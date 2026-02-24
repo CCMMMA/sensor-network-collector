@@ -1,26 +1,30 @@
 # sensor-network-collector
 
-MQTT to InfluxDB collector for the `meteo@uniparthenope` sensor network.
+MQTT collector for weather/sensor networks with pluggable outputs:
 
-It subscribes to MQTT topics, parses JSON payloads (including GeoJSON packets from `vantage-publisher-threading.py`), and writes points to InfluxDB.
+- InfluxDB
+- Signal K (websocket deltas)
+- Hourly CSV storage
+
+It supports flat JSON payloads and GeoJSON `Feature` payloads (as emitted by `vantage-publisher`).
 
 ## Features
 
 - MQTT subscriber with auto-reconnect
-- InfluxDB synchronous writes
-- Supports:
-  - flat JSON payloads
-  - GeoJSON `Feature` payloads with sensor data in `properties`
-- Timestamp handling from payload (`Datetime` / `DatetimeWS`) with UTC fallback
+- Multiple outputs enabled at runtime via CLI
+- Signal K delta generation from MQTT topics + payload keys
+- Hourly rotated CSV files by instrument UUID
+- Dry mode (`--dry`) for safe validation and logging-only runs
 
 ## Requirements
 
-- Python 3.9+ (recommended)
-- Access to:
-  - an MQTT broker
-  - an InfluxDB instance (v2 API)
+- Python 3.9+
+- MQTT broker reachable from this host
+- Optional:
+  - InfluxDB v2 API
+  - Signal K server (for websocket forwarding)
 
-## Installation
+Install dependencies:
 
 ```bash
 python3 -m venv .venv
@@ -28,112 +32,219 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Configuration file (`--config`)
+## Run
 
-`main.py` is configured via a JSON file passed with `--config`.
-
-An example file is included:
-
-- [`config.json`](/Users/raffaelemontella/Documents/New project/sensor-network-collector/config.json)
-
-Keys:
-
-- `log_level`: e.g. `INFO`, `DEBUG` (default: `INFO`)
-- `influxdb_url` (required): e.g. `http://localhost:8086`
-- `influxdb_token` (required): InfluxDB API token
-- `influxdb_org` (required): InfluxDB organization
-- `influxdb_bucket` (required): destination bucket
-- `mqtt_address` (required): MQTT broker hostname/IP
-- `mqtt_port` (default: `1883`)
-- `mqtt_user` (optional)
-- `mqtt_password` (optional)
-- `mqtt_topic` (default: `#`)
-- `influx_measurement` (default: `mqtt_data`)
-- `skip_empty_fields` (default: `1`)
-  - `1`: skip write if payload has no valid scalar fields
-  - `0`: allow writing even with empty field set (not recommended)
-
-Note: if a key is omitted in JSON, matching environment variables are still accepted as fallback.
-
-## Quick start
+`main.py` always reads MQTT from `--config`. Outputs are selected by CLI.
 
 ```bash
-cp config.json config.local.json
-# edit config.local.json with your real values
-
-python3 main.py --config config.local.json
+python3 main.py --config config.json
 ```
 
-## Packet formats
+### Output selection
 
-### 1) Flat JSON payload
+- `--influxdb`: enable InfluxDB output
+- `--signalk`: enable Signal K output
+- `--storage <ROOT_PATH>`: enable CSV storage under `ROOT_PATH`
+- `--dry`: no writes/connections for selected outputs; generated data is logged
 
-Example:
+You can combine outputs:
+
+```bash
+# InfluxDB + Signal K + CSV
+python3 main.py --config config.json --influxdb --signalk --storage /data/collector
+
+# Signal K only
+python3 main.py --config config.json --signalk
+
+# Signal K + storage in dry mode (no real writes)
+python3 main.py --config config.json --signalk --storage /data/collector --dry
+```
+
+Notes:
+
+- If no output flags are passed, runtime falls back to config booleans (`influxdb_enabled`, `signalk_enabled`, `storage_root`) for backward compatibility.
+- In dry mode, MQTT intake is active, but sink writes are replaced by logs.
+
+## Configuration (`config.json`)
+
+Core keys:
+
+- `mqtt_address` (required)
+- `mqtt_port` (default `1883`)
+- `mqtt_user` / `mqtt_password` (optional)
+- `mqtt_topic` (default `#`)
+- `skip_empty_fields` (`1` default)
+
+Influx keys (required only if Influx output is enabled):
+
+- `influxdb_url`
+- `influxdb_token`
+- `influxdb_org`
+- `influxdb_bucket`
+- `influx_measurement` (default `mqtt_data`)
+
+Signal K keys (required only if Signal K output is enabled):
+
+- `signalk_server_url` (example: `ws://signalk.local:3000/signalk/v1/stream`)
+- `signalk_token` (optional)
+- `signalk_context_prefix` (default `meteo`)
+- `signalk_source_label` (default `sensor-network-collector`)
+- `signalk_path_map` (optional key -> Signal K path overrides)
+
+Optional default output controls:
+
+- `influxdb_enabled` (`1`/`0`)
+- `signalk_enabled` (`1`/`0`)
+- `storage_root` (path or `null`)
+
+## Payload support
+
+### Flat JSON
 
 ```json
 {
-  "Datetime": "2026-02-23T12:34:56Z",
-  "temperature": 21.4,
-  "humidity": 62
+  "Datetime": "2026-02-24T10:15:40Z",
+  "uuid": "it.uniparthenope.meteo.ws1",
+  "TempOut": 12.7,
+  "HumOut": 62,
+  "WindSpeed": 3.4,
+  "position": { "latitude": 40.8569, "longitude": 14.2845 }
 }
 ```
 
-### 2) GeoJSON `Feature` payload (from vantage-publisher-threading.py)
-
-Example:
+### GeoJSON Feature
 
 ```json
 {
   "type": "Feature",
   "geometry": {
     "type": "Point",
-    "coordinates": [14.2681, 40.8518]
+    "coordinates": [14.2845, 40.8569]
   },
   "properties": {
-    "uuid": "station-001",
-    "name": "Napoli Station",
-    "Datetime": "2026-02-23T12:34:56Z",
-    "temp_out": 18.7
+    "uuid": "it.uniparthenope.meteo.ws1",
+    "Datetime": "2026-02-24T10:15:40Z",
+    "TempOut": 12.7
   }
 }
 ```
 
-For GeoJSON packets:
-- Influx fields come from `properties`
-- `uuid`, `name`, `latitude`, `longitude` are written as tags (when present)
+## Signal K mapping
 
-## How timestamps are chosen
+The collector builds Signal K deltas (`context` + `updates[].values[]`) and forwards them to websocket `/signalk/v1/stream`.
 
-1. `Datetime` (if present and valid ISO-8601)
-2. `DatetimeWS` (if present and valid)
-3. Current UTC time
+Mapping rules:
 
-Accepted examples:
-- `2026-02-18T12:34:56Z`
-- `2026-02-18T12:34:56+01:00`
-- `2026-02-18T12:34:56`
+- MQTT topic -> Signal K `context`:
+  - `context = <signalk_context_prefix>.<topic with '/' mapped to '.'>`
+- Payload key -> Signal K `path`:
+  - `signalk_path_map[key]` if configured
+  - standard weather mapping (same convention used in `vantage-publisher`), including:
+    - `TempOut -> environment.outside.temperature`
+    - `HumOut -> environment.outside.humidity`
+    - `Barometer -> environment.outside.pressure`
+    - `WindSpeed -> environment.wind.speedApparent`
+    - `WindDir -> environment.wind.angleApparent`
+  - fallback: `environment.<sanitized_key>`
 
-## Run as a service (example with systemd)
+Also:
 
-Create a service unit that exports the same environment variables and runs:
+- If position is available (`position` object or GeoJSON coordinates), `navigation.position` is emitted.
+- Standard conversions are applied for common weather keys:
+  - `TempOut`, `TempIn`: C -> K
+  - `Barometer`: hPa -> Pa
+  - `HumOut`, `HumIn`: `%` -> ratio
+  - `WindDir`: degrees -> radians
 
-```bash
-python3 /path/to/sensor-network-collector/main.py --config /path/to/config.json
+## CSV storage layout
+
+When `--storage <ROOT_PATH>` is enabled, each message is stored in:
+
+`/UUID/YYYY/MM/DD/UUID_YYYYMMDDZHH00.csv`
+
+Where:
+
+- `UUID` is instrument UUID from payload (`uuid`) if available, otherwise topic-derived
+- file rotates every hour (`HH`)
+- if collector restarts within the same hour, it appends to the same hourly file
+
+## Architecture
+
+Runtime components:
+
+1. MQTT intake
+2. Payload normalizer (flat JSON / GeoJSON)
+3. Timestamp resolver (`Datetime` -> `DatetimeWS` -> now UTC)
+4. Output sinks (InfluxDB, Signal K, CSV)
+
+### Data flow
+
+```text
+MQTT broker
+  -> sensor-network-collector (subscribe topic filter)
+    -> parse/normalize payload
+      -> Influx sink (optional)
+      -> Signal K sink (optional)
+      -> CSV hourly sink (optional)
 ```
 
-## Troubleshooting
+## Example: many `vantage-publisher` stations -> flat MQTT -> Signal K server
 
-- `Missing required env var: ...`
-  - A required config key is missing and no env fallback is available.
-- `Invalid JSON on topic=...`
-  - Publisher payload is not valid JSON.
-- `JSON payload is not an object`
-  - Root JSON value must be an object.
-- `Influx write failed`
-  - Check URL/token/org/bucket and network reachability.
+Scenario:
 
-## Development quick check
+- many `vantage-publisher` instances publish flat JSON on topics such as:
+  - `it.uniparthenope.meteo.ws1`
+  - `it.uniparthenope.meteo.ws2`
+  - `it.uniparthenope.meteo.ws3`
+- this collector subscribes to `it.uniparthenope.meteo/#`
+- it forwards all stations to one Signal K server
+
+Example `config.json`:
+
+```json
+{
+  "log_level": "INFO",
+  "mqtt_address": "mqtt-broker.local",
+  "mqtt_port": 1883,
+  "mqtt_topic": "it.uniparthenope.meteo/#",
+
+  "signalk_server_url": "ws://signalk.local:3000/signalk/v1/stream",
+  "signalk_token": "",
+  "signalk_context_prefix": "meteo",
+  "signalk_source_label": "sensor-network-collector",
+
+  "signalk_path_map": {
+    "TempOut": "environment.outside.temperature",
+    "HumOut": "environment.outside.humidity",
+    "Barometer": "environment.outside.pressure",
+    "WindSpeed": "environment.wind.speedApparent",
+    "WindDir": "environment.wind.angleApparent"
+  },
+
+  "influxdb_enabled": 0,
+  "signalk_enabled": 1,
+  "storage_root": null
+}
+```
+
+Run:
+
+```bash
+python3 main.py --config config.json --signalk
+```
+
+Examples of context mapping:
+
+- topic `it.uniparthenope.meteo.ws1` -> context `meteo.it.uniparthenope.meteo.ws1`
+- topic `it/uniparthenope/meteo/ws2` -> context `meteo.it.uniparthenope.meteo.ws2`
+
+## Validation
 
 ```bash
 python3 -m py_compile main.py
+python3 main.py --config config.json --signalk --dry
 ```
+
+## License
+
+Apache-2.0
