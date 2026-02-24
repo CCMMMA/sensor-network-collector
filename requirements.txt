@@ -1,3 +1,4 @@
 paho-mqtt
 influxdb-client
 websocket-client
+Flask

@@ -4,14 +4,22 @@ import json
 import logging
 import math
 import os
+import re
+import secrets
 import signal
+import sqlite3
 import sys
+import tempfile
+import threading
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 import paho.mqtt.client as mqtt
+from flask import Flask, abort, redirect, render_template_string, request, send_file, session, url_for
 from influxdb_client import InfluxDBClient
 from influxdb_client.client.write_api import SYNCHRONOUS
+from werkzeug.security import check_password_hash, generate_password_hash
 
 
 # ----------------------------
@@ -39,28 +47,18 @@ SIGNALK_STANDARD_PATHS = {
 }
 
 
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 # ----------------------------
 # Config helpers
 # ----------------------------
 def require_env(name: str) -> str:
-    v = os.environ.get(name)
-    if not v:
+    value = os.environ.get(name)
+    if not value:
         raise RuntimeError(f"Missing required env var: {name}")
-    return v
-
-
-def get_required_value(config: dict, key: str, env_name: str) -> str:
-    value = config.get(key)
-    if value is None or value == "":
-        return require_env(env_name)
-    return str(value)
-
-
-def get_optional_value(config: dict, key: str, env_name: str, default=None):
-    value = config.get(key)
-    if value is not None:
-        return value
-    return os.getenv(env_name, default)
+    return value
 
 
 def parse_boolish(value, default: bool = False) -> bool:
@@ -78,116 +76,192 @@ def parse_boolish(value, default: bool = False) -> bool:
     return bool(default)
 
 
+def parse_cli_bool(value: str) -> bool:
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError("Expected true|false")
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="MQTT collector with pluggable outputs")
-    parser.add_argument("--config", required=True, help="Path to JSON configuration file")
+    parser = argparse.ArgumentParser(
+        description="Threaded sensor-network collector (InfluxDB + Signal K + CSV + web gui)"
+    )
+    parser.add_argument("--config", default="config.json", help="Config file path (default: config.json)")
+
+    # Homogeneous with vantage-publisher style:
+    # --signalk true|false, --storage true|false|<path>, --influxdb true|false
+    parser.add_argument("--signalk", type=parse_cli_bool, default=None, help="Enable/disable Signal K output")
     parser.add_argument(
         "--influxdb",
-        action="store_true",
-        help="Enable InfluxDB output (if no output flags are passed, this is enabled by default)",
-    )
-    parser.add_argument(
-        "--signalk",
-        action="store_true",
-        help="Enable Signal K output to websocket server",
+        type=parse_cli_bool,
+        default=None,
+        help="Enable/disable InfluxDB output",
     )
     parser.add_argument(
         "--storage",
-        metavar="ROOT_PATH",
-        help="Enable CSV storage and write files under ROOT_PATH",
+        default=None,
+        help="Enable/disable storage (true|false) or set storage root path",
     )
-    parser.add_argument(
-        "--dry",
-        action="store_true",
-        help="Dry mode: do not write to InfluxDB/Signal K/CSV, log generated outputs instead",
-    )
+    parser.add_argument("--http", type=parse_cli_bool, default=None, help="Enable/disable web gui")
+    parser.add_argument("--dry", action="store_true", help="Dry mode: no sink writes, log output only")
     return parser.parse_args()
 
 
-def load_raw_config(path: str) -> dict:
+def cfg_value(raw: dict, keys, env_name=None, default=None):
+    for key in keys:
+        if key in raw and raw.get(key) is not None:
+            return raw.get(key)
+    if env_name:
+        env = os.getenv(env_name)
+        if env is not None:
+            return env
+    return default
+
+
+def cfg_required(raw: dict, keys, env_name):
+    value = cfg_value(raw, keys, env_name=env_name, default=None)
+    if value is None or value == "":
+        raise RuntimeError(f"Missing required config key(s) {keys} (or env {env_name})")
+    return value
+
+
+def parse_storage_override(arg_value):
+    if arg_value is None:
+        return None, None
+    s = str(arg_value).strip()
+    l = s.lower()
+    if l in ("1", "true", "yes", "y", "on"):
+        return True, None
+    if l in ("0", "false", "no", "n", "off"):
+        return False, None
+    return True, s
+
+
+def load_config(path: str, args) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
     if not isinstance(raw, dict):
         raise RuntimeError("Config file must contain a JSON object")
-    return raw
 
+    log_level = str(cfg_value(raw, ["logLevel", "log_level"], env_name="LOG_LEVEL", default="INFO")).upper()
 
-def determine_outputs(args, raw: dict):
-    # Default behavior is backwards-compatible: if no output option is specified,
-    # keep writing to InfluxDB.
-    explicit = args.influxdb or args.signalk or bool(args.storage)
+    mqtt_broker = str(cfg_required(raw, ["mqttBroker", "mqtt_address"], "MQTT_ADDRESS"))
+    mqtt_port = int(cfg_value(raw, ["mqttPort", "mqtt_port"], env_name="MQTT_PORT", default=1883))
+    mqtt_user = cfg_value(raw, ["mqttUser", "mqtt_user"], env_name="MQTT_USER", default=None)
+    mqtt_pass = cfg_value(raw, ["mqttPass", "mqtt_password"], env_name="MQTT_PASSWORD", default=None)
+    mqtt_topic = str(cfg_value(raw, ["mqttTopic", "mqtt_topic"], env_name="MQTT_TOPIC", default="#"))
 
-    enable_influx = bool(args.influxdb)
-    enable_signalk = bool(args.signalk)
-    storage_root = args.storage
+    skip_empty = parse_boolish(
+        cfg_value(raw, ["skipEmptyFields", "skip_empty_fields"], env_name="SKIP_EMPTY_FIELDS", default=1),
+        True,
+    )
 
-    if not explicit:
-        enable_influx = parse_boolish(get_optional_value(raw, "influxdb_enabled", "INFLUXDB_ENABLED", "1"), True)
-        enable_signalk = parse_boolish(get_optional_value(raw, "signalk_enabled", "SIGNALK_ENABLED", "0"), False)
-        storage_root = get_optional_value(raw, "storage_root", "STORAGE_ROOT", None)
+    storage_cfg_enabled = parse_boolish(cfg_value(raw, ["storage"], env_name="STORAGE", default=False), False)
+    storage_root = cfg_value(raw, ["pathStorage", "storage_root"], env_name="STORAGE_ROOT", default=None)
 
-    if not enable_influx and not enable_signalk and not storage_root:
-        raise RuntimeError("No outputs enabled. Use --influxdb, --signalk, and/or --storage <ROOT_PATH>")
+    signalk_cfg_enabled = parse_boolish(
+        cfg_value(raw, ["signalk", "signalk_enabled"], env_name="SIGNALK_ENABLED", default=False),
+        False,
+    )
 
-    return {
-        "enable_influx": enable_influx,
-        "enable_signalk": enable_signalk,
-        "storage_root": storage_root,
-    }
+    influx_cfg_enabled = parse_boolish(
+        cfg_value(raw, ["influxdb", "influxdb_enabled"], env_name="INFLUXDB_ENABLED", default=True),
+        True,
+    )
 
+    http_cfg_enabled = parse_boolish(cfg_value(raw, ["httpEnabled"], env_name="HTTP_ENABLED", default=False), False)
 
-def load_config(path: str, args) -> dict:
-    raw = load_raw_config(path)
-    outputs = determine_outputs(args, raw)
+    storage_override_enabled, storage_override_root = parse_storage_override(args.storage)
+
+    enable_signalk = signalk_cfg_enabled if args.signalk is None else bool(args.signalk)
+    enable_influx = influx_cfg_enabled if args.influxdb is None else bool(args.influxdb)
+    enable_http = http_cfg_enabled if args.http is None else bool(args.http)
+    enable_storage = storage_cfg_enabled if storage_override_enabled is None else storage_override_enabled
+
+    if storage_override_root is not None:
+        storage_root = storage_override_root
+        enable_storage = True
+
+    if enable_storage and not storage_root:
+        raise RuntimeError("Storage is enabled but pathStorage/storage_root is not configured")
 
     cfg = {
-        "log_level": str(get_optional_value(raw, "log_level", "LOG_LEVEL", "INFO")).upper(),
-        "mqtt_address": get_required_value(raw, "mqtt_address", "MQTT_ADDRESS"),
-        "mqtt_port": int(get_optional_value(raw, "mqtt_port", "MQTT_PORT", "1883")),
-        "mqtt_user": get_optional_value(raw, "mqtt_user", "MQTT_USER", None),
-        "mqtt_password": get_optional_value(raw, "mqtt_password", "MQTT_PASSWORD", None),
-        "mqtt_topic": str(get_optional_value(raw, "mqtt_topic", "MQTT_TOPIC", "#")),
-        "skip_empty_fields": str(get_optional_value(raw, "skip_empty_fields", "SKIP_EMPTY_FIELDS", "1")) == "1",
-        "influx_measurement": str(
-            get_optional_value(raw, "influx_measurement", "INFLUX_MEASUREMENT", "mqtt_data")
-        ),
+        "log_level": log_level,
+        "mqtt_broker": mqtt_broker,
+        "mqtt_port": mqtt_port,
+        "mqtt_user": mqtt_user,
+        "mqtt_pass": mqtt_pass,
+        "mqtt_topic": mqtt_topic,
+        "skip_empty_fields": skip_empty,
         "dry": bool(args.dry),
-        **outputs,
+        "enable_signalk": enable_signalk,
+        "enable_influx": enable_influx,
+        "enable_storage": enable_storage,
+        "enable_http": enable_http,
+        "storage_root": str(storage_root) if storage_root else None,
+        "influx_measurement": str(
+            cfg_value(raw, ["influxMeasurement", "influx_measurement"], env_name="INFLUX_MEASUREMENT", default="mqtt_data")
+        ),
+        "signalk_server_url": str(
+            cfg_value(raw, ["signalkServerUrl", "signalk_server_url"], env_name="SIGNALK_SERVER_URL", default="")
+        ).strip(),
+        "signalk_token": str(cfg_value(raw, ["signalkToken", "signalk_token"], env_name="SIGNALK_TOKEN", default="") or ""),
+        "signalk_context_prefix": str(
+            cfg_value(
+                raw,
+                ["signalkContextPrefix", "signalk_context_prefix", "signalkContext"],
+                env_name="SIGNALK_CONTEXT_PREFIX",
+                default="meteo",
+            )
+        ).strip("."),
+        "signalk_source_label": str(
+            cfg_value(raw, ["signalkSourceLabel", "signalk_source_label"], env_name="SIGNALK_SOURCE_LABEL", default="sensor-network-collector")
+        ),
+        "http_host": str(cfg_value(raw, ["httpHost"], env_name="HTTP_HOST", default="0.0.0.0")),
+        "http_port": int(cfg_value(raw, ["httpPort"], env_name="HTTP_PORT", default=8080)),
+        "auth_db_path": str(
+            cfg_value(raw, ["authDbPath"], env_name="AUTH_DB_PATH", default="")
+            or (str(Path(storage_root) / "collector_auth.sqlite") if storage_root else "collector_auth.sqlite")
+        ),
+        "web_session_secret": str(cfg_value(raw, ["webSessionSecret"], env_name="WEB_SESSION_SECRET", default="") or ""),
+        "admin_user": str(cfg_value(raw, ["adminUser"], env_name="ADMIN_USER", default="admin") or "admin"),
+        "admin_password": str(
+            cfg_value(raw, ["adminPassword"], env_name="ADMIN_PASSWORD", default="admin") or "admin"
+        ),
     }
 
-    if cfg["enable_influx"]:
-        cfg.update(
-            {
-                "influxdb_url": get_required_value(raw, "influxdb_url", "INFLUXDB_URL"),
-                "influxdb_token": get_required_value(raw, "influxdb_token", "INFLUXDB_TOKEN"),
-                "influxdb_org": get_required_value(raw, "influxdb_org", "INFLUXDB_ORG"),
-                "influxdb_bucket": get_required_value(raw, "influxdb_bucket", "INFLUXDB_BUCKET"),
-            }
-        )
+    raw_map = cfg_value(raw, ["signalkPathMap", "signalk_path_map"], env_name="SIGNALK_PATH_MAP", default={})
+    if isinstance(raw_map, str):
+        try:
+            raw_map = json.loads(raw_map)
+        except json.JSONDecodeError:
+            logger.warning("Invalid SIGNALK_PATH_MAP JSON, using empty map")
+            raw_map = {}
+    cfg["signalk_path_map"] = {
+        str(k): str(v) for k, v in (raw_map.items() if isinstance(raw_map, dict) else []) if v
+    }
 
-    if cfg["enable_signalk"]:
-        cfg["signalk_server_url"] = get_required_value(raw, "signalk_server_url", "SIGNALK_SERVER_URL")
-        cfg["signalk_token"] = str(get_optional_value(raw, "signalk_token", "SIGNALK_TOKEN", "") or "")
-        cfg["signalk_context_prefix"] = str(
-            get_optional_value(raw, "signalk_context_prefix", "SIGNALK_CONTEXT_PREFIX", "meteo")
-        )
-        raw_map = get_optional_value(raw, "signalk_path_map", "SIGNALK_PATH_MAP", {})
-        if isinstance(raw_map, str):
-            try:
-                raw_map = json.loads(raw_map)
-            except json.JSONDecodeError:
-                logger.warning("Invalid JSON in SIGNALK_PATH_MAP; ignoring custom path map")
-                raw_map = {}
-        cfg["signalk_path_map"] = {
-            str(k): str(v) for k, v in (raw_map.items() if isinstance(raw_map, dict) else []) if v
-        }
-        cfg["signalk_source_label"] = str(
-            get_optional_value(raw, "signalk_source_label", "SIGNALK_SOURCE_LABEL", "sensor-network-collector")
-        )
+    if cfg["enable_signalk"] and not cfg["signalk_server_url"]:
+        raise RuntimeError("Signal K enabled but signalkServerUrl/signalk_server_url is empty")
+
+    if cfg["enable_influx"]:
+        cfg["influxdb_url"] = str(cfg_required(raw, ["influxdbUrl", "influxdb_url"], "INFLUXDB_URL"))
+        cfg["influxdb_token"] = str(cfg_required(raw, ["influxdbToken", "influxdb_token"], "INFLUXDB_TOKEN"))
+        cfg["influxdb_org"] = str(cfg_required(raw, ["influxdbOrg", "influxdb_org"], "INFLUXDB_ORG"))
+        cfg["influxdb_bucket"] = str(cfg_required(raw, ["influxdbBucket", "influxdb_bucket"], "INFLUXDB_BUCKET"))
+
+    if not cfg["enable_influx"] and not cfg["enable_signalk"] and not cfg["enable_storage"]:
+        raise RuntimeError("No outputs enabled: enable at least one of influxdb, signalk, storage")
 
     return cfg
 
 
+# ----------------------------
+# Data parsing helpers
+# ----------------------------
 def parse_iso8601_or_none(value: str):
     if not isinstance(value, str) or not value.strip():
         return None
@@ -208,10 +282,6 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 
-def utc_now_iso():
-    return utc_now().isoformat().replace("+00:00", "Z")
-
-
 def sanitize_signalk_key(key: str) -> str:
     out = []
     for ch in str(key):
@@ -230,7 +300,6 @@ def topic_to_context(topic: str, prefix: str) -> str:
 
 
 def convert_signalk_value(key: str, value):
-    # Reuse same conversions as vantage-publisher for standard weather fields.
     if value is None:
         return None
     if key in ("TempOut", "TempIn"):
@@ -306,10 +375,10 @@ def extract_payload_fields(payload):
 
 
 def resolve_instrument_uuid(topic: str, data: dict, tags: dict) -> str:
-    for k in ("uuid", "UUID", "station_uuid"):
-        v = data.get(k) if isinstance(data, dict) else None
-        if isinstance(v, str) and v.strip():
-            return v.strip()
+    for key in ("uuid", "UUID", "station_uuid"):
+        value = data.get(key) if isinstance(data, dict) else None
+        if isinstance(value, str) and value.strip():
+            return value.strip()
 
     tag_uuid = tags.get("uuid")
     if isinstance(tag_uuid, str) and tag_uuid.strip():
@@ -318,6 +387,9 @@ def resolve_instrument_uuid(topic: str, data: dict, tags: dict) -> str:
     return topic.replace("/", "_") if topic else "unknown"
 
 
+# ----------------------------
+# Signal K / CSV sinks
+# ----------------------------
 class SignalKWebsocketPublisher:
     """Best-effort Signal K stream publisher over websocket."""
 
@@ -367,14 +439,9 @@ class CSVHourlyStorage:
         self.root = Path(root_path)
 
     def _file_path(self, instrument_uuid: str, dt: datetime) -> Path:
-        year = dt.strftime("%Y")
-        month = dt.strftime("%m")
-        day = dt.strftime("%d")
-        hour = dt.strftime("%H")
-
-        day_dir = self.root / instrument_uuid / year / month / day
-        filename = f"{instrument_uuid}_{dt.strftime('%Y%m%d')}Z{hour}00.csv"
-        return day_dir / filename
+        day_dir = self.root / instrument_uuid / dt.strftime("%Y") / dt.strftime("%m") / dt.strftime("%d")
+        name = f"{instrument_uuid}_{dt.strftime('%Y%m%d')}Z{dt.strftime('%H')}00.csv"
+        return day_dir / name
 
     def _read_header(self, csv_path: Path):
         if not csv_path.exists() or csv_path.stat().st_size == 0:
@@ -386,14 +453,13 @@ class CSVHourlyStorage:
     def _ensure_schema(self, csv_path: Path, row_keys):
         existing = self._read_header(csv_path)
         if not existing:
-            return list(row_keys), False
+            return list(row_keys)
 
         new_cols = [c for c in row_keys if c not in existing]
         if not new_cols:
-            return existing, False
+            return existing
 
         merged = existing + new_cols
-
         with csv_path.open("r", newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
 
@@ -401,25 +467,23 @@ class CSVHourlyStorage:
             writer = csv.DictWriter(f, fieldnames=merged)
             writer.writeheader()
             for old in rows:
-                out = {k: old.get(k, "") for k in merged}
-                writer.writerow(out)
+                writer.writerow({k: old.get(k, "") for k in merged})
 
-        return merged, True
+        return merged
 
     def write(self, instrument_uuid: str, dt: datetime, row: dict):
         csv_path = self._file_path(instrument_uuid, dt)
         csv_path.parent.mkdir(parents=True, exist_ok=True)
 
         ordered_row = dict(sorted(row.items(), key=lambda kv: kv[0]))
-        fieldnames, _ = self._ensure_schema(csv_path, ordered_row.keys())
+        fieldnames = self._ensure_schema(csv_path, ordered_row.keys())
 
-        file_exists = csv_path.exists() and csv_path.stat().st_size > 0
+        has_data = csv_path.exists() and csv_path.stat().st_size > 0
         with csv_path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if not file_exists:
+            if not has_data:
                 writer.writeheader()
             writer.writerow({k: ordered_row.get(k, "") for k in fieldnames})
-
         return str(csv_path)
 
 
@@ -461,9 +525,7 @@ def build_signalk_delta(topic: str, data: dict, tags: dict, dt: datetime, cfg: d
         except Exception:
             value = raw
 
-        if value is None:
-            continue
-        if isinstance(value, (dict, list)):
+        if value is None or isinstance(value, (dict, list)):
             continue
 
         values.append({"path": path, "value": value})
@@ -471,13 +533,709 @@ def build_signalk_delta(topic: str, data: dict, tags: dict, dt: datetime, cfg: d
     if not values:
         return None
 
-    update = {
-        "timestamp": dt.isoformat().replace("+00:00", "Z"),
-        "$source": cfg.get("signalk_source_label", "sensor-network-collector"),
-        "values": values,
+    return {
+        "context": context,
+        "updates": [
+            {
+                "timestamp": dt.isoformat().replace("+00:00", "Z"),
+                "$source": cfg.get("signalk_source_label", "sensor-network-collector"),
+                "values": values,
+            }
+        ],
     }
 
-    return {"context": context, "updates": [update]}
+
+# ----------------------------
+# Web GUI auth/policy store
+# ----------------------------
+class AccessStore:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._init_schema()
+
+    def _connect(self):
+        con = sqlite3.connect(self.db_path)
+        con.row_factory = sqlite3.Row
+        return con
+
+    def _init_schema(self):
+        with self._lock:
+            with self._connect() as con:
+                con.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS users (
+                        username TEXT PRIMARY KEY,
+                        password_hash TEXT NOT NULL,
+                        email TEXT,
+                        role TEXT NOT NULL DEFAULT 'user',
+                        active INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS account_requests (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT NOT NULL,
+                        email TEXT,
+                        password_hash TEXT NOT NULL,
+                        message TEXT,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        created_at TEXT NOT NULL,
+                        reviewed_by TEXT
+                    );
+
+                    CREATE TABLE IF NOT EXISTS instrument_policies (
+                        instrument_uuid TEXT PRIMARY KEY,
+                        policy TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        updated_by TEXT
+                    );
+
+                    CREATE TABLE IF NOT EXISTS user_instruments (
+                        username TEXT NOT NULL,
+                        instrument_uuid TEXT NOT NULL,
+                        PRIMARY KEY (username, instrument_uuid)
+                    );
+                    """
+                )
+
+    def ensure_admin(self, username: str, password: str):
+        with self._lock:
+            with self._connect() as con:
+                row = con.execute("SELECT username FROM users WHERE username = ?", (username,)).fetchone()
+                if row is None:
+                    con.execute(
+                        "INSERT INTO users(username,password_hash,email,role,active,created_at) VALUES(?,?,?,?,?,?)",
+                        (username, generate_password_hash(password), "", "admin", 1, now_utc_iso()),
+                    )
+                    logger.info("Created default admin user '%s'", username)
+
+    def get_user(self, username: str):
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT username,email,role,active,created_at FROM users WHERE username = ?",
+                (username,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_users(self):
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT username,email,role,active,created_at FROM users ORDER BY username"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def authenticate(self, username: str, password: str):
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT username,password_hash,email,role,active,created_at FROM users WHERE username = ?",
+                (username,),
+            ).fetchone()
+        if row is None:
+            return None
+        if int(row["active"]) != 1:
+            return None
+        if not check_password_hash(row["password_hash"], password):
+            return None
+        return {
+            "username": row["username"],
+            "email": row["email"],
+            "role": row["role"],
+            "active": int(row["active"]),
+            "created_at": row["created_at"],
+        }
+
+    def create_user(self, username: str, password: str, email: str, role: str = "user", active: int = 1):
+        username = username.strip()
+        if not username:
+            return False, "Username is required"
+        role = "admin" if role == "admin" else "user"
+        with self._lock:
+            try:
+                with self._connect() as con:
+                    con.execute(
+                        "INSERT INTO users(username,password_hash,email,role,active,created_at) VALUES(?,?,?,?,?,?)",
+                        (username, generate_password_hash(password), email.strip(), role, int(active), now_utc_iso()),
+                    )
+                return True, "User created"
+            except sqlite3.IntegrityError:
+                return False, "User already exists"
+
+    def create_account_request(self, username: str, password: str, email: str, message: str):
+        username = username.strip()
+        if not username:
+            return False, "Username is required"
+        if not password:
+            return False, "Password is required"
+
+        with self._lock:
+            with self._connect() as con:
+                exists_user = con.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+                if exists_user:
+                    return False, "Username already exists"
+                con.execute(
+                    "INSERT INTO account_requests(username,email,password_hash,message,status,created_at,reviewed_by) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        username,
+                        email.strip(),
+                        generate_password_hash(password),
+                        message.strip(),
+                        "pending",
+                        now_utc_iso(),
+                        None,
+                    ),
+                )
+        return True, "Request submitted"
+
+    def list_account_requests(self, status=None):
+        query = "SELECT id,username,email,message,status,created_at,reviewed_by FROM account_requests"
+        params = ()
+        if status:
+            query += " WHERE status = ?"
+            params = (status,)
+        query += " ORDER BY created_at DESC"
+        with self._connect() as con:
+            rows = con.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+
+    def approve_request(self, request_id: int, admin_username: str):
+        with self._lock:
+            with self._connect() as con:
+                req = con.execute(
+                    "SELECT id,username,email,password_hash,status FROM account_requests WHERE id = ?",
+                    (request_id,),
+                ).fetchone()
+                if req is None:
+                    return False, "Request not found"
+                if req["status"] != "pending":
+                    return False, f"Request already {req['status']}"
+
+                exists_user = con.execute("SELECT 1 FROM users WHERE username = ?", (req["username"],)).fetchone()
+                if exists_user:
+                    con.execute(
+                        "UPDATE account_requests SET status = 'approved', reviewed_by = ? WHERE id = ?",
+                        (admin_username, request_id),
+                    )
+                    return True, "Request marked approved (user already existed)"
+
+                con.execute(
+                    "INSERT INTO users(username,password_hash,email,role,active,created_at) VALUES(?,?,?,?,?,?)",
+                    (req["username"], req["password_hash"], req["email"], "user", 1, now_utc_iso()),
+                )
+                con.execute(
+                    "UPDATE account_requests SET status = 'approved', reviewed_by = ? WHERE id = ?",
+                    (admin_username, request_id),
+                )
+                return True, "Request approved and user created"
+
+    def reject_request(self, request_id: int, admin_username: str):
+        with self._lock:
+            with self._connect() as con:
+                req = con.execute("SELECT status FROM account_requests WHERE id = ?", (request_id,)).fetchone()
+                if req is None:
+                    return False, "Request not found"
+                if req["status"] != "pending":
+                    return False, f"Request already {req['status']}"
+                con.execute(
+                    "UPDATE account_requests SET status = 'rejected', reviewed_by = ? WHERE id = ?",
+                    (admin_username, request_id),
+                )
+                return True, "Request rejected"
+
+    def set_policy(self, instrument_uuid: str, policy: str, updated_by: str):
+        if policy not in ("open", "account", "restricted"):
+            return False, "Invalid policy"
+        instrument_uuid = instrument_uuid.strip()
+        if not instrument_uuid:
+            return False, "instrument UUID is required"
+
+        with self._lock:
+            with self._connect() as con:
+                con.execute(
+                    """
+                    INSERT INTO instrument_policies(instrument_uuid, policy, updated_at, updated_by)
+                    VALUES(?,?,?,?)
+                    ON CONFLICT(instrument_uuid)
+                    DO UPDATE SET policy=excluded.policy, updated_at=excluded.updated_at, updated_by=excluded.updated_by
+                    """,
+                    (instrument_uuid, policy, now_utc_iso(), updated_by),
+                )
+        return True, "Policy updated"
+
+    def get_policy(self, instrument_uuid: str):
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT policy FROM instrument_policies WHERE instrument_uuid = ?",
+                (instrument_uuid,),
+            ).fetchone()
+        return row["policy"] if row else "account"
+
+    def list_policies(self, instrument_uuids):
+        result = {}
+        with self._connect() as con:
+            rows = con.execute("SELECT instrument_uuid, policy FROM instrument_policies").fetchall()
+            for row in rows:
+                result[row["instrument_uuid"]] = row["policy"]
+        for uid in instrument_uuids:
+            result.setdefault(uid, "account")
+        return result
+
+    def set_user_instrument_access(self, username: str, instrument_uuid: str, allow: bool):
+        username = username.strip()
+        instrument_uuid = instrument_uuid.strip()
+        if not username or not instrument_uuid:
+            return False, "Username and instrument UUID are required"
+
+        with self._lock:
+            with self._connect() as con:
+                user_exists = con.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+                if not user_exists:
+                    return False, "User not found"
+
+                if allow:
+                    con.execute(
+                        "INSERT OR IGNORE INTO user_instruments(username,instrument_uuid) VALUES(?,?)",
+                        (username, instrument_uuid),
+                    )
+                else:
+                    con.execute(
+                        "DELETE FROM user_instruments WHERE username = ? AND instrument_uuid = ?",
+                        (username, instrument_uuid),
+                    )
+        return True, "Access updated"
+
+    def get_user_instruments(self, username: str):
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT instrument_uuid FROM user_instruments WHERE username = ? ORDER BY instrument_uuid",
+                (username,),
+            ).fetchall()
+            return [r["instrument_uuid"] for r in rows]
+
+    def can_download(self, user, instrument_uuid: str):
+        policy = self.get_policy(instrument_uuid)
+        if policy == "open":
+            return True
+        if user is None:
+            return False
+        if user.get("role") == "admin":
+            return True
+        if policy == "account":
+            return True
+        if policy == "restricted":
+            allowed = set(self.get_user_instruments(user["username"]))
+            return instrument_uuid in allowed
+        return False
+
+
+def collect_instruments(storage_root: str):
+    root = Path(storage_root)
+    if not root.exists() or not root.is_dir():
+        return []
+    return sorted([p.name for p in root.iterdir() if p.is_dir()])
+
+
+def parse_date_ymd(value: str):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def extract_date_from_name(name: str):
+    # UUID_YYYYMMDDZHH00.csv
+    m = re.search(r"_(\d{8})Z\d{4}\.csv$", name)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def list_csv_files_for_instrument(storage_root: str, instrument_uuid: str, from_date=None, to_date=None):
+    root = Path(storage_root) / instrument_uuid
+    if not root.exists():
+        return []
+
+    files = []
+    for path in root.rglob("*.csv"):
+        date = extract_date_from_name(path.name)
+        if from_date and (date is None or date < from_date):
+            continue
+        if to_date and (date is None or date > to_date):
+            continue
+        files.append(path)
+    files.sort()
+    return files
+
+
+def make_zip_for_download(storage_root: str, instrument_uuids, from_date=None, to_date=None):
+    tmp = tempfile.NamedTemporaryFile(prefix="collector_download_", suffix=".zip", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+
+    count = 0
+    with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for uuid in instrument_uuids:
+            files = list_csv_files_for_instrument(storage_root, uuid, from_date=from_date, to_date=to_date)
+            for f in files:
+                rel = f.relative_to(Path(storage_root))
+                zf.write(f, arcname=str(rel))
+                count += 1
+
+    return tmp_path, count
+
+
+def create_web_app(cfg: dict, access_store: AccessStore):
+    app = Flask(__name__)
+    app.secret_key = cfg["web_session_secret"] or secrets.token_hex(32)
+
+    if not cfg["web_session_secret"]:
+        logger.warning("webSessionSecret not set; using ephemeral secret (sessions reset on restart)")
+
+    def current_user():
+        username = session.get("username")
+        if not username:
+            return None
+        return access_store.get_user(username)
+
+    def require_login():
+        user = current_user()
+        if not user:
+            return redirect(url_for("login", next=request.path))
+        return user
+
+    def require_admin():
+        user = current_user()
+        if not user:
+            return redirect(url_for("login", next=request.path))
+        if user.get("role") != "admin":
+            abort(403)
+        return user
+
+    @app.route("/")
+    def index():
+        user = current_user()
+        storage_root = cfg.get("storage_root")
+        instruments = collect_instruments(storage_root) if storage_root else []
+        policies = access_store.list_policies(instruments)
+
+        visible = []
+        for inst in instruments:
+            if access_store.can_download(user, inst):
+                visible.append(inst)
+            elif policies.get(inst) == "open":
+                visible.append(inst)
+
+        return render_template_string(
+            """
+            <html><body>
+            <h1>Sensor Network Collector - Data Portal</h1>
+            {% if user %}
+              <p>Logged in as <b>{{ user.username }}</b> ({{ user.role }}) - <a href="{{ url_for('logout') }}">Logout</a></p>
+              {% if user.role == 'admin' %}<p><a href="{{ url_for('admin') }}">Admin panel</a></p>{% endif %}
+            {% else %}
+              <p><a href="{{ url_for('login') }}">Login</a> | <a href="{{ url_for('request_account') }}">Request account</a></p>
+            {% endif %}
+
+            <h2>Download data</h2>
+            {% if not storage_root %}
+              <p>Storage is not enabled/configured.</p>
+            {% elif not instruments %}
+              <p>No instrument folders found under {{ storage_root }}.</p>
+            {% elif not visible %}
+              <p>No instruments available with your current permissions.</p>
+            {% else %}
+              <form method="post" action="{{ url_for('download') }}">
+                <p>Select one or more instruments:</p>
+                {% for inst in visible %}
+                  <label><input type="checkbox" name="instrument" value="{{ inst }}"> {{ inst }} (policy={{ policies[inst] }})</label><br/>
+                {% endfor %}
+                <p>Date filter (optional):</p>
+                <label>From <input type="date" name="from_date"></label>
+                <label>To <input type="date" name="to_date"></label>
+                <p><button type="submit">Download ZIP</button></p>
+              </form>
+            {% endif %}
+            </body></html>
+            """,
+            user=user,
+            instruments=instruments,
+            visible=visible,
+            policies=policies,
+            storage_root=storage_root,
+        )
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        err = ""
+        if request.method == "POST":
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "")
+            user = access_store.authenticate(username, password)
+            if user:
+                session["username"] = user["username"]
+                nxt = request.args.get("next") or url_for("index")
+                return redirect(nxt)
+            err = "Invalid credentials or inactive user"
+
+        return render_template_string(
+            """
+            <html><body>
+            <h1>Login</h1>
+            {% if err %}<p style="color:red">{{ err }}</p>{% endif %}
+            <form method="post">
+              <label>Username <input name="username"></label><br/>
+              <label>Password <input name="password" type="password"></label><br/>
+              <button type="submit">Login</button>
+            </form>
+            <p><a href="{{ url_for('request_account') }}">Request account</a></p>
+            <p><a href="{{ url_for('index') }}">Home</a></p>
+            </body></html>
+            """,
+            err=err,
+        )
+
+    @app.route("/logout")
+    def logout():
+        session.pop("username", None)
+        return redirect(url_for("index"))
+
+    @app.route("/request-account", methods=["GET", "POST"])
+    def request_account():
+        msg = ""
+        err = ""
+        if request.method == "POST":
+            username = request.form.get("username", "").strip()
+            email = request.form.get("email", "").strip()
+            password = request.form.get("password", "")
+            reason = request.form.get("reason", "")
+            ok, text = access_store.create_account_request(username, password, email, reason)
+            if ok:
+                msg = text
+            else:
+                err = text
+
+        return render_template_string(
+            """
+            <html><body>
+            <h1>Request account</h1>
+            {% if msg %}<p style="color:green">{{ msg }}</p>{% endif %}
+            {% if err %}<p style="color:red">{{ err }}</p>{% endif %}
+            <form method="post">
+              <label>Username <input name="username"></label><br/>
+              <label>Email <input name="email" type="email"></label><br/>
+              <label>Password <input name="password" type="password"></label><br/>
+              <label>Reason <textarea name="reason"></textarea></label><br/>
+              <button type="submit">Submit request</button>
+            </form>
+            <p><a href="{{ url_for('index') }}">Home</a></p>
+            </body></html>
+            """,
+            msg=msg,
+            err=err,
+        )
+
+    @app.route("/download", methods=["POST"])
+    def download():
+        user = current_user()
+        storage_root = cfg.get("storage_root")
+        if not storage_root:
+            abort(404)
+
+        instruments = request.form.getlist("instrument")
+        if not instruments:
+            abort(400, "Select at least one instrument")
+
+        allowed = [inst for inst in instruments if access_store.can_download(user, inst)]
+        if not allowed:
+            abort(403)
+
+        from_date = parse_date_ymd(request.form.get("from_date", ""))
+        to_date = parse_date_ymd(request.form.get("to_date", ""))
+        if from_date and to_date and to_date < from_date:
+            abort(400, "to_date must be >= from_date")
+
+        zip_path, count = make_zip_for_download(storage_root, allowed, from_date=from_date, to_date=to_date)
+        if count == 0:
+            zip_path.unlink(missing_ok=True)
+            abort(404, "No data files found for selected filters")
+
+        return send_file(
+            zip_path,
+            as_attachment=True,
+            download_name=f"collector_data_{datetime.now().strftime('%Y%m%dT%H%M%S')}.zip",
+            mimetype="application/zip",
+        )
+
+    @app.route("/admin")
+    def admin():
+        admin_user = require_admin()
+        if not isinstance(admin_user, dict):
+            return admin_user
+
+        storage_root = cfg.get("storage_root")
+        instruments = collect_instruments(storage_root) if storage_root else []
+        policies = access_store.list_policies(instruments)
+        users = access_store.list_users()
+        pending_requests = access_store.list_account_requests(status="pending")
+
+        user_access = {u["username"]: access_store.get_user_instruments(u["username"]) for u in users}
+
+        return render_template_string(
+            """
+            <html><body>
+            <h1>Admin panel</h1>
+            <p>Logged in as {{ admin_user.username }} - <a href="{{ url_for('index') }}">Home</a></p>
+
+            <h2>Create user</h2>
+            <form method="post" action="{{ url_for('admin_create_user') }}">
+              <label>Username <input name="username"></label>
+              <label>Email <input name="email"></label>
+              <label>Password <input name="password" type="password"></label>
+              <label>Role
+                <select name="role">
+                  <option value="user">user</option>
+                  <option value="admin">admin</option>
+                </select>
+              </label>
+              <button type="submit">Create</button>
+            </form>
+
+            <h2>Pending account requests</h2>
+            {% if pending_requests %}
+              {% for r in pending_requests %}
+                <div style="border:1px solid #ccc; margin:6px; padding:6px;">
+                  <b>#{{ r.id }} {{ r.username }}</b> ({{ r.email }})<br/>
+                  {{ r.message }}<br/>
+                  <form method="post" action="{{ url_for('admin_approve_request', request_id=r.id) }}" style="display:inline;">
+                    <button type="submit">Approve</button>
+                  </form>
+                  <form method="post" action="{{ url_for('admin_reject_request', request_id=r.id) }}" style="display:inline;">
+                    <button type="submit">Reject</button>
+                  </form>
+                </div>
+              {% endfor %}
+            {% else %}
+              <p>No pending requests.</p>
+            {% endif %}
+
+            <h2>Instrument policies</h2>
+            {% if instruments %}
+              {% for inst in instruments %}
+                <form method="post" action="{{ url_for('admin_set_policy') }}">
+                  <input type="hidden" name="instrument_uuid" value="{{ inst }}">
+                  <b>{{ inst }}</b>
+                  <select name="policy">
+                    <option value="open" {% if policies[inst]=='open' %}selected{% endif %}>open (free download)</option>
+                    <option value="account" {% if policies[inst]=='account' %}selected{% endif %}>account (authenticated users)</option>
+                    <option value="restricted" {% if policies[inst]=='restricted' %}selected{% endif %}>restricted (assigned users only)</option>
+                  </select>
+                  <button type="submit">Save</button>
+                </form>
+              {% endfor %}
+            {% else %}
+              <p>No instruments found in storage.</p>
+            {% endif %}
+
+            <h2>User access (for restricted policy)</h2>
+            {% for u in users %}
+              <div style="border:1px solid #ccc; margin:6px; padding:6px;">
+                <b>{{ u.username }}</b> role={{ u.role }} active={{ u.active }}<br/>
+                currently allowed: {{ user_access[u.username] }}
+                <form method="post" action="{{ url_for('admin_set_user_access') }}">
+                  <input type="hidden" name="username" value="{{ u.username }}">
+                  <label>Instrument UUID <input name="instrument_uuid"></label>
+                  <select name="allow">
+                    <option value="1">allow</option>
+                    <option value="0">revoke</option>
+                  </select>
+                  <button type="submit">Apply</button>
+                </form>
+              </div>
+            {% endfor %}
+            </body></html>
+            """,
+            admin_user=admin_user,
+            instruments=instruments,
+            policies=policies,
+            users=users,
+            pending_requests=pending_requests,
+            user_access=user_access,
+        )
+
+    @app.route("/admin/create-user", methods=["POST"])
+    def admin_create_user():
+        admin_user = require_admin()
+        if not isinstance(admin_user, dict):
+            return admin_user
+
+        username = request.form.get("username", "")
+        email = request.form.get("email", "")
+        password = request.form.get("password", "")
+        role = request.form.get("role", "user")
+
+        if not password:
+            abort(400, "Password required")
+
+        ok, msg = access_store.create_user(username, password, email, role=role)
+        if not ok:
+            abort(400, msg)
+        return redirect(url_for("admin"))
+
+    @app.route("/admin/requests/<int:request_id>/approve", methods=["POST"])
+    def admin_approve_request(request_id: int):
+        admin_user = require_admin()
+        if not isinstance(admin_user, dict):
+            return admin_user
+        ok, msg = access_store.approve_request(request_id, admin_user["username"])
+        if not ok:
+            abort(400, msg)
+        return redirect(url_for("admin"))
+
+    @app.route("/admin/requests/<int:request_id>/reject", methods=["POST"])
+    def admin_reject_request(request_id: int):
+        admin_user = require_admin()
+        if not isinstance(admin_user, dict):
+            return admin_user
+        ok, msg = access_store.reject_request(request_id, admin_user["username"])
+        if not ok:
+            abort(400, msg)
+        return redirect(url_for("admin"))
+
+    @app.route("/admin/policy", methods=["POST"])
+    def admin_set_policy():
+        admin_user = require_admin()
+        if not isinstance(admin_user, dict):
+            return admin_user
+
+        instrument_uuid = request.form.get("instrument_uuid", "")
+        policy = request.form.get("policy", "")
+        ok, msg = access_store.set_policy(instrument_uuid, policy, admin_user["username"])
+        if not ok:
+            abort(400, msg)
+        return redirect(url_for("admin"))
+
+    @app.route("/admin/user-access", methods=["POST"])
+    def admin_set_user_access():
+        admin_user = require_admin()
+        if not isinstance(admin_user, dict):
+            return admin_user
+
+        username = request.form.get("username", "")
+        instrument_uuid = request.form.get("instrument_uuid", "")
+        allow = parse_boolish(request.form.get("allow", "1"), True)
+
+        ok, msg = access_store.set_user_instrument_access(username, instrument_uuid, allow)
+        if not ok:
+            abort(400, msg)
+        return redirect(url_for("admin"))
+
+    return app
 
 
 # ----------------------------
@@ -489,6 +1247,8 @@ runtime = {
     "write_api": None,
     "signalk_client": None,
     "csv_storage": None,
+    "http_thread": None,
+    "access_store": None,
 }
 
 
@@ -560,7 +1320,7 @@ def on_message(client, userdata, message):
                 logger.exception("Influx write failed for topic=%s: %s", topic, e)
 
     # CSV storage sink
-    if cfg["storage_root"]:
+    if cfg["enable_storage"]:
         storage_row = {
             "timestamp": dt.isoformat().replace("+00:00", "Z"),
             "topic": topic,
@@ -591,7 +1351,12 @@ def on_message(client, userdata, message):
             signalk_client = runtime["signalk_client"]
             try:
                 signalk_client.publish(json.dumps(delta, separators=(",", ":")))
-                logger.info("Signal K write topic=%s context=%s values=%d", topic, delta["context"], len(delta["updates"][0]["values"]))
+                logger.info(
+                    "Signal K write topic=%s context=%s values=%d",
+                    topic,
+                    delta["context"],
+                    len(delta["updates"][0]["values"]),
+                )
             except Exception as e:
                 logger.exception("Signal K publish failed for topic=%s: %s", topic, e)
 
@@ -619,6 +1384,24 @@ def shutdown(signum, frame):
     sys.exit(0)
 
 
+def start_web_gui(cfg: dict):
+    access_store = AccessStore(cfg["auth_db_path"])
+    access_store.ensure_admin(cfg["admin_user"], cfg["admin_password"])
+
+    app = create_web_app(cfg, access_store)
+
+    def run_http():
+        app.run(host=cfg["http_host"], port=cfg["http_port"], debug=False, use_reloader=False, threaded=True)
+
+    thread = threading.Thread(target=run_http, name="collector-web-gui", daemon=True)
+    thread.start()
+
+    runtime["access_store"] = access_store
+    runtime["http_thread"] = thread
+
+    logger.info("Web GUI enabled on http://%s:%s", cfg["http_host"], cfg["http_port"])
+
+
 def main():
     args = parse_args()
     cfg = load_config(args.config, args)
@@ -638,7 +1421,7 @@ def main():
     elif cfg["enable_influx"]:
         logger.info("InfluxDB output enabled in dry mode")
 
-    if cfg["storage_root"]:
+    if cfg["enable_storage"]:
         runtime["csv_storage"] = CSVHourlyStorage(cfg["storage_root"])
         if cfg["dry"]:
             logger.info("CSV storage enabled in dry mode (root=%s)", cfg["storage_root"])
@@ -655,6 +1438,9 @@ def main():
             )
             logger.info("Signal K output enabled (%s)", cfg["signalk_server_url"])
 
+    if cfg["enable_http"]:
+        start_web_gui(cfg)
+
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
@@ -662,13 +1448,13 @@ def main():
     mqtt_client.on_connect = on_connect
     mqtt_client.on_message = on_message
 
-    if cfg["mqtt_user"] is not None:
-        mqtt_client.username_pw_set(username=cfg["mqtt_user"], password=cfg["mqtt_password"])
+    if cfg["mqtt_user"]:
+        mqtt_client.username_pw_set(username=cfg["mqtt_user"], password=cfg["mqtt_pass"])
 
     mqtt_client.reconnect_delay_set(min_delay=1, max_delay=60)
 
-    logger.info("Connecting to MQTT %s:%d", cfg["mqtt_address"], cfg["mqtt_port"])
-    mqtt_client.connect(cfg["mqtt_address"], cfg["mqtt_port"])
+    logger.info("Connecting to MQTT %s:%d", cfg["mqtt_broker"], cfg["mqtt_port"])
+    mqtt_client.connect(cfg["mqtt_broker"], cfg["mqtt_port"])
     mqtt_client.loop_forever()
 
 
