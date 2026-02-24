@@ -64,6 +64,52 @@ python3 main.py --config config.json --influxdb false --signalk true --storage /
 python3 main.py --config config.json --dry
 ```
 
+## Deployment with Docker
+
+This repository includes:
+
+- [`Dockerfile`](/Users/raffaelemontella/Documents/New project/sensor-network-collector/Dockerfile)
+- [`docker-compose.yml`](/Users/raffaelemontella/Documents/New project/sensor-network-collector/docker-compose.yml)
+
+Before running with Docker, update `config.json` for container networking and persistent paths.
+
+Minimum recommended changes:
+
+```json
+{
+  "mqttBroker": "your-mqtt-host",
+  "mqttPort": 1883,
+  "pathStorage": "/data/storage",
+  "authDbPath": "/data/collector_auth.sqlite",
+  "httpHost": "0.0.0.0",
+  "httpPort": 8080
+}
+```
+
+Build and start:
+
+```bash
+docker compose up -d --build
+```
+
+View logs:
+
+```bash
+docker compose logs -f collector
+```
+
+Stop:
+
+```bash
+docker compose down
+```
+
+Notes:
+
+- `./config.json` is mounted into the container at `/app/config.json` (read-only).
+- `./data` is mounted at `/data` and should be used for CSV/auth persistence.
+- If MQTT/InfluxDB run on the Docker host, use host-reachable addresses (not `localhost` inside container).
+
 ## Configuration (`config.json`)
 
 Example:

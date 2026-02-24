@@ -1,0 +1,13 @@
+services:
+  collector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sensor-network-collector
+    restart: unless-stopped
+    command: ["python", "main.py", "--config", "/app/config.json"]
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./data:/data
+    ports:
+      - "8080:8080"
