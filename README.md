@@ -66,14 +66,37 @@ python3 main.py --config config.json --dry
 
 ## Deployment with Docker
 
-This repository includes:
+Use the provided:
 
 - [`Dockerfile`](/Users/raffaelemontella/Documents/New project/sensor-network-collector/Dockerfile)
 - [`docker-compose.yml`](/Users/raffaelemontella/Documents/New project/sensor-network-collector/docker-compose.yml)
 
-Before running with Docker, update `config.json` for container networking and persistent paths.
+### Step 1: Prerequisites
 
-Minimum recommended changes:
+Install:
+
+- Docker Engine
+- Docker Compose v2 (`docker compose`)
+
+Verify:
+
+```bash
+docker --version
+docker compose version
+```
+
+### Step 2: Prepare local files
+
+From the project root:
+
+```bash
+mkdir -p data
+cp config.json config.local.json
+```
+
+Then edit `config.local.json` for your environment.
+
+Recommended values for Docker:
 
 ```json
 {
@@ -86,17 +109,46 @@ Minimum recommended changes:
 }
 ```
 
-Build and start:
+Important networking note:
+
+- Do not use `localhost` for remote MQTT/InfluxDB services.
+- Use a reachable hostname/IP from inside the container.
+
+### Step 3: Point compose to your config
+
+Edit [`docker-compose.yml`](/Users/raffaelemontella/Documents/New project/sensor-network-collector/docker-compose.yml) volume line:
+
+```yaml
+- ./config.local.json:/app/config.json:ro
+```
+
+This keeps your customized config separate from the default example.
+
+### Step 4: Build and start
 
 ```bash
 docker compose up -d --build
 ```
 
-View logs:
+### Step 5: Verify service health
+
+Check container status:
+
+```bash
+docker compose ps
+```
+
+Check live logs:
 
 ```bash
 docker compose logs -f collector
 ```
+
+Check web GUI (if `httpEnabled=true`):
+
+- [http://localhost:8080](http://localhost:8080)
+
+### Step 6: Daily operations
 
 Stop:
 
@@ -104,11 +156,30 @@ Stop:
 docker compose down
 ```
 
-Notes:
+Restart:
 
-- `./config.json` is mounted into the container at `/app/config.json` (read-only).
-- `./data` is mounted at `/data` and should be used for CSV/auth persistence.
-- If MQTT/InfluxDB run on the Docker host, use host-reachable addresses (not `localhost` inside container).
+```bash
+docker compose restart collector
+```
+
+Update after code/config changes:
+
+```bash
+docker compose up -d --build
+```
+
+### Step 7: Persistence and backup
+
+Persisted data is in local `./data` (mounted to `/data` in container), including:
+
+- CSV storage files
+- auth/policy SQLite DB (if enabled)
+
+Backup:
+
+```bash
+tar -czf sensor-network-collector-data-backup.tgz data/
+```
 
 ## Configuration (`config.json`)
 
