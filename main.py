@@ -1260,6 +1260,30 @@ def maybe_fix_influx_record_type_conflict(record: dict, error: Exception):
     fixed["fields"] = fields
     return fixed, field, existing_type
 
+
+def write_influx_with_type_conflict_retries(write_api, cfg: dict, record: dict, topic: str, max_retries: int = 3):
+    attempt = 0
+    current = dict(record)
+    while True:
+        try:
+            write_api.write(bucket=cfg["influxdb_bucket"], org=cfg["influxdb_org"], record=current)
+            return True
+        except Exception as e:
+            fixed_record, field_name, existing_type = maybe_fix_influx_record_type_conflict(current, e)
+            if fixed_record is None or attempt >= max_retries:
+                logger.exception("Influx write failed for topic=%s: %s", topic, e)
+                return False
+
+            attempt += 1
+            logger.warning(
+                "Influx conflict retry topic=%s attempt=%d field=%s target_type=%s",
+                topic,
+                attempt,
+                field_name,
+                existing_type,
+            )
+            current = fixed_record
+
 def create_web_app(cfg: dict, access_store: AccessStore):
     app = Flask(__name__)
     app.secret_key = cfg["web_session_secret"] or secrets.token_hex(32)
@@ -2139,24 +2163,9 @@ def on_message(client, userdata, message):
             logger.info("DRY INFLUX topic=%s record=%s", topic, influx_record)
         else:
             write_api = runtime["write_api"]
-            try:
-                write_api.write(bucket=cfg["influxdb_bucket"], org=cfg["influxdb_org"], record=influx_record)
+            ok = write_influx_with_type_conflict_retries(write_api, cfg, influx_record, topic)
+            if ok:
                 logger.info("Influx write topic=%s fields=%d time=%s", topic, len(flat_fields), dt.isoformat())
-            except Exception as e:
-                fixed_record, field_name, existing_type = maybe_fix_influx_record_type_conflict(influx_record, e)
-                if fixed_record is not None:
-                    try:
-                        write_api.write(bucket=cfg["influxdb_bucket"], org=cfg["influxdb_org"], record=fixed_record)
-                        logger.warning(
-                            "Influx write retried with coerced field type topic=%s field=%s target_type=%s",
-                            topic,
-                            field_name,
-                            existing_type,
-                        )
-                    except Exception as retry_error:
-                        logger.exception("Influx retry failed for topic=%s: %s", topic, retry_error)
-                else:
-                    logger.exception("Influx write failed for topic=%s: %s", topic, e)
 
     # CSV storage sink
     if cfg["enable_storage"]:
