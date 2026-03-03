@@ -208,6 +208,10 @@ Example:
   "signalk": false,
   "signalkServerUrl": "ws://localhost:3000/signalk/v1/stream",
   "signalkToken": "",
+  "signalkClientId": "9d95a6f4-7c8e-4a2f-9fd8-8a190f8f24be",
+  "signalkAccessDescription": "sensor-network-collector",
+  "signalkAccessPollSec": 10,
+  "signalkAccessTimeoutSec": 10,
   "signalkContextPrefix": "meteo",
   "signalkSourceLabel": "sensor-network-collector",
   "signalkPathMap": {},
@@ -243,6 +247,24 @@ Standard conversions:
 - `WindDir`: degrees -> radians
 
 If coordinates are present (`position` or GeoJSON), it emits `navigation.position`.
+
+### Automatic Signal K access requests
+
+The collector implements Signal K access requests following the Signal K 1.5 flow:
+
+1. If `signalkToken` is empty, it sends `POST /signalk/v1/access/requests` with `clientId` and `description`.
+2. It polls the returned `href` until access is approved.
+3. While request state is pending, the collector keeps running other sinks (CSV and InfluxDB).
+4. When approved, it writes the token to `signalkToken` in the config file and starts Signal K publishing.
+5. If a token becomes invalid at runtime (for example 401/403 on publish), it restarts the access-request flow.
+
+Relevant keys:
+
+- `signalkToken`: current token; auto-updated when approved
+- `signalkClientId`: UUID client identifier used in access requests
+- `signalkAccessDescription`: request description string
+- `signalkAccessPollSec`: polling interval for pending requests
+- `signalkAccessTimeoutSec`: HTTP timeout for access request calls
 
 ## CSV storage (`--storage`)
 

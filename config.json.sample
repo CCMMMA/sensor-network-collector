@@ -1,23 +1,19 @@
 {
   "logLevel": "INFO",
-
   "mqttBroker": "localhost",
   "mqttPort": 1883,
   "mqttUser": "",
   "mqttPass": "",
   "mqttTopic": "#",
   "skipEmptyFields": true,
-
   "storage": true,
   "pathStorage": "/tmp/sensor-network-collector",
-
   "influxdb": true,
   "influxdbUrl": "http://localhost:8086",
   "influxdbToken": "replace-with-influx-token",
   "influxdbOrg": "replace-with-influx-org",
   "influxdbBucket": "replace-with-influx-bucket",
   "influxMeasurement": "mqtt_data",
-
   "signalk": false,
   "signalkServerUrl": "ws://localhost:3000/signalk/v1/stream",
   "signalkToken": "",
@@ -30,12 +26,15 @@
     "WindSpeed": "environment.wind.speedApparent",
     "WindDir": "environment.wind.angleApparent"
   },
-
   "httpEnabled": true,
   "httpHost": "0.0.0.0",
   "httpPort": 8080,
   "authDbPath": "/tmp/sensor-network-collector/collector_auth.sqlite",
   "webSessionSecret": "replace-with-a-strong-random-secret",
   "adminUser": "admin",
-  "adminPassword": "change-me-now"
+  "adminPassword": "change-me-now",
+  "signalkClientId": "9d95a6f4-7c8e-4a2f-9fd8-8a190f8f24be",
+  "signalkAccessDescription": "sensor-network-collector",
+  "signalkAccessPollSec": 10,
+  "signalkAccessTimeoutSec": 10
 }

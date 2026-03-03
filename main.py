@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,8 @@ from flask import Flask, abort, redirect, render_template_string, request, send_
 from influxdb_client import InfluxDBClient
 from influxdb_client.client.write_api import SYNCHRONOUS
 from werkzeug.security import check_password_hash, generate_password_hash
+
+from signalk_access import SignalKAccessManager
 
 
 # ----------------------------
@@ -220,6 +223,24 @@ def load_config(path: str, args) -> dict:
         "signalk_source_label": str(
             cfg_value(raw, ["signalkSourceLabel", "signalk_source_label"], env_name="SIGNALK_SOURCE_LABEL", default="sensor-network-collector")
         ),
+        "signalk_access_client_id": str(
+            cfg_value(raw, ["signalkClientId", "signalk_client_id"], env_name="SIGNALK_CLIENT_ID", default="")
+            or str(uuid.uuid4())
+        ),
+        "signalk_access_description": str(
+            cfg_value(
+                raw,
+                ["signalkAccessDescription", "signalk_access_description"],
+                env_name="SIGNALK_ACCESS_DESCRIPTION",
+                default="sensor-network-collector",
+            )
+        ),
+        "signalk_access_poll_sec": int(
+            cfg_value(raw, ["signalkAccessPollSec", "signalk_access_poll_sec"], env_name="SIGNALK_ACCESS_POLL_SEC", default=10)
+        ),
+        "signalk_access_timeout_sec": int(
+            cfg_value(raw, ["signalkAccessTimeoutSec", "signalk_access_timeout_sec"], env_name="SIGNALK_ACCESS_TIMEOUT_SEC", default=10)
+        ),
         "http_host": str(cfg_value(raw, ["httpHost"], env_name="HTTP_HOST", default="0.0.0.0")),
         "http_port": int(cfg_value(raw, ["httpPort"], env_name="HTTP_PORT", default=8080)),
         "auth_db_path": str(
@@ -256,6 +277,7 @@ def load_config(path: str, args) -> dict:
     if not cfg["enable_influx"] and not cfg["enable_signalk"] and not cfg["enable_storage"]:
         raise RuntimeError("No outputs enabled: enable at least one of influxdb, signalk, storage")
 
+    cfg["config_path"] = str(Path(path).resolve())
     return cfg
 
 
@@ -423,6 +445,9 @@ class SignalKWebsocketPublisher:
         except Exception:
             self.close()
             raise
+
+    def check_connection(self):
+        self._connect()
 
     def close(self):
         if self._ws is None:
@@ -1246,11 +1271,58 @@ runtime = {
     "influx_client": None,
     "write_api": None,
     "signalk_client": None,
+    "signalk_access_manager": None,
+    "signalk_lock": threading.Lock(),
     "csv_storage": None,
     "http_thread": None,
     "access_store": None,
 }
 
+
+
+
+def get_signalk_client():
+    with runtime["signalk_lock"]:
+        return runtime.get("signalk_client")
+
+
+def set_signalk_client(client):
+    with runtime["signalk_lock"]:
+        old = runtime.get("signalk_client")
+        runtime["signalk_client"] = client
+    if old is not None and old is not client:
+        try:
+            old.close()
+        except Exception:
+            pass
+
+
+def build_signalk_access_manager(cfg: dict):
+    def client_factory(token: str):
+        return SignalKWebsocketPublisher(
+            server_url=cfg["signalk_server_url"],
+            token=token,
+            timeout=float(cfg["signalk_access_timeout_sec"]),
+        )
+
+    def on_token_approved(token: str):
+        cfg["signalk_token"] = token
+
+    return SignalKAccessManager(
+        server_url=cfg["signalk_server_url"],
+        initial_token=cfg.get("signalk_token", ""),
+        config_path=cfg["config_path"],
+        config_token_key="signalkToken",
+        client_id=cfg["signalk_access_client_id"],
+        description=cfg["signalk_access_description"],
+        poll_interval_sec=max(2, int(cfg["signalk_access_poll_sec"])),
+        request_timeout_sec=max(2, int(cfg["signalk_access_timeout_sec"])),
+        client_factory=client_factory,
+        on_client_ready=set_signalk_client,
+        on_client_unavailable=lambda: set_signalk_client(None),
+        on_token_approved=on_token_approved,
+        logger=logger,
+    )
 
 # ----------------------------
 # MQTT callbacks
@@ -1348,7 +1420,10 @@ def on_message(client, userdata, message):
         if cfg["dry"]:
             logger.info("DRY SIGNALK topic=%s delta=%s", topic, json.dumps(delta, separators=(",", ":")))
         else:
-            signalk_client = runtime["signalk_client"]
+            signalk_client = get_signalk_client()
+            if signalk_client is None:
+                logger.debug("Signal K client unavailable (access pending or disconnected), skipping topic=%s", topic)
+                return
             try:
                 signalk_client.publish(json.dumps(delta, separators=(",", ":")))
                 logger.info(
@@ -1359,6 +1434,11 @@ def on_message(client, userdata, message):
                 )
             except Exception as e:
                 logger.exception("Signal K publish failed for topic=%s: %s", topic, e)
+                msg = str(e).lower()
+                if any(x in msg for x in ("401", "403", "unauthoriz", "forbidden", "token")):
+                    manager = runtime.get("signalk_access_manager")
+                    if manager is not None:
+                        manager.notify_token_invalid()
 
 
 # ----------------------------
@@ -1374,7 +1454,14 @@ def shutdown(signum, frame):
         except Exception:
             pass
 
-    signalk_client = runtime.get("signalk_client")
+    manager = runtime.get("signalk_access_manager")
+    if manager is not None:
+        try:
+            manager.stop()
+        except Exception:
+            pass
+
+    signalk_client = get_signalk_client()
     if signalk_client is not None:
         try:
             signalk_client.close()
@@ -1432,11 +1519,10 @@ def main():
         if cfg["dry"]:
             logger.info("Signal K output enabled in dry mode")
         else:
-            runtime["signalk_client"] = SignalKWebsocketPublisher(
-                server_url=cfg["signalk_server_url"],
-                token=cfg["signalk_token"],
-            )
-            logger.info("Signal K output enabled (%s)", cfg["signalk_server_url"])
+            manager = build_signalk_access_manager(cfg)
+            runtime["signalk_access_manager"] = manager
+            manager.start()
+            logger.info("Signal K output enabled (%s) with access-request workflow", cfg["signalk_server_url"])
 
     if cfg["enable_http"]:
         start_web_gui(cfg)
