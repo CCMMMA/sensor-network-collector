@@ -1254,7 +1254,12 @@ def maybe_fix_influx_record_type_conflict(record: dict, error: Exception):
     try:
         fields[field] = coerce_for_influx_type(fields[field], existing_type)
     except Exception:
-        return None, field, existing_type
+        # If conversion is not possible (for example NaN -> integer), drop only
+        # the conflicting field and keep writing the rest of the point.
+        fields.pop(field, None)
+        fixed = dict(record)
+        fixed["fields"] = fields
+        return fixed, field, f"drop({existing_type})"
 
     fixed = dict(record)
     fixed["fields"] = fields
@@ -1275,6 +1280,13 @@ def write_influx_with_type_conflict_retries(write_api, cfg: dict, record: dict, 
                 return False
 
             attempt += 1
+            if not fixed_record.get("fields"):
+                logger.error(
+                    "Influx retry aborted topic=%s after removing conflicting field=%s; no fields left",
+                    topic,
+                    field_name,
+                )
+                return False
             logger.warning(
                 "Influx conflict retry topic=%s attempt=%d field=%s target_type=%s",
                 topic,
