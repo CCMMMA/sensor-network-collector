@@ -11,6 +11,8 @@ Threaded MQTT collector for weather/sensor networks, aligned with `vantage-publi
   - hourly CSV storage
 - Dry mode for safe runtime validation (`--dry`)
 - Web GUI for data download with authentication and access policies
+- Map-based station discovery on the home page
+- Data browsing per station with charts and tables
 
 ## Configuration Style (Homogeneous with `vantage-publisher`)
 
@@ -214,7 +216,27 @@ Example:
   "signalkAccessTimeoutSec": 10,
   "signalkContextPrefix": "meteo",
   "signalkSourceLabel": "sensor-network-collector",
-  "signalkPathMap": {},
+  "signalkPathMap": {
+    "BarTrend": {
+      "path": "environment.outside.pressureTrend",
+      "meta": {
+        "displayName": "Pressure Trend",
+        "units": "Pa/s"
+      }
+    },
+    "TempOut": {
+      "path": "environment.outside.temperature",
+      "meta": {
+        "units": "K"
+      }
+    },
+    "WindDir": {
+      "path": "environment.wind.angleApparent",
+      "meta": {
+        "units": "rad"
+      }
+    }
+  },
 
   "httpEnabled": true,
   "httpHost": "0.0.0.0",
@@ -239,12 +261,29 @@ Rules:
   - else standard mappings (same as `vantage-publisher`)
   - else fallback `environment.<sanitized_key>`
 
-Standard conversions:
+`signalkPathMap` supports both legacy and extended forms:
 
-- `TempOut`, `TempIn`: Celsius -> Kelvin
-- `Barometer`: hPa -> Pa
-- `HumOut`, `HumIn`: percent -> ratio
-- `WindDir`: degrees -> radians
+```json
+{
+  "TempOut": "environment.outside.temperature",
+  "BarTrend": {
+    "path": "environment.outside.pressureTrend",
+    "meta": {
+      "displayName": "Pressure Trend",
+      "units": "Pa/s"
+    }
+  }
+}
+```
+
+- If `meta` is defined for a mapped field, the collector sends it as Signal K `meta` delta for that `path`.
+
+Standard SI-friendly conversions applied before Signal K publish:
+
+- temperature-like values -> Kelvin (for temperature paths/keys)
+- angular values/degrees -> radians (for angle/bearing/course/dir paths/keys)
+- pressure-like values hPa -> Pa
+- humidity percent -> ratio
 
 If coordinates are present (`position` or GeoJSON), it emits `navigation.position`.
 
@@ -282,6 +321,7 @@ Enable web GUI with `httpEnabled=true` or `--http true`.
 
 Features:
 
+- home page map with all stations discovered from `pathStorage`
 - login/logout
 - account request form for new users
 - admin panel to:
@@ -289,6 +329,10 @@ Features:
   - approve/reject account requests
   - define per-instrument policy
   - grant/revoke per-user access for restricted instruments
+- station browsing UI (`/station/<uuid>`) with:
+  - numeric charts
+  - tabular data preview
+  - filtered download action
 - authenticated or anonymous downloads depending on policy
 
 Policy levels (per instrument):
@@ -302,6 +346,10 @@ Downloads:
 - user can select one or more instruments
 - optional date range filters
 - output is a ZIP with matching CSV files from `pathStorage`
+- permission checks are enforced server-side for every requested station
+  - unknown stations are rejected
+  - unauthorized stations are rejected
+  - this applies to both browsing and download endpoints
 
 ### Web access configuration examples for `pathStorage`
 

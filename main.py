@@ -261,9 +261,34 @@ def load_config(path: str, args) -> dict:
         except json.JSONDecodeError:
             logger.warning("Invalid SIGNALK_PATH_MAP JSON, using empty map")
             raw_map = {}
-    cfg["signalk_path_map"] = {
-        str(k): str(v) for k, v in (raw_map.items() if isinstance(raw_map, dict) else []) if v
-    }
+
+    parsed_map = {}
+    if isinstance(raw_map, dict):
+        for k, v in raw_map.items():
+            key = str(k)
+            if isinstance(v, str):
+                path = v.strip()
+                if path:
+                    parsed_map[key] = {"path": path}
+                continue
+
+            if isinstance(v, dict):
+                path = str(v.get("path", "")).strip()
+                if not path:
+                    logger.warning("Ignoring signalkPathMap entry '%s' without a valid 'path'", key)
+                    continue
+                meta = v.get("meta")
+                if meta is None and "meta:" in v:
+                    meta = v.get("meta:")
+                entry = {"path": path}
+                if meta is not None:
+                    entry["meta"] = meta
+                parsed_map[key] = entry
+                continue
+
+            logger.warning("Ignoring signalkPathMap entry '%s' with unsupported type %s", key, type(v).__name__)
+
+    cfg["signalk_path_map"] = parsed_map
 
     if cfg["enable_signalk"] and not cfg["signalk_server_url"]:
         raise RuntimeError("Signal K enabled but signalkServerUrl/signalk_server_url is empty")
@@ -321,17 +346,37 @@ def topic_to_context(topic: str, prefix: str) -> str:
     return f"{head}.{suffix}" if head else suffix
 
 
-def convert_signalk_value(key: str, value):
+def convert_signalk_value(key: str, path: str, value):
     if value is None:
         return None
-    if key in ("TempOut", "TempIn"):
-        return float(value) + 273.15
-    if key == "Barometer":
-        return float(value) * 100.0
-    if key in ("HumOut", "HumIn"):
-        return float(value) / 100.0
-    if key == "WindDir":
-        return math.radians(float(value))
+
+    # Keep non-numeric values untouched.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+
+    v = float(value)
+    key_l = str(key).lower()
+    path_l = str(path or "").lower()
+
+    # Temperatures in Signal K are Kelvin.
+    if "temperature" in path_l or key_l.startswith("temp"):
+        # Heuristic: values below 200 are assumed Celsius.
+        return v + 273.15 if v < 200 else v
+
+    # Pressure in Signal K is Pascal.
+    if "pressure" in path_l or "barometer" in key_l:
+        # Heuristic: values in hPa are typically around 900-1100.
+        return v * 100.0 if abs(v) < 2000 else v
+
+    # Relative humidity ratio [0..1].
+    if "humidity" in path_l or key_l in ("humout", "humin"):
+        return v / 100.0 if v > 1.0 else v
+
+    # Angular quantities in Signal K are radians.
+    angle_tokens = ("angle", "heading", "bearing", "course", "track", "yaw", "pitch", "roll", "leeway")
+    if any(token in path_l for token in angle_tokens) or any(token in key_l for token in ("dir", "deg", "angle")):
+        return math.radians(v)
+
     return value
 
 
@@ -517,6 +562,8 @@ def build_signalk_delta(topic: str, data: dict, tags: dict, dt: datetime, cfg: d
     path_map = cfg.get("signalk_path_map", {})
 
     values = []
+    metas = []
+    seen_meta_paths = set()
 
     pos = extract_position(data, tags)
     if pos is not None:
@@ -543,10 +590,23 @@ def build_signalk_delta(topic: str, data: dict, tags: dict, dt: datetime, cfg: d
             continue
 
         mapped = path_map.get(key)
-        path = str(mapped).strip() if mapped else SIGNALK_STANDARD_PATHS.get(key, f"environment.{sanitize_signalk_key(key)}")
+        mapped_meta = None
+
+        if isinstance(mapped, dict):
+            path = str(mapped.get("path", "")).strip()
+            mapped_meta = mapped.get("meta")
+            if mapped_meta is None and "meta:" in mapped:
+                mapped_meta = mapped.get("meta:")
+        elif isinstance(mapped, str):
+            path = mapped.strip()
+        else:
+            path = ""
+
+        if not path:
+            path = SIGNALK_STANDARD_PATHS.get(key, f"environment.{sanitize_signalk_key(key)}")
 
         try:
-            value = convert_signalk_value(key, raw)
+            value = convert_signalk_value(key, path, raw)
         except Exception:
             value = raw
 
@@ -555,18 +615,25 @@ def build_signalk_delta(topic: str, data: dict, tags: dict, dt: datetime, cfg: d
 
         values.append({"path": path, "value": value})
 
-    if not values:
+        if mapped_meta is not None and path not in seen_meta_paths:
+            metas.append({"path": path, "value": mapped_meta})
+            seen_meta_paths.add(path)
+
+    if not values and not metas:
         return None
+
+    update = {
+        "timestamp": dt.isoformat().replace("+00:00", "Z"),
+        "$source": cfg.get("signalk_source_label", "sensor-network-collector"),
+    }
+    if values:
+        update["values"] = values
+    if metas:
+        update["meta"] = metas
 
     return {
         "context": context,
-        "updates": [
-            {
-                "timestamp": dt.isoformat().replace("+00:00", "Z"),
-                "$source": cfg.get("signalk_source_label", "sensor-network-collector"),
-                "values": values,
-            }
-        ],
+        "updates": [update],
     }
 
 
@@ -915,6 +982,118 @@ def make_zip_for_download(storage_root: str, instrument_uuids, from_date=None, t
     return tmp_path, count
 
 
+
+
+def _to_float(value):
+    try:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        s = str(value).strip()
+        if not s:
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
+def _extract_lat_lon_from_row(row: dict):
+    # Direct latitude/longitude columns
+    key_pairs = [
+        ("latitude", "longitude"),
+        ("lat", "lon"),
+        ("lat", "lng"),
+    ]
+    for k_lat, k_lon in key_pairs:
+        lat = _to_float(row.get(k_lat))
+        lon = _to_float(row.get(k_lon))
+        if lat is not None and lon is not None:
+            return lat, lon
+
+    # Nested JSON in 'position' column
+    pos_raw = row.get("position")
+    if isinstance(pos_raw, str) and pos_raw.strip().startswith("{"):
+        try:
+            pos = json.loads(pos_raw)
+            lat = _to_float(pos.get("latitude"))
+            lon = _to_float(pos.get("longitude"))
+            if lat is not None and lon is not None:
+                return lat, lon
+        except Exception:
+            pass
+
+    return None, None
+
+
+def get_station_preview(storage_root: str, instrument_uuid: str):
+    files = list_csv_files_for_instrument(storage_root, instrument_uuid)
+    if not files:
+        return {"latitude": None, "longitude": None, "last_timestamp": None, "rows": 0}
+
+    total_rows = 0
+    last_timestamp = None
+    latitude = None
+    longitude = None
+
+    # Scan newest files first so map can show latest known position quickly.
+    for csv_path in reversed(files):
+        try:
+            with csv_path.open("r", newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+        except Exception:
+            continue
+
+        if not rows:
+            continue
+
+        total_rows += len(rows)
+
+        if last_timestamp is None:
+            last_timestamp = rows[-1].get("timestamp")
+
+        if latitude is None or longitude is None:
+            lat, lon = _extract_lat_lon_from_row(rows[-1])
+            if lat is not None and lon is not None:
+                latitude, longitude = lat, lon
+
+        if latitude is not None and longitude is not None and last_timestamp is not None:
+            break
+
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "last_timestamp": last_timestamp,
+        "rows": total_rows,
+    }
+
+
+def load_station_rows(storage_root: str, instrument_uuid: str, from_date=None, to_date=None, limit=400):
+    files = list_csv_files_for_instrument(storage_root, instrument_uuid, from_date=from_date, to_date=to_date)
+    out = []
+    for csv_path in files:
+        try:
+            with csv_path.open("r", newline="", encoding="utf-8") as f:
+                out.extend(list(csv.DictReader(f)))
+        except Exception:
+            continue
+
+    if limit and len(out) > limit:
+        out = out[-limit:]
+    return out
+
+
+def extract_numeric_series(rows, excluded=None):
+    excluded = set(excluded or [])
+    numeric_keys = set()
+    for row in rows:
+        for k, v in row.items():
+            if k in excluded:
+                continue
+            if _to_float(v) is not None:
+                numeric_keys.add(k)
+    return sorted(numeric_keys)
+
 def create_web_app(cfg: dict, access_store: AccessStore):
     app = Flask(__name__)
     app.secret_key = cfg["web_session_secret"] or secrets.token_hex(32)
@@ -928,12 +1107,6 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             return None
         return access_store.get_user(username)
 
-    def require_login():
-        user = current_user()
-        if not user:
-            return redirect(url_for("login", next=request.path))
-        return user
-
     def require_admin():
         user = current_user()
         if not user:
@@ -942,57 +1115,305 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             abort(403)
         return user
 
+    def storage_root_or_404():
+        storage_root = cfg.get("storage_root")
+        if not storage_root:
+            abort(404, "Storage is not enabled/configured")
+        return storage_root
+
+    def available_instruments(storage_root: str):
+        return collect_instruments(storage_root)
+
+    def station_is_accessible(user, instrument_uuid: str):
+        return access_store.can_download(user, instrument_uuid)
+
     @app.route("/")
     def index():
         user = current_user()
         storage_root = cfg.get("storage_root")
-        instruments = collect_instruments(storage_root) if storage_root else []
+        instruments = available_instruments(storage_root) if storage_root else []
         policies = access_store.list_policies(instruments)
 
-        visible = []
+        stations = []
         for inst in instruments:
-            if access_store.can_download(user, inst):
-                visible.append(inst)
-            elif policies.get(inst) == "open":
-                visible.append(inst)
+            preview = get_station_preview(storage_root, inst)
+            can_access = station_is_accessible(user, inst)
+            stations.append(
+                {
+                    "uuid": inst,
+                    "policy": policies.get(inst, "account"),
+                    "can_access": can_access,
+                    "latitude": preview["latitude"],
+                    "longitude": preview["longitude"],
+                    "last_timestamp": preview["last_timestamp"],
+                    "rows": preview["rows"],
+                }
+            )
+
+        # Map center based on first station with known coordinates.
+        center = {"lat": 40.0, "lon": 14.0, "zoom": 6}
+        for st in stations:
+            if st["latitude"] is not None and st["longitude"] is not None:
+                center = {"lat": st["latitude"], "lon": st["longitude"], "zoom": 9}
+                break
+
+        clickable = [s for s in stations if s["can_access"]]
 
         return render_template_string(
             """
-            <html><body>
-            <h1>Sensor Network Collector - Data Portal</h1>
-            {% if user %}
-              <p>Logged in as <b>{{ user.username }}</b> ({{ user.role }}) - <a href="{{ url_for('logout') }}">Logout</a></p>
-              {% if user.role == 'admin' %}<p><a href="{{ url_for('admin') }}">Admin panel</a></p>{% endif %}
-            {% else %}
-              <p><a href="{{ url_for('login') }}">Login</a> | <a href="{{ url_for('request_account') }}">Request account</a></p>
-            {% endif %}
+            <html>
+            <head>
+              <title>Sensor Network Collector - Data Portal</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+              <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+              <style>
+                body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 16px; }
+                #map { height: 420px; border: 1px solid #ccc; margin-bottom: 16px; }
+                .panel { border: 1px solid #ddd; padding: 12px; margin-bottom: 12px; border-radius: 8px; }
+              </style>
+            </head>
+            <body>
+              <h1>Sensor Network Collector - Data Portal</h1>
+              {% if user %}
+                <p>Logged in as <b>{{ user.username }}</b> ({{ user.role }}) - <a href="{{ url_for('logout') }}">Logout</a></p>
+                {% if user.role == 'admin' %}<p><a href="{{ url_for('admin') }}">Admin panel</a></p>{% endif %}
+              {% else %}
+                <p><a href="{{ url_for('login') }}">Login</a> | <a href="{{ url_for('request_account') }}">Request account</a></p>
+              {% endif %}
 
-            <h2>Download data</h2>
-            {% if not storage_root %}
-              <p>Storage is not enabled/configured.</p>
-            {% elif not instruments %}
-              <p>No instrument folders found under {{ storage_root }}.</p>
-            {% elif not visible %}
-              <p>No instruments available with your current permissions.</p>
-            {% else %}
-              <form method="post" action="{{ url_for('download') }}">
-                <p>Select one or more instruments:</p>
-                {% for inst in visible %}
-                  <label><input type="checkbox" name="instrument" value="{{ inst }}"> {{ inst }} (policy={{ policies[inst] }})</label><br/>
-                {% endfor %}
-                <p>Date filter (optional):</p>
-                <label>From <input type="date" name="from_date"></label>
-                <label>To <input type="date" name="to_date"></label>
-                <p><button type="submit">Download ZIP</button></p>
-              </form>
-            {% endif %}
-            </body></html>
+              <div class="panel">
+                <h2>Stations map</h2>
+                {% if not storage_root %}
+                  <p>Storage is not enabled/configured.</p>
+                {% elif not stations %}
+                  <p>No station folders found under {{ storage_root }}.</p>
+                {% else %}
+                  <div id="map"></div>
+                  <p>Green markers are clickable (browse/download allowed). Gray markers are visible but not accessible with current permissions.</p>
+                {% endif %}
+              </div>
+
+              <div class="panel">
+                <h2>Browse & download</h2>
+                {% if not clickable %}
+                  <p>No stations available with your current permissions.</p>
+                {% else %}
+                  <form method="post" action="{{ url_for('download') }}">
+                    {% for st in clickable %}
+                      <label>
+                        <input type="checkbox" name="instrument" value="{{ st.uuid }}"> {{ st.uuid }}
+                        (policy={{ st.policy }}, rows={{ st.rows }})
+                        <a href="{{ url_for('browse_station', instrument_uuid=st.uuid) }}">browse</a>
+                      </label><br/>
+                    {% endfor %}
+                    <p>Date filter (optional):</p>
+                    <label>From <input type="date" name="from_date"></label>
+                    <label>To <input type="date" name="to_date"></label>
+                    <p><button type="submit">Download ZIP</button></p>
+                  </form>
+                {% endif %}
+              </div>
+
+              <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+              <script>
+                const stations = {{ stations | tojson }};
+                if (stations.length > 0 && document.getElementById('map')) {
+                  const map = L.map('map').setView([{{ center.lat }}, {{ center.lon }}], {{ center.zoom }});
+                  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                    maxZoom: 19,
+                    attribution: '&copy; OpenStreetMap contributors'
+                  }).addTo(map);
+
+                  stations.forEach((s) => {
+                    if (s.latitude == null || s.longitude == null) {
+                      return;
+                    }
+                    const color = s.can_access ? '#1f9d55' : '#666';
+                    const marker = L.circleMarker([s.latitude, s.longitude], {
+                      radius: 8,
+                      color: color,
+                      fillColor: color,
+                      fillOpacity: 0.85
+                    }).addTo(map);
+
+                    let html = `<b>${s.uuid}</b><br/>policy=${s.policy}<br/>rows=${s.rows}`;
+                    if (s.last_timestamp) {
+                      html += `<br/>last=${s.last_timestamp}`;
+                    }
+                    if (s.can_access) {
+                      html += `<br/><a href="/station/${encodeURIComponent(s.uuid)}">browse station</a>`;
+                    } else {
+                      html += '<br/>no access with current user';
+                    }
+                    marker.bindPopup(html);
+                  });
+                }
+              </script>
+            </body>
+            </html>
             """,
             user=user,
-            instruments=instruments,
-            visible=visible,
-            policies=policies,
             storage_root=storage_root,
+            stations=stations,
+            clickable=clickable,
+            center=center,
+        )
+
+    @app.route("/station/<path:instrument_uuid>")
+    def browse_station(instrument_uuid: str):
+        user = current_user()
+        storage_root = storage_root_or_404()
+
+        instruments = set(available_instruments(storage_root))
+        if instrument_uuid not in instruments:
+            abort(404, "Station not found")
+
+        if not station_is_accessible(user, instrument_uuid):
+            abort(403)
+
+        from_date = parse_date_ymd(request.args.get("from_date", ""))
+        to_date = parse_date_ymd(request.args.get("to_date", ""))
+        if from_date and to_date and to_date < from_date:
+            abort(400, "to_date must be >= from_date")
+
+        rows = load_station_rows(storage_root, instrument_uuid, from_date=from_date, to_date=to_date, limit=600)
+        if not rows:
+            return render_template_string(
+                """
+                <html><body>
+                  <p><a href="{{ url_for('index') }}">Home</a></p>
+                  <h1>Station {{ instrument_uuid }}</h1>
+                  <p>No data rows found for the selected filters.</p>
+                </body></html>
+                """,
+                instrument_uuid=instrument_uuid,
+            )
+
+        excluded = {"timestamp", "topic", "uuid", "position", "latitude", "longitude", "lat", "lon", "lng"}
+        numeric_cols = extract_numeric_series(rows, excluded=excluded)
+
+        selected_field = request.args.get("field", "")
+        if selected_field not in numeric_cols:
+            selected_field = numeric_cols[0] if numeric_cols else ""
+
+        chart_labels = []
+        chart_values = []
+        if selected_field:
+            for row in rows:
+                y = _to_float(row.get(selected_field))
+                if y is None:
+                    continue
+                chart_labels.append(row.get("timestamp") or "")
+                chart_values.append(y)
+
+        table_rows = rows[-120:]
+        table_cols = list(table_rows[0].keys()) if table_rows else []
+
+        return render_template_string(
+            """
+            <html>
+            <head>
+              <title>Station {{ instrument_uuid }}</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+              <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+              <style>
+                body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 16px; }
+                table { border-collapse: collapse; width: 100%; font-size: 12px; }
+                th, td { border: 1px solid #ddd; padding: 4px; }
+                th { position: sticky; top: 0; background: #f8f8f8; }
+                .table-wrap { max-height: 420px; overflow: auto; border: 1px solid #ddd; }
+                .panel { border: 1px solid #ddd; padding: 12px; margin-bottom: 12px; border-radius: 8px; }
+              </style>
+            </head>
+            <body>
+              <p><a href="{{ url_for('index') }}">Home</a></p>
+              <h1>Station {{ instrument_uuid }}</h1>
+
+              <div class="panel">
+                <h2>Download station data</h2>
+                <form method="post" action="{{ url_for('download') }}">
+                  <input type="hidden" name="instrument" value="{{ instrument_uuid }}"/>
+                  <label>From <input type="date" name="from_date" value="{{ request.args.get('from_date','') }}"></label>
+                  <label>To <input type="date" name="to_date" value="{{ request.args.get('to_date','') }}"></label>
+                  <button type="submit">Download ZIP</button>
+                </form>
+              </div>
+
+              <div class="panel">
+                <h2>Chart</h2>
+                {% if not numeric_cols %}
+                  <p>No numeric columns available for charting.</p>
+                {% else %}
+                  <form method="get">
+                    <input type="hidden" name="from_date" value="{{ request.args.get('from_date','') }}"/>
+                    <input type="hidden" name="to_date" value="{{ request.args.get('to_date','') }}"/>
+                    <label>Field
+                      <select name="field">
+                        {% for c in numeric_cols %}
+                          <option value="{{ c }}" {% if c == selected_field %}selected{% endif %}>{{ c }}</option>
+                        {% endfor %}
+                      </select>
+                    </label>
+                    <button type="submit">Update</button>
+                  </form>
+                  <canvas id="chart" height="110"></canvas>
+                {% endif %}
+              </div>
+
+              <div class="panel">
+                <h2>Data table (last {{ table_rows|length }} rows)</h2>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>{% for c in table_cols %}<th>{{ c }}</th>{% endfor %}</tr>
+                    </thead>
+                    <tbody>
+                      {% for r in table_rows %}
+                        <tr>{% for c in table_cols %}<td>{{ r.get(c, '') }}</td>{% endfor %}</tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <script>
+                const labels = {{ chart_labels | tojson }};
+                const values = {{ chart_values | tojson }};
+                if (labels.length > 0 && document.getElementById('chart')) {
+                  new Chart(document.getElementById('chart'), {
+                    type: 'line',
+                    data: {
+                      labels,
+                      datasets: [{
+                        label: '{{ selected_field }}',
+                        data: values,
+                        borderColor: '#0b57d0',
+                        pointRadius: 0,
+                        tension: 0.2
+                      }]
+                    },
+                    options: {
+                      responsive: true,
+                      scales: {
+                        x: { display: true },
+                        y: { display: true }
+                      }
+                    }
+                  });
+                }
+              </script>
+            </body>
+            </html>
+            """,
+            instrument_uuid=instrument_uuid,
+            rows=rows,
+            numeric_cols=numeric_cols,
+            selected_field=selected_field,
+            chart_labels=chart_labels,
+            chart_values=chart_values,
+            table_rows=table_rows,
+            table_cols=table_cols,
+            request=request,
         )
 
     @app.route("/login", methods=["GET", "POST"])
@@ -1068,24 +1489,32 @@ def create_web_app(cfg: dict, access_store: AccessStore):
     @app.route("/download", methods=["POST"])
     def download():
         user = current_user()
-        storage_root = cfg.get("storage_root")
-        if not storage_root:
-            abort(404)
+        storage_root = storage_root_or_404()
+        all_instruments = set(available_instruments(storage_root))
 
-        instruments = request.form.getlist("instrument")
-        if not instruments:
+        requested = []
+        for inst in request.form.getlist("instrument"):
+            inst = str(inst).strip()
+            if inst and inst not in requested:
+                requested.append(inst)
+
+        if not requested:
             abort(400, "Select at least one instrument")
 
-        allowed = [inst for inst in instruments if access_store.can_download(user, inst)]
-        if not allowed:
-            abort(403)
+        unknown = [inst for inst in requested if inst not in all_instruments]
+        if unknown:
+            abort(404, f"Unknown station(s): {', '.join(unknown)}")
+
+        unauthorized = [inst for inst in requested if not station_is_accessible(user, inst)]
+        if unauthorized:
+            abort(403, f"Access denied for station(s): {', '.join(unauthorized)}")
 
         from_date = parse_date_ymd(request.form.get("from_date", ""))
         to_date = parse_date_ymd(request.form.get("to_date", ""))
         if from_date and to_date and to_date < from_date:
             abort(400, "to_date must be >= from_date")
 
-        zip_path, count = make_zip_for_download(storage_root, allowed, from_date=from_date, to_date=to_date)
+        zip_path, count = make_zip_for_download(storage_root, requested, from_date=from_date, to_date=to_date)
         if count == 0:
             zip_path.unlink(missing_ok=True)
             abort(404, "No data files found for selected filters")

@@ -20,11 +20,200 @@
   "signalkContextPrefix": "meteo",
   "signalkSourceLabel": "sensor-network-collector",
   "signalkPathMap": {
-    "TempOut": "environment.outside.temperature",
-    "HumOut": "environment.outside.humidity",
-    "Barometer": "environment.outside.pressure",
-    "WindSpeed": "environment.wind.speedApparent",
-    "WindDir": "environment.wind.angleApparent"
+    "BarTrend": {
+      "path": "environment.outside.pressureTrend",
+      "meta": {
+        "displayName": "Pressure Trend",
+        "units": "Pa/s",
+        "description": "Outside pressure change rate"
+      }
+    },
+    "Barometer": {
+      "path": "environment.outside.pressure",
+      "meta": {
+        "displayName": "Outside Pressure",
+        "units": "Pa",
+        "description": "Outside atmospheric pressure"
+      }
+    },
+    "TempIn": {
+      "path": "environment.inside.temperature",
+      "meta": {
+        "displayName": "Inside Temperature",
+        "units": "K",
+        "description": "Inside air temperature"
+      }
+    },
+    "HumIn": {
+      "path": "environment.inside.humidity",
+      "meta": {
+        "displayName": "Inside Humidity",
+        "units": "ratio",
+        "description": "Inside relative humidity"
+      }
+    },
+    "TempOut": {
+      "path": "environment.outside.temperature",
+      "meta": {
+        "displayName": "Outside Temperature",
+        "units": "K",
+        "description": "Outside air temperature"
+      }
+    },
+    "WindSpeed": {
+      "path": "environment.wind.speedApparent",
+      "meta": {
+        "displayName": "Apparent Wind Speed",
+        "units": "m/s",
+        "description": "Apparent wind speed"
+      }
+    },
+    "WindSpeed10Min": {
+      "path": "environment.wind.speedAverage",
+      "meta": {
+        "displayName": "Average Wind Speed",
+        "units": "m/s",
+        "description": "Average wind speed"
+      }
+    },
+    "WindDir": {
+      "path": "environment.wind.angleApparent",
+      "meta": {
+        "displayName": "Apparent Wind Direction",
+        "units": "rad",
+        "description": "Apparent wind angle"
+      }
+    },
+    "HumOut": {
+      "path": "environment.outside.humidity",
+      "meta": {
+        "displayName": "Outside Humidity",
+        "units": "ratio",
+        "description": "Outside relative humidity"
+      }
+    },
+    "RainRate": {
+      "path": "environment.rain.rate",
+      "meta": {
+        "displayName": "Rain Rate",
+        "units": "m/s",
+        "description": "Rainfall rate"
+      }
+    },
+    "SolarRad": {
+      "path": "environment.solar.radiation",
+      "meta": {
+        "displayName": "Solar Radiation",
+        "units": "W/m2",
+        "description": "Solar radiation"
+      }
+    },
+    "RainStorm": {
+      "path": "environment.rain.storm.total",
+      "meta": {
+        "displayName": "Storm Rain",
+        "units": "m",
+        "description": "Total rainfall for current storm"
+      }
+    },
+    "StormStartDate": {
+      "path": "environment.rain.storm.startDate",
+      "meta": {
+        "displayName": "Storm Start Date",
+        "description": "Start date/time of current storm"
+      }
+    },
+    "RainDay": {
+      "path": "environment.rain.day",
+      "meta": {
+        "displayName": "Daily Rain",
+        "units": "m",
+        "description": "Daily rainfall accumulation"
+      }
+    },
+    "RainMonth": {
+      "path": "environment.rain.month",
+      "meta": {
+        "displayName": "Monthly Rain",
+        "units": "m",
+        "description": "Monthly rainfall accumulation"
+      }
+    },
+    "RainYear": {
+      "path": "environment.rain.year",
+      "meta": {
+        "displayName": "Yearly Rain",
+        "units": "m",
+        "description": "Yearly rainfall accumulation"
+      }
+    },
+    "ETDay": {
+      "path": "environment.outside.evapoTranspiration.day",
+      "meta": {
+        "displayName": "Daily Evapotranspiration",
+        "units": "m",
+        "description": "Daily evapotranspiration"
+      }
+    },
+    "ETMonth": {
+      "path": "environment.outside.evapoTranspiration.month",
+      "meta": {
+        "displayName": "Monthly Evapotranspiration",
+        "units": "m",
+        "description": "Monthly evapotranspiration"
+      }
+    },
+    "ETYear": {
+      "path": "environment.outside.evapoTranspiration.year",
+      "meta": {
+        "displayName": "Yearly Evapotranspiration",
+        "units": "m",
+        "description": "Yearly evapotranspiration"
+      }
+    },
+    "BatteryStatus": {
+      "path": "electrical.batteries.sensor.status",
+      "meta": {
+        "displayName": "Sensor Battery Status",
+        "description": "Battery state indicator"
+      }
+    },
+    "BatteryVolts": {
+      "path": "electrical.batteries.sensor.voltage",
+      "meta": {
+        "displayName": "Sensor Battery Voltage",
+        "units": "V",
+        "description": "Battery voltage"
+      }
+    },
+    "ForecastIcon": {
+      "path": "environment.weather.forecast.icon",
+      "meta": {
+        "displayName": "Forecast Icon",
+        "description": "Weather forecast icon code"
+      }
+    },
+    "ForecastRuleNo": {
+      "path": "environment.weather.forecast.ruleNumber",
+      "meta": {
+        "displayName": "Forecast Rule Number",
+        "description": "Forecast rule identifier"
+      }
+    },
+    "SunRise": {
+      "path": "environment.sun.rise",
+      "meta": {
+        "displayName": "Sunrise",
+        "description": "Sunrise time"
+      }
+    },
+    "SunSet": {
+      "path": "environment.sun.set",
+      "meta": {
+        "displayName": "Sunset",
+        "description": "Sunset time"
+      }
+    }
   },
   "httpEnabled": true,
   "httpHost": "0.0.0.0",
