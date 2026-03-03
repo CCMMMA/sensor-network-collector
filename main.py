@@ -13,7 +13,7 @@ import tempfile
 import threading
 import uuid
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import paho.mqtt.client as mqtt
@@ -1026,15 +1026,103 @@ def _extract_lat_lon_from_row(row: dict):
     return None, None
 
 
+DEFAULT_FIELD_UNITS = {
+    "TempIn": "K",
+    "TempOut": "K",
+    "HumIn": "ratio",
+    "HumOut": "ratio",
+    "Barometer": "Pa",
+    "BarTrend": "Pa/s",
+    "WindSpeed": "m/s",
+    "WindSpeed10Min": "m/s",
+    "WindDir": "rad",
+    "RainRate": "m/s",
+    "RainStorm": "m",
+    "RainDay": "m",
+    "RainMonth": "m",
+    "RainYear": "m",
+    "ETDay": "m",
+    "ETMonth": "m",
+    "ETYear": "m",
+    "SolarRad": "W/m2",
+    "BatteryVolts": "V",
+}
+
+
+def get_field_units(cfg: dict):
+    out = dict(DEFAULT_FIELD_UNITS)
+    path_map = cfg.get("signalk_path_map", {})
+    for key, entry in (path_map.items() if isinstance(path_map, dict) else []):
+        if isinstance(entry, dict):
+            meta = entry.get("meta")
+            if isinstance(meta, dict):
+                units = meta.get("units")
+                if isinstance(units, str) and units.strip():
+                    out[str(key)] = units.strip()
+    return out
+
+
+def parse_iso_ts(value: str):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    s = value.strip()
+    try:
+        if s.endswith("Z"):
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        else:
+            dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def shift_months(dt: datetime, months: int):
+    y = dt.year + ((dt.month - 1 + months) // 12)
+    m = ((dt.month - 1 + months) % 12) + 1
+    d = min(dt.day, [31, 29 if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1])
+    return dt.replace(year=y, month=m, day=d)
+
+
+def interval_start(anchor: datetime, interval: str):
+    if interval == "hour":
+        return anchor - timedelta(hours=1)
+    if interval == "day":
+        return anchor - timedelta(days=1)
+    if interval == "week":
+        return anchor - timedelta(weeks=1)
+    if interval == "month":
+        return shift_months(anchor, -1)
+    if interval == "year":
+        return shift_months(anchor, -12)
+    return anchor - timedelta(days=1)
+
+
+def shift_anchor(anchor: datetime, interval: str, steps: int):
+    if interval == "hour":
+        return anchor + timedelta(hours=steps)
+    if interval == "day":
+        return anchor + timedelta(days=steps)
+    if interval == "week":
+        return anchor + timedelta(weeks=steps)
+    if interval == "month":
+        return shift_months(anchor, steps)
+    if interval == "year":
+        return shift_months(anchor, 12 * steps)
+    return anchor + timedelta(days=steps)
+
+
 def get_station_preview(storage_root: str, instrument_uuid: str):
     files = list_csv_files_for_instrument(storage_root, instrument_uuid)
     if not files:
-        return {"latitude": None, "longitude": None, "last_timestamp": None, "rows": 0}
+        return {"latitude": None, "longitude": None, "last_timestamp": None, "rows": 0, "name": instrument_uuid}
 
     total_rows = 0
     last_timestamp = None
     latitude = None
     longitude = None
+    station_name = instrument_uuid
 
     # Scan newest files first so map can show latest known position quickly.
     for csv_path in reversed(files):
@@ -1051,20 +1139,22 @@ def get_station_preview(storage_root: str, instrument_uuid: str):
 
         if last_timestamp is None:
             last_timestamp = rows[-1].get("timestamp")
+        if station_name == instrument_uuid:
+            maybe_name = rows[-1].get("name")
+            if isinstance(maybe_name, str) and maybe_name.strip():
+                station_name = maybe_name.strip()
 
         if latitude is None or longitude is None:
             lat, lon = _extract_lat_lon_from_row(rows[-1])
             if lat is not None and lon is not None:
                 latitude, longitude = lat, lon
 
-        if latitude is not None and longitude is not None and last_timestamp is not None:
-            break
-
     return {
         "latitude": latitude,
         "longitude": longitude,
         "last_timestamp": last_timestamp,
         "rows": total_rows,
+        "name": station_name,
     }
 
 
@@ -1078,7 +1168,7 @@ def load_station_rows(storage_root: str, instrument_uuid: str, from_date=None, t
         except Exception:
             continue
 
-    if limit and len(out) > limit:
+    if limit is not None and limit > 0 and len(out) > limit:
         out = out[-limit:]
     return out
 
@@ -1141,6 +1231,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             stations.append(
                 {
                     "uuid": inst,
+                    "name": preview["name"],
                     "policy": policies.get(inst, "account"),
                     "can_access": can_access,
                     "latitude": preview["latitude"],
@@ -1201,7 +1292,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   <form method="post" action="{{ url_for('download') }}">
                     {% for st in clickable %}
                       <label>
-                        <input type="checkbox" name="instrument" value="{{ st.uuid }}"> {{ st.uuid }}
+                        <input type="checkbox" name="instrument" value="{{ st.uuid }}"> {{ st.name }} ({{ st.uuid }})
                         (policy={{ st.policy }}, rows={{ st.rows }})
                         <a href="{{ url_for('browse_station', instrument_uuid=st.uuid) }}">browse</a>
                       </label><br/>
@@ -1236,7 +1327,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                       fillOpacity: 0.85
                     }).addTo(map);
 
-                    let html = `<b>${s.uuid}</b><br/>policy=${s.policy}<br/>rows=${s.rows}`;
+                    let html = `<b>${s.name || s.uuid}</b><br/>uuid=${s.uuid}<br/>policy=${s.policy}<br/>rows=${s.rows}`;
                     if (s.last_timestamp) {
                       html += `<br/>last=${s.last_timestamp}`;
                     }
@@ -1271,49 +1362,130 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         if not station_is_accessible(user, instrument_uuid):
             abort(403)
 
+        preview = get_station_preview(storage_root, instrument_uuid)
+        station_name = preview.get("name") or instrument_uuid
+
+        interval = request.args.get("interval", "day")
+        if interval not in ("hour", "day", "week", "month", "year", "custom"):
+            interval = "day"
+
         from_date = parse_date_ymd(request.args.get("from_date", ""))
         to_date = parse_date_ymd(request.args.get("to_date", ""))
         if from_date and to_date and to_date < from_date:
             abort(400, "to_date must be >= from_date")
 
-        rows = load_station_rows(storage_root, instrument_uuid, from_date=from_date, to_date=to_date, limit=600)
+        rows = load_station_rows(storage_root, instrument_uuid, from_date=from_date, to_date=to_date, limit=None)
         if not rows:
             return render_template_string(
                 """
                 <html><body>
                   <p><a href="{{ url_for('index') }}">Home</a></p>
-                  <h1>Station {{ instrument_uuid }}</h1>
+                  <h1>Station {{ station_name }} ({{ instrument_uuid }})</h1>
                   <p>No data rows found for the selected filters.</p>
                 </body></html>
                 """,
                 instrument_uuid=instrument_uuid,
+                station_name=station_name,
             )
+
+        rows_ts = []
+        for row in rows:
+            ts = parse_iso_ts(row.get("timestamp", ""))
+            if ts is not None:
+                rows_ts.append((ts, row))
+
+        if rows_ts:
+            rows_ts.sort(key=lambda x: x[0])
+            max_ts = rows_ts[-1][0]
+        else:
+            max_ts = datetime.now(timezone.utc)
+
+        anchor_param = request.args.get("anchor", "")
+        anchor = parse_iso_ts(anchor_param) or max_ts
+
+        if interval == "custom":
+            if from_date:
+                win_start = datetime.combine(from_date, datetime.min.time(), tzinfo=timezone.utc)
+            else:
+                win_start = max_ts - timedelta(days=1)
+            if to_date:
+                win_end = datetime.combine(to_date, datetime.max.time(), tzinfo=timezone.utc)
+            else:
+                win_end = max_ts
+        else:
+            win_end = anchor
+            win_start = interval_start(anchor, interval)
+
+        filtered_rows = []
+        for ts, row in rows_ts:
+            if win_start <= ts <= win_end:
+                filtered_rows.append(row)
+
+        if not filtered_rows and rows_ts:
+            fallback_end = rows_ts[-1][0]
+            fallback_start = interval_start(fallback_end, interval if interval != "custom" else "day")
+            filtered_rows = [row for ts, row in rows_ts if fallback_start <= ts <= fallback_end]
+            win_start, win_end = fallback_start, fallback_end
+
+        rows = filtered_rows
 
         excluded = {"timestamp", "topic", "uuid", "position", "latitude", "longitude", "lat", "lon", "lng"}
         numeric_cols = extract_numeric_series(rows, excluded=excluded)
 
-        selected_field = request.args.get("field", "")
-        if selected_field not in numeric_cols:
-            selected_field = numeric_cols[0] if numeric_cols else ""
+        selected_fields = [f for f in request.args.getlist("field") if f in numeric_cols]
+        if not selected_fields and numeric_cols:
+            selected_fields = [numeric_cols[0]]
+
+        units_map = get_field_units(cfg)
 
         chart_labels = []
-        chart_values = []
-        if selected_field:
+        chart_datasets = []
+        for field in selected_fields:
+            d_labels = []
+            d_values = []
             for row in rows:
-                y = _to_float(row.get(selected_field))
+                y = _to_float(row.get(field))
                 if y is None:
                     continue
-                chart_labels.append(row.get("timestamp") or "")
-                chart_values.append(y)
+                d_labels.append(row.get("timestamp") or "")
+                d_values.append(y)
+            if len(d_labels) > len(chart_labels):
+                chart_labels = d_labels
+            chart_datasets.append(
+                {
+                    "field": field,
+                    "label": f"{field} [{units_map.get(field, '-')}]",
+                    "data": d_values,
+                    "unit": units_map.get(field, ""),
+                }
+            )
 
-        table_rows = rows[-120:]
+        page = max(1, int(request.args.get("page", "1") or "1"))
+        page_size = int(request.args.get("page_size", "50") or "50")
+        page_size = min(200, max(10, page_size))
+        total_rows = len(rows)
+        page_count = max(1, (total_rows + page_size - 1) // page_size)
+        if page > page_count:
+            page = page_count
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        table_rows = rows[start_idx:end_idx]
         table_cols = list(table_rows[0].keys()) if table_rows else []
+        table_headers = {
+            c: f"{c} [{units_map.get(c, '-')}]"
+            if c not in ("timestamp", "topic", "uuid", "name", "position", "latitude", "longitude", "lat", "lon", "lng")
+            else c
+            for c in table_cols
+        }
+
+        prev_anchor = shift_anchor(anchor, interval, -1).isoformat().replace("+00:00", "Z")
+        next_anchor = shift_anchor(anchor, interval, 1).isoformat().replace("+00:00", "Z")
 
         return render_template_string(
             """
             <html>
             <head>
-              <title>Station {{ instrument_uuid }}</title>
+              <title>Station {{ station_name }} ({{ instrument_uuid }})</title>
               <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
               <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
               <style>
@@ -1327,7 +1499,34 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             </head>
             <body>
               <p><a href="{{ url_for('index') }}">Home</a></p>
-              <h1>Station {{ instrument_uuid }}</h1>
+              <h1>Station {{ station_name }} ({{ instrument_uuid }})</h1>
+
+              <div class="panel">
+                <h2>Time interval</h2>
+                <form method="get" id="intervalForm">
+                  <label>Window
+                    <select name="interval" id="intervalSelect">
+                      {% for it in ['hour','day','week','month','year','custom'] %}
+                        <option value="{{ it }}" {% if it==interval %}selected{% endif %}>{{ it }}</option>
+                      {% endfor %}
+                    </select>
+                  </label>
+                  <label>From <input type="date" name="from_date" value="{{ request.args.get('from_date','') }}"/></label>
+                  <label>To <input type="date" name="to_date" value="{{ request.args.get('to_date','') }}"/></label>
+                  <input type="hidden" name="anchor" value="{{ request.args.get('anchor','') }}"/>
+                  {% for f in selected_fields %}<input type="hidden" name="field" value="{{ f }}"/>{% endfor %}
+                  <input type="hidden" name="page_size" value="{{ page_size }}"/>
+                  <button type="submit">Apply</button>
+                </form>
+                {% if interval != 'custom' %}
+                  <p>
+                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=prev_anchor, page_size=page_size, field=selected_fields) }}">&#8592; previous {{ interval }}</a>
+                    |
+                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=next_anchor, page_size=page_size, field=selected_fields) }}">next {{ interval }} &#8594;</a>
+                  </p>
+                {% endif %}
+                <p>Showing data in window: {{ win_start }} to {{ win_end }} UTC</p>
+              </div>
 
               <div class="panel">
                 <h2>Download station data</h2>
@@ -1344,28 +1543,43 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 {% if not numeric_cols %}
                   <p>No numeric columns available for charting.</p>
                 {% else %}
-                  <form method="get">
+                  <form method="get" id="chartForm">
+                    <input type="hidden" name="interval" value="{{ interval }}"/>
+                    <input type="hidden" name="anchor" value="{{ request.args.get('anchor','') }}"/>
                     <input type="hidden" name="from_date" value="{{ request.args.get('from_date','') }}"/>
                     <input type="hidden" name="to_date" value="{{ request.args.get('to_date','') }}"/>
-                    <label>Field
-                      <select name="field">
-                        {% for c in numeric_cols %}
-                          <option value="{{ c }}" {% if c == selected_field %}selected{% endif %}>{{ c }}</option>
-                        {% endfor %}
-                      </select>
-                    </label>
-                    <button type="submit">Update</button>
+                    <input type="hidden" name="page_size" value="{{ page_size }}"/>
+                    <fieldset>
+                      <legend>Variables</legend>
+                      {% for c in numeric_cols %}
+                        <label style="display:inline-block; margin-right:10px;">
+                          <input type="checkbox" name="field" value="{{ c }}" {% if c in selected_fields %}checked{% endif %}>
+                          {{ c }} [{{ units_map.get(c,'-') }}]
+                        </label>
+                      {% endfor %}
+                    </fieldset>
+                    <noscript><button type="submit">Update</button></noscript>
                   </form>
                   <canvas id="chart" height="110"></canvas>
                 {% endif %}
               </div>
 
               <div class="panel">
-                <h2>Data table (last {{ table_rows|length }} rows)</h2>
+                <h2>Data table</h2>
+                <p>Rows {{ start_idx + 1 if total_rows else 0 }}-{{ end_idx if end_idx < total_rows else total_rows }} of {{ total_rows }}</p>
+                <p>
+                  {% if page > 1 %}
+                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=request.args.get('anchor',''), from_date=request.args.get('from_date',''), to_date=request.args.get('to_date',''), page=page-1, page_size=page_size, field=selected_fields) }}">&#8592; prev page</a>
+                  {% endif %}
+                  {% if page < page_count %}
+                    {% if page > 1 %}|{% endif %}
+                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=request.args.get('anchor',''), from_date=request.args.get('from_date',''), to_date=request.args.get('to_date',''), page=page+1, page_size=page_size, field=selected_fields) }}">next page &#8594;</a>
+                  {% endif %}
+                </p>
                 <div class="table-wrap">
                   <table>
                     <thead>
-                      <tr>{% for c in table_cols %}<th>{{ c }}</th>{% endfor %}</tr>
+                      <tr>{% for c in table_cols %}<th>{{ table_headers[c] }}</th>{% endfor %}</tr>
                     </thead>
                     <tbody>
                       {% for r in table_rows %}
@@ -1378,43 +1592,78 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
               <script>
                 const labels = {{ chart_labels | tojson }};
-                const values = {{ chart_values | tojson }};
-                if (labels.length > 0 && document.getElementById('chart')) {
+                const datasets = {{ chart_datasets | tojson }};
+                if (labels.length > 0 && datasets.length > 0 && document.getElementById('chart')) {
                   new Chart(document.getElementById('chart'), {
                     type: 'line',
                     data: {
                       labels,
-                      datasets: [{
-                        label: '{{ selected_field }}',
-                        data: values,
-                        borderColor: '#0b57d0',
+                      datasets: datasets.map((d, idx) => ({
+                        label: d.label,
+                        data: d.data,
+                        borderColor: ['#0b57d0','#1f9d55','#d95f02','#7b1fa2','#c2185b'][idx % 5],
                         pointRadius: 0,
                         tension: 0.2
-                      }]
+                      }))
                     },
                     options: {
                       responsive: true,
                       scales: {
-                        x: { display: true },
-                        y: { display: true }
+                        x: { display: true, title: { display: true, text: 'timestamp' } },
+                        y: {
+                          display: true,
+                          title: {
+                            display: true,
+                            text: (new Set(datasets.map(d => d.unit || '-')).size === 1)
+                              ? `value [${datasets[0].unit || '-'}]`
+                              : 'value [mixed units]'
+                          }
+                        }
                       }
                     }
                   });
+                }
+
+                const chartForm = document.getElementById('chartForm');
+                if (chartForm) {
+                  chartForm.querySelectorAll('input[type="checkbox"]').forEach((el) => {
+                    el.addEventListener('change', () => chartForm.submit());
+                  });
+                }
+                const intervalSel = document.getElementById('intervalSelect');
+                const intervalForm = document.getElementById('intervalForm');
+                if (intervalSel && intervalForm) {
+                  intervalSel.addEventListener('change', () => intervalForm.submit());
                 }
               </script>
             </body>
             </html>
             """,
             instrument_uuid=instrument_uuid,
+            station_name=station_name,
+            interval=interval,
+            win_start=win_start.isoformat().replace("+00:00", "Z"),
+            win_end=win_end.isoformat().replace("+00:00", "Z"),
+            prev_anchor=prev_anchor,
+            next_anchor=next_anchor,
             rows=rows,
             numeric_cols=numeric_cols,
-            selected_field=selected_field,
+            selected_fields=selected_fields,
             chart_labels=chart_labels,
-            chart_values=chart_values,
+            chart_datasets=chart_datasets,
             table_rows=table_rows,
             table_cols=table_cols,
+            table_headers=table_headers,
+            units_map=units_map,
+            page=page,
+            page_count=page_count,
+            page_size=page_size,
+            total_rows=total_rows,
+            start_idx=start_idx,
+            end_idx=end_idx,
             request=request,
         )
+
 
     @app.route("/login", methods=["GET", "POST"])
     def login():

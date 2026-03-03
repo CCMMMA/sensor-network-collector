@@ -419,8 +419,11 @@ Features:
   - define per-instrument policy
   - grant/revoke per-user access for restricted instruments
 - station browsing UI (`/station/<uuid>`) with:
-  - numeric charts
-  - tabular data preview
+  - numeric charts (single or multiple variables)
+  - tabular data preview with pagination
+  - selectable time windows (hour/day/week/month/year/custom)
+  - previous/next interval navigation
+  - units shown in table headers and chart labels/axis
   - filtered download action
 - authenticated or anonymous downloads depending on policy
 
