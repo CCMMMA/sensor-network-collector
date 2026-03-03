@@ -1,5 +1,5 @@
 services:
-  collector:
+  sensor-network-collector:
     build:
       context: .
       dockerfile: Dockerfile
@@ -11,3 +11,4 @@ services:
       - ./data:/data
     ports:
       - "8080:8080"
+      - "1883:1883"
