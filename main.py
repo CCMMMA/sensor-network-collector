@@ -49,6 +49,11 @@ SIGNALK_STANDARD_PATHS = {
     "HumIn": "environment.inside.humidity",
 }
 
+INFLUX_FIELD_CONFLICT_RE = re.compile(
+    r'input field "(?P<field>[^"]+)" .* is type (?P<input_type>[a-zA-Z]+), already exists as type (?P<existing_type>[a-zA-Z]+)',
+    re.IGNORECASE,
+)
+
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -1184,6 +1189,56 @@ def extract_numeric_series(rows, excluded=None):
                 numeric_keys.add(k)
     return sorted(numeric_keys)
 
+
+def coerce_for_influx_type(value, target_type: str):
+    t = str(target_type or "").strip().lower()
+    if t in ("integer", "int"):
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float, str)):
+            return int(float(value))
+    if t in ("float", "double"):
+        if isinstance(value, bool):
+            return float(int(value))
+        if isinstance(value, (int, float, str)):
+            return float(value)
+    if t in ("string", "str"):
+        return str(value)
+    if t in ("boolean", "bool"):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            s = value.strip().lower()
+            if s in ("1", "true", "yes", "on"):
+                return True
+            if s in ("0", "false", "no", "off"):
+                return False
+    return value
+
+
+def maybe_fix_influx_record_type_conflict(record: dict, error: Exception):
+    msg = str(error)
+    m = INFLUX_FIELD_CONFLICT_RE.search(msg)
+    if not m:
+        return None, None, None
+
+    field = m.group("field")
+    existing_type = m.group("existing_type")
+    fields = dict(record.get("fields", {}))
+    if field not in fields:
+        return None, field, existing_type
+
+    try:
+        fields[field] = coerce_for_influx_type(fields[field], existing_type)
+    except Exception:
+        return None, field, existing_type
+
+    fixed = dict(record)
+    fixed["fields"] = fields
+    return fixed, field, existing_type
+
 def create_web_app(cfg: dict, access_store: AccessStore):
     app = Flask(__name__)
     app.secret_key = cfg["web_session_secret"] or secrets.token_hex(32)
@@ -2067,7 +2122,20 @@ def on_message(client, userdata, message):
                 write_api.write(bucket=cfg["influxdb_bucket"], org=cfg["influxdb_org"], record=influx_record)
                 logger.info("Influx write topic=%s fields=%d time=%s", topic, len(flat_fields), dt.isoformat())
             except Exception as e:
-                logger.exception("Influx write failed for topic=%s: %s", topic, e)
+                fixed_record, field_name, existing_type = maybe_fix_influx_record_type_conflict(influx_record, e)
+                if fixed_record is not None:
+                    try:
+                        write_api.write(bucket=cfg["influxdb_bucket"], org=cfg["influxdb_org"], record=fixed_record)
+                        logger.warning(
+                            "Influx write retried with coerced field type topic=%s field=%s target_type=%s",
+                            topic,
+                            field_name,
+                            existing_type,
+                        )
+                    except Exception as retry_error:
+                        logger.exception("Influx retry failed for topic=%s: %s", topic, retry_error)
+                else:
+                    logger.exception("Influx write failed for topic=%s: %s", topic, e)
 
     # CSV storage sink
     if cfg["enable_storage"]:
