@@ -71,7 +71,7 @@ python3 main.py --config config.json --dry
 Use the provided:
 
 - [`Dockerfile`](/Users/raffaelemontella/Documents/New project/sensor-network-collector/Dockerfile)
-- [`docker-compose.yml`](/Users/raffaelemontella/Documents/New project/sensor-network-collector/docker-compose.yml)
+- [`docker-compose.yml.sample`](/Users/raffaelemontella/Documents/New project/sensor-network-collector/docker-compose.yml.sample)
 
 ### Step 1: Prerequisites
 
@@ -93,7 +93,8 @@ From the project root:
 
 ```bash
 mkdir -p data
-cp config.json config.local.json
+cp config.json.sample config.local.json
+cp docker-compose.yml.sample docker-compose.yml
 ```
 
 Then edit `config.local.json` for your environment.
@@ -118,7 +119,7 @@ Important networking note:
 
 ### Step 3: Point compose to your config
 
-Edit [`docker-compose.yml`](/Users/raffaelemontella/Documents/New project/sensor-network-collector/docker-compose.yml) volume line:
+Edit [`docker-compose.yml.sample`](/Users/raffaelemontella/Documents/New project/sensor-network-collector/docker-compose.yml.sample) (or your copied `docker-compose.yml`) volume line:
 
 ```yaml
 - ./config.local.json:/app/config.json:ro
@@ -182,6 +183,94 @@ Backup:
 ```bash
 tar -czf sensor-network-collector-data-backup.tgz data/
 ```
+
+## Production WSGI setup (web app only)
+
+For production, serve the Flask web portal through a WSGI server instead of Flask's built-in server.
+
+### 1) Install WSGI dependencies
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install gunicorn
+```
+
+### 2) Prepare production config
+
+```bash
+cp config.json.sample config.prod.json
+```
+
+Set at least:
+
+- `httpEnabled: true`
+- `pathStorage`: absolute storage root
+- `authDbPath`: absolute sqlite path
+- `webSessionSecret`: strong random value
+- `adminPassword`: strong value
+
+### 3) Run with Gunicorn
+
+```bash
+source .venv/bin/activate
+COLLECTOR_CONFIG=/absolute/path/config.prod.json \
+gunicorn --workers 2 --bind 127.0.0.1:8080 webapp_wsgi:app
+```
+
+This serves only the web portal through WSGI.
+
+### 4) systemd service example
+
+`/etc/systemd/system/sensor-network-web.service`:
+
+```ini
+[Unit]
+Description=Sensor Network Collector Web (Gunicorn)
+After=network.target
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/sensor-network-collector
+Environment=COLLECTOR_CONFIG=/opt/sensor-network-collector/config.prod.json
+ExecStart=/opt/sensor-network-collector/.venv/bin/gunicorn --workers 2 --bind 127.0.0.1:8080 webapp_wsgi:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable/start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now sensor-network-web.service
+sudo systemctl status sensor-network-web.service
+```
+
+### 5) Nginx reverse proxy example
+
+`/etc/nginx/sites-available/sensor-network-web`:
+
+```nginx
+server {
+    listen 80;
+    server_name your-domain.example;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Then enable TLS with certbot (recommended).
 
 ## Configuration (`config.json`)
 
