@@ -50,7 +50,7 @@ SIGNALK_STANDARD_PATHS = {
 }
 
 INFLUX_FIELD_CONFLICT_RE = re.compile(
-    r'input field "(?P<field>[^"]+)" .* is type (?P<input_type>[a-zA-Z]+), already exists as type (?P<existing_type>[a-zA-Z]+)',
+    r'input field\s+\\?"(?P<field>[^"\\]+)\\?"\s+.*?\s+is type\s+(?P<input_type>[a-zA-Z]+),\s+already exists as type\s+(?P<existing_type>[a-zA-Z]+)',
     re.IGNORECASE,
 )
 
@@ -1220,7 +1220,28 @@ def coerce_for_influx_type(value, target_type: str):
 
 def maybe_fix_influx_record_type_conflict(record: dict, error: Exception):
     msg = str(error)
-    m = INFLUX_FIELD_CONFLICT_RE.search(msg)
+
+    body_msg = None
+    raw_body = getattr(error, "body", None)
+    if isinstance(raw_body, bytes):
+        raw_body = raw_body.decode("utf-8", errors="replace")
+    if isinstance(raw_body, str) and raw_body.strip():
+        try:
+            body = json.loads(raw_body)
+            if isinstance(body, dict):
+                body_msg = body.get("message") or body.get("error")
+        except Exception:
+            body_msg = raw_body
+
+    candidates = [msg]
+    if body_msg:
+        candidates.insert(0, str(body_msg))
+
+    m = None
+    for candidate in candidates:
+        m = INFLUX_FIELD_CONFLICT_RE.search(candidate)
+        if m:
+            break
     if not m:
         return None, None, None
 
