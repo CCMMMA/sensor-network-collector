@@ -1368,14 +1368,14 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             <head>
               <title>Sensor Network Collector - Data Portal</title>
               <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+              <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
               <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
               <style>
-                body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 16px; }
                 #map { height: 420px; border: 1px solid #ccc; margin-bottom: 16px; }
                 .panel { border: 1px solid #ddd; padding: 12px; margin-bottom: 12px; border-radius: 8px; }
               </style>
             </head>
-            <body>
+            <body class="container py-4">
               <h1>Sensor Network Collector - Data Portal</h1>
               {% if user %}
                 <p>Logged in as <b>{{ user.username }}</b> ({{ user.role }}) - <a href="{{ url_for('logout') }}">Logout</a></p>
@@ -1410,9 +1410,9 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                       </label><br/>
                     {% endfor %}
                     <p>Date filter (optional):</p>
-                    <label>From <input type="date" name="from_date"></label>
-                    <label>To <input type="date" name="to_date"></label>
-                    <p><button type="submit">Download ZIP</button></p>
+                    <label>From <input class="form-control d-inline-block w-auto" type="date" name="from_date"></label>
+                    <label>To <input class="form-control d-inline-block w-auto" type="date" name="to_date"></label>
+                    <p><button class="btn btn-primary mt-2" type="submit">Download ZIP</button></p>
                   </form>
                 {% endif %}
               </div>
@@ -1599,9 +1599,9 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             <head>
               <title>Station {{ station_name }} ({{ instrument_uuid }})</title>
               <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+              <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
               <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
               <style>
-                body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 16px; }
                 table { border-collapse: collapse; width: 100%; font-size: 12px; }
                 th, td { border: 1px solid #ddd; padding: 4px; }
                 th { position: sticky; top: 0; background: #f8f8f8; }
@@ -1609,7 +1609,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 .panel { border: 1px solid #ddd; padding: 12px; margin-bottom: 12px; border-radius: 8px; }
               </style>
             </head>
-            <body>
+            <body class="container-fluid py-3">
               <p><a href="{{ url_for('index') }}">Home</a></p>
               <h1>Station {{ station_name }} ({{ instrument_uuid }})</h1>
 
@@ -1628,7 +1628,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   <input type="hidden" name="anchor" value="{{ request.args.get('anchor','') }}"/>
                   {% for f in selected_fields %}<input type="hidden" name="field" value="{{ f }}"/>{% endfor %}
                   <input type="hidden" name="page_size" value="{{ page_size }}"/>
-                  <button type="submit">Apply</button>
+                  <button class="btn btn-primary btn-sm" type="submit">Apply</button>
                 </form>
                 {% if interval != 'custom' %}
                   <p>
@@ -1646,7 +1646,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   <input type="hidden" name="instrument" value="{{ instrument_uuid }}"/>
                   <label>From <input type="date" name="from_date" value="{{ request.args.get('from_date','') }}"></label>
                   <label>To <input type="date" name="to_date" value="{{ request.args.get('to_date','') }}"></label>
-                  <button type="submit">Download ZIP</button>
+                  <button class="btn btn-primary btn-sm" type="submit">Download ZIP</button>
                 </form>
               </div>
 
@@ -1670,7 +1670,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                         </label>
                       {% endfor %}
                     </fieldset>
-                    <noscript><button type="submit">Update</button></noscript>
+                    <noscript><button class="btn btn-secondary btn-sm" type="submit">Update</button></noscript>
                   </form>
                   <canvas id="chart" height="110"></canvas>
                 {% endif %}
@@ -1689,7 +1689,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   {% endif %}
                 </p>
                 <div class="table-wrap">
-                  <table>
+                  <table class="table table-sm table-striped table-bordered">
                     <thead>
                       <tr>{% for c in table_cols %}<th>{{ table_headers[c] }}</th>{% endfor %}</tr>
                     </thead>
@@ -1792,17 +1792,34 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
         return render_template_string(
             """
-            <html><body>
-            <h1>Login</h1>
-            {% if err %}<p style="color:red">{{ err }}</p>{% endif %}
-            <form method="post">
-              <label>Username <input name="username"></label><br/>
-              <label>Password <input name="password" type="password"></label><br/>
-              <button type="submit">Login</button>
-            </form>
-            <p><a href="{{ url_for('request_account') }}">Request account</a></p>
-            <p><a href="{{ url_for('index') }}">Home</a></p>
-            </body></html>
+            <html>
+            <head>
+              <title>Login</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+              <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+            </head>
+            <body class="container py-5">
+              <div class="row justify-content-center">
+                <div class="col-12 col-md-6 col-lg-4">
+                  <h1 class="h3 mb-3">Login</h1>
+                  {% if err %}<div class="alert alert-danger">{{ err }}</div>{% endif %}
+                  <form method="post">
+                    <div class="mb-3">
+                      <label class="form-label">Username</label>
+                      <input class="form-control" name="username">
+                    </div>
+                    <div class="mb-3">
+                      <label class="form-label">Password</label>
+                      <input class="form-control" name="password" type="password">
+                    </div>
+                    <button class="btn btn-primary w-100" type="submit">Login</button>
+                  </form>
+                  <p class="mt-3 mb-1"><a href="{{ url_for('request_account') }}">Request account</a></p>
+                  <p><a href="{{ url_for('index') }}">Home</a></p>
+                </div>
+              </div>
+            </body>
+            </html>
             """,
             err=err,
         )
@@ -1829,19 +1846,42 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
         return render_template_string(
             """
-            <html><body>
-            <h1>Request account</h1>
-            {% if msg %}<p style="color:green">{{ msg }}</p>{% endif %}
-            {% if err %}<p style="color:red">{{ err }}</p>{% endif %}
-            <form method="post">
-              <label>Username <input name="username"></label><br/>
-              <label>Email <input name="email" type="email"></label><br/>
-              <label>Password <input name="password" type="password"></label><br/>
-              <label>Reason <textarea name="reason"></textarea></label><br/>
-              <button type="submit">Submit request</button>
-            </form>
-            <p><a href="{{ url_for('index') }}">Home</a></p>
-            </body></html>
+            <html>
+            <head>
+              <title>Request account</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+              <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+            </head>
+            <body class="container py-5">
+              <div class="row justify-content-center">
+                <div class="col-12 col-md-8 col-lg-6">
+                  <h1 class="h3 mb-3">Request account</h1>
+                  {% if msg %}<div class="alert alert-success">{{ msg }}</div>{% endif %}
+                  {% if err %}<div class="alert alert-danger">{{ err }}</div>{% endif %}
+                  <form method="post">
+                    <div class="mb-3">
+                      <label class="form-label">Username</label>
+                      <input class="form-control" name="username">
+                    </div>
+                    <div class="mb-3">
+                      <label class="form-label">Email</label>
+                      <input class="form-control" name="email" type="email">
+                    </div>
+                    <div class="mb-3">
+                      <label class="form-label">Password</label>
+                      <input class="form-control" name="password" type="password">
+                    </div>
+                    <div class="mb-3">
+                      <label class="form-label">Reason</label>
+                      <textarea class="form-control" name="reason" rows="4"></textarea>
+                    </div>
+                    <button class="btn btn-primary" type="submit">Submit request</button>
+                  </form>
+                  <p class="mt-3"><a href="{{ url_for('index') }}">Home</a></p>
+                </div>
+              </div>
+            </body>
+            </html>
             """,
             msg=msg,
             err=err,
@@ -1903,75 +1943,83 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
         return render_template_string(
             """
-            <html><body>
-            <h1>Admin panel</h1>
+            <html>
+            <head>
+              <title>Admin panel</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+              <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+            </head>
+            <body class="container py-4">
+            <h1 class="h3">Admin panel</h1>
             <p>Logged in as {{ admin_user.username }} - <a href="{{ url_for('index') }}">Home</a></p>
 
-            <h2>Create user</h2>
-            <form method="post" action="{{ url_for('admin_create_user') }}">
-              <label>Username <input name="username"></label>
-              <label>Email <input name="email"></label>
-              <label>Password <input name="password" type="password"></label>
-              <label>Role
-                <select name="role">
+            <div class="card mb-3"><div class="card-body">
+            <h2 class="h5">Create user</h2>
+            <form method="post" action="{{ url_for('admin_create_user') }}" class="row g-2">
+              <div class="col-md-3"><input class="form-control" name="username" placeholder="Username"></div>
+              <div class="col-md-3"><input class="form-control" name="email" placeholder="Email"></div>
+              <div class="col-md-3"><input class="form-control" name="password" type="password" placeholder="Password"></div>
+              <div class="col-md-2">
+                <select class="form-select" name="role">
                   <option value="user">user</option>
                   <option value="admin">admin</option>
                 </select>
-              </label>
-              <button type="submit">Create</button>
+              </div>
+              <div class="col-md-1"><button class="btn btn-primary w-100" type="submit">Create</button></div>
             </form>
+            </div></div>
 
-            <h2>Pending account requests</h2>
+            <h2 class="h5">Pending account requests</h2>
             {% if pending_requests %}
               {% for r in pending_requests %}
-                <div style="border:1px solid #ccc; margin:6px; padding:6px;">
+                <div class="card mb-2"><div class="card-body">
                   <b>#{{ r.id }} {{ r.username }}</b> ({{ r.email }})<br/>
                   {{ r.message }}<br/>
                   <form method="post" action="{{ url_for('admin_approve_request', request_id=r.id) }}" style="display:inline;">
-                    <button type="submit">Approve</button>
+                    <button class="btn btn-success btn-sm" type="submit">Approve</button>
                   </form>
                   <form method="post" action="{{ url_for('admin_reject_request', request_id=r.id) }}" style="display:inline;">
-                    <button type="submit">Reject</button>
+                    <button class="btn btn-danger btn-sm" type="submit">Reject</button>
                   </form>
-                </div>
+                </div></div>
               {% endfor %}
             {% else %}
               <p>No pending requests.</p>
             {% endif %}
 
-            <h2>Instrument policies</h2>
+            <h2 class="h5 mt-4">Instrument policies</h2>
             {% if instruments %}
               {% for inst in instruments %}
-                <form method="post" action="{{ url_for('admin_set_policy') }}">
+                <form method="post" action="{{ url_for('admin_set_policy') }}" class="row g-2 align-items-center mb-2">
                   <input type="hidden" name="instrument_uuid" value="{{ inst }}">
-                  <b>{{ inst }}</b>
-                  <select name="policy">
+                  <div class="col-md-4"><b>{{ inst }}</b></div>
+                  <div class="col-md-5"><select class="form-select" name="policy">
                     <option value="open" {% if policies[inst]=='open' %}selected{% endif %}>open (free download)</option>
                     <option value="account" {% if policies[inst]=='account' %}selected{% endif %}>account (authenticated users)</option>
                     <option value="restricted" {% if policies[inst]=='restricted' %}selected{% endif %}>restricted (assigned users only)</option>
-                  </select>
-                  <button type="submit">Save</button>
+                  </select></div>
+                  <div class="col-md-2"><button class="btn btn-primary btn-sm" type="submit">Save</button></div>
                 </form>
               {% endfor %}
             {% else %}
               <p>No instruments found in storage.</p>
             {% endif %}
 
-            <h2>User access (for restricted policy)</h2>
+            <h2 class="h5 mt-4">User access (for restricted policy)</h2>
             {% for u in users %}
-              <div style="border:1px solid #ccc; margin:6px; padding:6px;">
+              <div class="card mb-2"><div class="card-body">
                 <b>{{ u.username }}</b> role={{ u.role }} active={{ u.active }}<br/>
                 currently allowed: {{ user_access[u.username] }}
-                <form method="post" action="{{ url_for('admin_set_user_access') }}">
+                <form method="post" action="{{ url_for('admin_set_user_access') }}" class="row g-2 mt-1">
                   <input type="hidden" name="username" value="{{ u.username }}">
-                  <label>Instrument UUID <input name="instrument_uuid"></label>
-                  <select name="allow">
+                  <div class="col-md-5"><input class="form-control" name="instrument_uuid" placeholder="Instrument UUID"></div>
+                  <div class="col-md-3"><select class="form-select" name="allow">
                     <option value="1">allow</option>
                     <option value="0">revoke</option>
-                  </select>
-                  <button type="submit">Apply</button>
+                  </select></div>
+                  <div class="col-md-2"><button class="btn btn-secondary btn-sm" type="submit">Apply</button></div>
                 </form>
-              </div>
+              </div></div>
             {% endfor %}
             </body></html>
             """,

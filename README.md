@@ -408,6 +408,8 @@ When enabled, incoming data is written to hourly files:
 
 Enable web GUI with `httpEnabled=true` or `--http true`.
 
+The web pages use Bootstrap 5 (from [getbootstrap.com](https://getbootstrap.com/)) via CDN.
+
 Features:
 
 - home page map with all stations discovered from `pathStorage`
