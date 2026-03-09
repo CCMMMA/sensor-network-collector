@@ -2780,12 +2780,33 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     return a.field.localeCompare(b.field);
                   });
 
-                  return entries;
+                  const grouped = new Map();
+                  entries.forEach((entry) => {
+                    if (!grouped.has(entry.group)) {
+                      grouped.set(entry.group, []);
+                    }
+                    grouped.get(entry.group).push(entry);
+                  });
+
+                  const out = Array.from(grouped.entries()).map(([group, items]) => {
+                    items.sort((a, b) => a.field.localeCompare(b.field));
+                    return { group, items };
+                  });
+
+                  out.sort((a, b) => {
+                    const ga = GROUP_ORDER.indexOf(a.group);
+                    const gb = GROUP_ORDER.indexOf(b.group);
+                    const ia = ga === -1 ? GROUP_ORDER.length : ga;
+                    const ib = gb === -1 ? GROUP_ORDER.length : gb;
+                    return ia - ib;
+                  });
+
+                  return out;
                 }
 
                 function render(payload) {
                   headRow.innerHTML = '';
-                  ['Station', 'UUID', 'Timestamp', 'Age(s)', 'Status', 'Alarms', 'Missing values', 'Battery', 'Group', 'Field', 'Value'].forEach((h) => {
+                  ['Station', 'UUID', 'Timestamp', 'Age(s)', 'Status', 'Alarms', 'Missing values', 'Battery', 'Group', 'Data'].forEach((h) => {
                     const th = document.createElement('th');
                     th.textContent = h;
                     headRow.appendChild(th);
@@ -2795,7 +2816,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   (payload.stations || []).forEach((st) => {
                     const entries = buildGroupedEntries(st);
                     if (entries.length === 0) {
-                      entries.push({ group: 'Other', field: '-', value: '-', missing: false });
+                      entries.push({ group: 'Other', items: [{ field: '-', value: '-', missing: false }] });
                     }
 
                     entries.forEach((entry, idx) => {
@@ -2828,15 +2849,16 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                       g.className = 'group-cell';
                       tr.appendChild(g);
 
-                      const f = document.createElement('td');
-                      f.textContent = entry.field;
-                      tr.appendChild(f);
-
                       const v = document.createElement('td');
-                      v.textContent = entry.value;
-                      if (entry.missing) {
-                        v.className = 'missing-cell';
-                      }
+                      const parts = entry.items.map((item) => {
+                        const safeField = String(item.field);
+                        const safeValue = String(item.value);
+                        if (item.missing) {
+                          return `<span class="missing-cell px-1">${safeField}=MISSING</span>`;
+                        }
+                        return `${safeField}=${safeValue}`;
+                      });
+                      v.innerHTML = parts.join(' | ');
                       tr.appendChild(v);
 
                       bodyRows.appendChild(tr);
