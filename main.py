@@ -651,6 +651,7 @@ class AccessStore:
         self._lock = threading.Lock()
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        self._verify_writable()
 
     def _connect(self):
         con = sqlite3.connect(self.db_path)
@@ -694,19 +695,56 @@ class AccessStore:
                         instrument_uuid TEXT NOT NULL,
                         PRIMARY KEY (username, instrument_uuid)
                     );
+
+                    CREATE TABLE IF NOT EXISTS write_probe (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at TEXT NOT NULL
+                    );
                     """
                 )
 
+    def _is_readonly_error(self, err: Exception) -> bool:
+        msg = str(err).lower()
+        return "readonly" in msg or "read-only" in msg
+
+    def _verify_writable(self):
+        """Fail fast on startup if the auth DB is not writable."""
+        with self._lock:
+            try:
+                with self._connect() as con:
+                    cur = con.execute(
+                        "INSERT INTO write_probe(created_at) VALUES(?)",
+                        (now_utc_iso(),),
+                    )
+                    probe_id = cur.lastrowid
+                    if probe_id is not None:
+                        con.execute("DELETE FROM write_probe WHERE id = ?", (probe_id,))
+            except sqlite3.OperationalError as e:
+                if self._is_readonly_error(e):
+                    raise RuntimeError(
+                        f"Auth DB is read-only: {self.db_path}. "
+                        "Set authDbPath to a writable location (for example under /data)."
+                    ) from e
+                raise
+
     def ensure_admin(self, username: str, password: str):
         with self._lock:
-            with self._connect() as con:
-                row = con.execute("SELECT username FROM users WHERE username = ?", (username,)).fetchone()
-                if row is None:
-                    con.execute(
-                        "INSERT INTO users(username,password_hash,email,role,active,created_at) VALUES(?,?,?,?,?,?)",
-                        (username, generate_password_hash(password), "", "admin", 1, now_utc_iso()),
-                    )
-                    logger.info("Created default admin user '%s'", username)
+            try:
+                with self._connect() as con:
+                    row = con.execute("SELECT username FROM users WHERE username = ?", (username,)).fetchone()
+                    if row is None:
+                        con.execute(
+                            "INSERT INTO users(username,password_hash,email,role,active,created_at) VALUES(?,?,?,?,?,?)",
+                            (username, generate_password_hash(password), "", "admin", 1, now_utc_iso()),
+                        )
+                        logger.info("Created default admin user '%s'", username)
+            except sqlite3.OperationalError as e:
+                if self._is_readonly_error(e):
+                    raise RuntimeError(
+                        f"Cannot initialize admin user: auth DB is read-only ({self.db_path}). "
+                        "Set authDbPath to a writable location."
+                    ) from e
+                raise
 
     def get_user(self, username: str):
         with self._connect() as con:
@@ -758,6 +796,13 @@ class AccessStore:
                 return True, "User created"
             except sqlite3.IntegrityError:
                 return False, "User already exists"
+            except sqlite3.OperationalError as e:
+                if self._is_readonly_error(e):
+                    return (
+                        False,
+                        f"Auth database is read-only ({self.db_path}). Configure a writable authDbPath (for example /data/collector_auth.sqlite).",
+                    )
+                return False, f"Database error: {e}"
 
     def create_account_request(self, username: str, password: str, email: str, message: str):
         username = username.strip()
@@ -1001,6 +1046,18 @@ def _to_float(value):
         return float(s)
     except Exception:
         return None
+
+
+def _is_missing_sensor_value(value):
+    if value is None:
+        return True
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("", "nan", "none", "null", "n/a", "na", "-"):
+            return True
+    if isinstance(value, float) and math.isnan(value):
+        return True
+    return False
 
 
 def _extract_lat_lon_from_row(row: dict):
@@ -1526,6 +1583,16 @@ def build_admin_network_dashboard(storage_root: str):
         alarms = []
         values = {}
         battery_info = []
+        missing_fields = []
+        expected_keys = set()
+
+        for row in rows:
+            for key, raw in row.items():
+                if key in ("timestamp", "topic", "uuid", "name"):
+                    continue
+                if isinstance(raw, str) and len(raw) > 180:
+                    continue
+                expected_keys.add(key)
 
         if latest_ts is None or latest_row is None:
             alarms.append("lost_connectivity:no_data")
@@ -1538,17 +1605,22 @@ def build_admin_network_dashboard(storage_root: str):
             alarms.extend(batt_alarms)
 
             numeric_count = 0
-            for key, raw in latest_row.items():
-                if key in ("timestamp", "topic", "uuid", "name"):
-                    continue
-                if isinstance(raw, str) and len(raw) > 180:
+            for key in expected_keys:
+                raw = latest_row.get(key)
+                if _is_missing_sensor_value(raw):
+                    missing_fields.append(key)
                     continue
                 values[key] = raw
-                value_keys.add(key)
                 if _to_float(raw) is not None:
                     numeric_count += 1
             if numeric_count < 2:
                 alarms.append("sensor_failure:too_few_numeric_values")
+            if missing_fields:
+                short = ",".join(missing_fields[:8])
+                suffix = "" if len(missing_fields) <= 8 else ",..."
+                alarms.append(f"sensor_failure:missing_values[{len(missing_fields)}]={short}{suffix}")
+
+        value_keys.update(expected_keys)
 
         stations.append(
             {
@@ -1559,6 +1631,8 @@ def build_admin_network_dashboard(storage_root: str):
                 "status": "ALARM" if alarms else "OK",
                 "alarms": alarms,
                 "batteryInfo": ", ".join(battery_info) if battery_info else "",
+                "missingFields": missing_fields,
+                "missingCount": len(missing_fields),
                 "values": values,
             }
         )
@@ -2632,10 +2706,12 @@ def create_web_app(cfg: dict, access_store: AccessStore):
               <style>
                 .table-wrap { max-height: 78vh; overflow: auto; border: 1px solid #ddd; }
                 table { border-collapse: collapse; width: 100%; font-size: 12px; }
-                th, td { border: 1px solid #ddd; padding: 4px; white-space: nowrap; }
+                th, td { border: 1px solid #ddd; padding: 4px; vertical-align: top; }
                 th { position: sticky; top: 0; background: #f8f8f8; z-index: 2; }
                 .status-ok { color: #157347; font-weight: 700; }
                 .status-alarm { color: #bb2d3b; font-weight: 700; }
+                .missing-cell { background: #ffe7e7; color: #8b0000; font-weight: 600; }
+                .group-cell { font-weight: 700; background: #f9fafb; }
               </style>
             </head>
             <body class="container-fluid py-3">
@@ -2655,48 +2731,108 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 const bodyRows = document.getElementById('bodyRows');
                 const updatedAt = document.getElementById('updatedAt');
 
+                const GROUP_ORDER = ['Atmosphere', 'Wind', 'Rain', 'Air Quality', 'Position', 'System', 'Other'];
+
+                function classifyField(field) {
+                  const f = String(field || '').toLowerCase();
+                  if (f.includes('aqi') || f.startsWith('pm') || f.includes('partic') || f.includes('airlink')) return 'Air Quality';
+                  if (f.includes('wind')) return 'Wind';
+                  if (f.includes('rain') || f.includes('storm') || f.includes('et')) return 'Rain';
+                  if (f.includes('lat') || f.includes('lon') || f.includes('lng') || f.includes('position')) return 'Position';
+                  if (
+                    f.includes('temp') || f.includes('hum') || f.includes('bar') || f.includes('press') ||
+                    f.includes('dew') || f.includes('wet_bulb') || f.includes('heat')
+                  ) return 'Atmosphere';
+                  if (f.includes('battery') || f.includes('volt') || f.includes('status') || f.includes('signal')) return 'System';
+                  return 'Other';
+                }
+
+                function buildGroupedEntries(st) {
+                  const values = st.values || {};
+                  const missing = new Set(st.missingFields || []);
+                  const keys = new Set(Object.keys(values));
+                  missing.forEach((k) => keys.add(k));
+
+                  const entries = Array.from(keys).map((k) => {
+                    const isMissing = missing.has(k);
+                    return {
+                      group: classifyField(k),
+                      field: k,
+                      value: isMissing ? 'MISSING' : (values[k] == null ? '' : String(values[k])),
+                      missing: isMissing
+                    };
+                  });
+
+                  entries.sort((a, b) => {
+                    const ga = GROUP_ORDER.indexOf(a.group);
+                    const gb = GROUP_ORDER.indexOf(b.group);
+                    const ia = ga === -1 ? GROUP_ORDER.length : ga;
+                    const ib = gb === -1 ? GROUP_ORDER.length : gb;
+                    if (ia !== ib) return ia - ib;
+                    return a.field.localeCompare(b.field);
+                  });
+
+                  return entries;
+                }
+
                 function render(payload) {
-                  const columns = payload.valueColumns || [];
                   headRow.innerHTML = '';
-                  ['Station', 'UUID', 'Timestamp', 'Age(s)', 'Status', 'Alarms', 'Battery'].forEach((h) => {
+                  ['Station', 'UUID', 'Timestamp', 'Age(s)', 'Status', 'Alarms', 'Missing values', 'Battery', 'Group', 'Field', 'Value'].forEach((h) => {
                     const th = document.createElement('th');
                     th.textContent = h;
-                    headRow.appendChild(th);
-                  });
-                  columns.forEach((c) => {
-                    const th = document.createElement('th');
-                    th.textContent = c;
                     headRow.appendChild(th);
                   });
 
                   bodyRows.innerHTML = '';
                   (payload.stations || []).forEach((st) => {
-                    const tr = document.createElement('tr');
-                    const fixed = [
-                      st.name || st.uuid,
-                      st.uuid || '',
-                      st.lastTimestamp || '',
-                      st.ageSeconds == null ? '' : st.ageSeconds,
-                      st.status || '',
-                      (st.alarms || []).join(', '),
-                      st.batteryInfo || ''
-                    ];
-                    fixed.forEach((value, idx) => {
-                      const td = document.createElement('td');
-                      td.textContent = String(value);
-                      if (idx === 4) {
-                        td.className = (String(value) === 'OK') ? 'status-ok' : 'status-alarm';
-                      }
-                      tr.appendChild(td);
-                    });
+                    const entries = buildGroupedEntries(st);
+                    if (entries.length === 0) {
+                      entries.push({ group: 'Other', field: '-', value: '-', missing: false });
+                    }
 
-                    columns.forEach((c) => {
-                      const td = document.createElement('td');
-                      const raw = st.values ? st.values[c] : '';
-                      td.textContent = (raw === null || raw === undefined) ? '' : String(raw);
-                      tr.appendChild(td);
+                    entries.forEach((entry, idx) => {
+                      const tr = document.createElement('tr');
+
+                      if (idx === 0) {
+                        const fixed = [
+                          st.name || st.uuid,
+                          st.uuid || '',
+                          st.lastTimestamp || '',
+                          st.ageSeconds == null ? '' : st.ageSeconds,
+                          st.status || '',
+                          (st.alarms || []).join(', '),
+                          (st.missingFields && st.missingFields.length) ? st.missingFields.join(', ') : '',
+                          st.batteryInfo || ''
+                        ];
+                        fixed.forEach((value, colIdx) => {
+                          const td = document.createElement('td');
+                          td.textContent = String(value);
+                          td.rowSpan = entries.length;
+                          if (colIdx === 4) {
+                            td.className = (String(value) === 'OK') ? 'status-ok' : 'status-alarm';
+                          }
+                          tr.appendChild(td);
+                        });
+                      }
+
+                      const g = document.createElement('td');
+                      g.textContent = entry.group;
+                      g.className = 'group-cell';
+                      tr.appendChild(g);
+
+                      const f = document.createElement('td');
+                      f.textContent = entry.field;
+                      tr.appendChild(f);
+
+                      const v = document.createElement('td');
+                      v.textContent = entry.value;
+                      if (entry.missing) {
+                        v.className = 'missing-cell';
+                      }
+                      tr.appendChild(v);
+
+                      bodyRows.appendChild(tr);
                     });
-                    bodyRows.appendChild(tr);
                   });
 
                   updatedAt.textContent = 'Updated at: ' + (payload.updatedAt || '-');
