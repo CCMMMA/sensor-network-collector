@@ -660,48 +660,56 @@ class AccessStore:
 
     def _init_schema(self):
         with self._lock:
-            with self._connect() as con:
-                con.executescript(
-                    """
-                    CREATE TABLE IF NOT EXISTS users (
-                        username TEXT PRIMARY KEY,
-                        password_hash TEXT NOT NULL,
-                        email TEXT,
-                        role TEXT NOT NULL DEFAULT 'user',
-                        active INTEGER NOT NULL DEFAULT 1,
-                        created_at TEXT NOT NULL
-                    );
+            try:
+                with self._connect() as con:
+                    con.executescript(
+                        """
+                        CREATE TABLE IF NOT EXISTS users (
+                            username TEXT PRIMARY KEY,
+                            password_hash TEXT NOT NULL,
+                            email TEXT,
+                            role TEXT NOT NULL DEFAULT 'user',
+                            active INTEGER NOT NULL DEFAULT 1,
+                            created_at TEXT NOT NULL
+                        );
 
-                    CREATE TABLE IF NOT EXISTS account_requests (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        username TEXT NOT NULL,
-                        email TEXT,
-                        password_hash TEXT NOT NULL,
-                        message TEXT,
-                        status TEXT NOT NULL DEFAULT 'pending',
-                        created_at TEXT NOT NULL,
-                        reviewed_by TEXT
-                    );
+                        CREATE TABLE IF NOT EXISTS account_requests (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            username TEXT NOT NULL,
+                            email TEXT,
+                            password_hash TEXT NOT NULL,
+                            message TEXT,
+                            status TEXT NOT NULL DEFAULT 'pending',
+                            created_at TEXT NOT NULL,
+                            reviewed_by TEXT
+                        );
 
-                    CREATE TABLE IF NOT EXISTS instrument_policies (
-                        instrument_uuid TEXT PRIMARY KEY,
-                        policy TEXT NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        updated_by TEXT
-                    );
+                        CREATE TABLE IF NOT EXISTS instrument_policies (
+                            instrument_uuid TEXT PRIMARY KEY,
+                            policy TEXT NOT NULL,
+                            updated_at TEXT NOT NULL,
+                            updated_by TEXT
+                        );
 
-                    CREATE TABLE IF NOT EXISTS user_instruments (
-                        username TEXT NOT NULL,
-                        instrument_uuid TEXT NOT NULL,
-                        PRIMARY KEY (username, instrument_uuid)
-                    );
+                        CREATE TABLE IF NOT EXISTS user_instruments (
+                            username TEXT NOT NULL,
+                            instrument_uuid TEXT NOT NULL,
+                            PRIMARY KEY (username, instrument_uuid)
+                        );
 
-                    CREATE TABLE IF NOT EXISTS write_probe (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        created_at TEXT NOT NULL
-                    );
-                    """
-                )
+                        CREATE TABLE IF NOT EXISTS write_probe (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            created_at TEXT NOT NULL
+                        );
+                        """
+                    )
+            except sqlite3.OperationalError as e:
+                if self._is_readonly_error(e):
+                    raise RuntimeError(
+                        f"Auth DB is read-only: {self.db_path}. "
+                        "Set authDbPath to a writable location (for example under /data)."
+                    ) from e
+                raise
 
     def _is_readonly_error(self, err: Exception) -> bool:
         msg = str(err).lower()
@@ -3195,7 +3203,10 @@ def main():
             logger.info("Signal K output enabled (%s) with access-request workflow", cfg["signalk_server_url"])
 
     if cfg["enable_http"]:
-        start_web_gui(cfg)
+        try:
+            start_web_gui(cfg)
+        except RuntimeError as e:
+            logger.error("Web GUI disabled: %s", e)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
