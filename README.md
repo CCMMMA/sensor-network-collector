@@ -592,7 +592,7 @@ Example config:
   "signalkContextPrefix": "meteo",
   "signalkPathMap": {
     "TempOut": "environment.outside.temperature",
-    "HumOut": "environment.outside.humidity",
+    "HumOut": "environment.outside.relativeHumidity",
     "Barometer": "environment.outside.pressure",
     "WindSpeed": "environment.wind.speedApparent",
     "WindDir": "environment.wind.angleApparent"

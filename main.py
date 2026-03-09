@@ -41,12 +41,12 @@ logger = logging.getLogger("sensor_network_collector")
 # ----------------------------
 SIGNALK_STANDARD_PATHS = {
     "TempOut": "environment.outside.temperature",
-    "HumOut": "environment.outside.humidity",
+    "HumOut": "environment.outside.relativeHumidity",
     "Barometer": "environment.outside.pressure",
     "WindSpeed": "environment.wind.speedApparent",
     "WindDir": "environment.wind.angleApparent",
     "TempIn": "environment.inside.temperature",
-    "HumIn": "environment.inside.humidity",
+    "HumIn": "environment.inside.relativeHumidity",
 }
 
 INFLUX_FIELD_CONFLICT_RE = re.compile(
@@ -629,7 +629,7 @@ def build_signalk_delta(topic: str, data: dict, tags: dict, dt: datetime, cfg: d
 
     update = {
         "timestamp": dt.isoformat().replace("+00:00", "Z"),
-        "$source": cfg.get("signalk_source_label", "sensor-network-collector"),
+        "source": {"label": cfg.get("signalk_source_label", "sensor-network-collector")},
     }
     if values:
         update["values"] = values
