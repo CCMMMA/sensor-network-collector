@@ -1191,20 +1191,56 @@ def extract_numeric_series(rows, excluded=None):
 
 
 PUBLIC_METRIC_SPECS = [
+    {"key": "temperature", "label": "Temperature", "aliases": ["TempOut", "temperature", "outside_temp", "temp"], "unit": "C"},
+    {"key": "humidity", "label": "Humidity", "aliases": ["HumOut", "humidity", "hum"], "unit": "%"},
+    {"key": "pressure", "label": "Pressure", "aliases": ["Barometer", "pressure", "bar"], "unit": "hPa"},
+    {"key": "wind_speed", "label": "Wind Speed", "aliases": ["WindSpeed", "wind_speed"], "unit": "m/s"},
+    {"key": "wind_direction", "label": "Wind Direction", "aliases": ["WindDir", "wind_dir"], "unit": "deg"},
+    {"key": "rain_rate", "label": "Rain Rate", "aliases": ["RainRate", "rain_rate"], "unit": "mm/h"},
+    {"key": "aqi_current", "label": "Current AQI", "aliases": ["aqi_val", "AQI", "CurrentAQI", "aqi"], "unit": ""},
+    {"key": "aqi_1h", "label": "1 Hour AQI", "aliases": ["aqi_1_hour_val", "AQI1h", "AQI_1h"], "unit": ""},
+    {"key": "aqi_nowcast", "label": "NowCast AQI", "aliases": ["aqi_nowcast_val", "NowCastAQI"], "unit": ""},
+    {"key": "pm1", "label": "PM1", "aliases": ["pm_1", "PM1"], "unit": "ug/m3"},
+    {"key": "pm2_5", "label": "PM2.5", "aliases": ["pm_2p5", "pm2_5", "PM2_5", "PM2.5"], "unit": "ug/m3"},
+    {"key": "pm10", "label": "PM10", "aliases": ["pm_10", "PM10"], "unit": "ug/m3"},
+]
+
+PUBLIC_SERIES_SPECS = [
     {
         "key": "temperature",
-        "label": "Temperature",
-        "aliases": ["TempOut", "temperature", "outside_temp"],
+        "label": "Temperature Trend",
+        "aliases": ["TempOut", "temperature", "outside_temp", "temp"],
         "unit": "C",
-        "y_min": -20,
-        "y_max": 50,
+        "axis": {"auto": True},
     },
-    {"key": "humidity", "label": "Humidity", "aliases": ["HumOut", "humidity"], "unit": "%", "y_min": 0, "y_max": 100},
-    {"key": "pressure", "label": "Pressure", "aliases": ["Barometer", "pressure"], "unit": "hPa", "y_min": 850, "y_max": 1100},
-    {"key": "wind_speed", "label": "Wind Speed", "aliases": ["WindSpeed", "wind_speed"], "unit": "m/s", "y_min": 0, "y_max": 40},
-    {"key": "wind_direction", "label": "Wind Direction", "aliases": ["WindDir", "wind_dir"], "unit": "deg", "y_min": 0, "y_max": 360},
-    {"key": "rain_rate", "label": "Rain Rate", "aliases": ["RainRate", "rain_rate"], "unit": "mm/h", "y_min": 0, "y_max": 50},
-    {"key": "aqi", "label": "AQI", "aliases": ["AQI", "CurrentAQI", "NowCastAQI", "aqi"], "unit": "", "y_min": 0, "y_max": 300},
+    {
+        "key": "pressure",
+        "label": "Pressure Trend",
+        "aliases": ["Barometer", "pressure", "bar"],
+        "unit": "hPa",
+        "axis": {"auto": True},
+    },
+    {
+        "key": "wind_speed",
+        "label": "Wind Speed Trend",
+        "aliases": ["WindSpeed", "wind_speed"],
+        "unit": "m/s",
+        "axis": {"auto": True, "floor_zero": True},
+    },
+    {
+        "key": "rain_rate",
+        "label": "Rain Rate Trend",
+        "aliases": ["RainRate", "rain_rate"],
+        "unit": "mm/h",
+        "axis": {"auto": True, "floor_zero": True},
+    },
+    {
+        "key": "aqi_trend",
+        "label": "Air Quality Index",
+        "aliases": ["aqi_val", "AQI", "CurrentAQI", "aqi"],
+        "unit": "",
+        "axis": {"min": 0, "max": 300},
+    },
 ]
 
 
@@ -1223,6 +1259,35 @@ def _first_numeric_for_aliases(row: dict, aliases):
         if v is not None:
             return v
     return None
+
+
+def _calc_axis_range(values, axis_spec=None):
+    axis_spec = axis_spec or {}
+    if "min" in axis_spec or "max" in axis_spec:
+        return axis_spec.get("min"), axis_spec.get("max")
+
+    if not axis_spec.get("auto"):
+        return None, None
+
+    if not values:
+        return None, None
+
+    lo = min(values)
+    hi = max(values)
+
+    if lo == hi:
+        pad = max(1.0, abs(lo) * 0.15)
+        lo -= pad
+        hi += pad
+    else:
+        pad = (hi - lo) * 0.15
+        lo -= pad
+        hi += pad
+
+    if axis_spec.get("floor_zero"):
+        lo = max(0.0, lo)
+
+    return round(lo, 3), round(hi, 3)
 
 
 def build_public_station_snapshot(storage_root: str, instrument_uuid: str, max_points: int = 120):
@@ -1269,7 +1334,7 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, max_p
         )
 
     series = []
-    for spec in PUBLIC_METRIC_SPECS:
+    for spec in PUBLIC_SERIES_SPECS:
         labels = []
         values = []
         for ts, row in rows_ts:
@@ -1279,17 +1344,56 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, max_p
             labels.append(ts.isoformat().replace("+00:00", "Z"))
             values.append(round(value, 3))
         if values:
+            y_min, y_max = _calc_axis_range(values, spec.get("axis"))
             series.append(
                 {
                     "key": spec["key"],
                     "label": spec["label"],
                     "unit": spec["unit"],
-                    "y_min": spec.get("y_min"),
-                    "y_max": spec.get("y_max"),
+                    "y_min": y_min,
+                    "y_max": y_max,
                     "labels": labels,
                     "values": values,
                 }
             )
+
+    # Particulate matter multi-series trend (only when available).
+    pm_series_specs = [
+        {"label": "PM1", "aliases": ["pm_1", "PM1"]},
+        {"label": "PM2.5", "aliases": ["pm_2p5", "pm2_5", "PM2_5", "PM2.5"]},
+        {"label": "PM10", "aliases": ["pm_10", "PM10"]},
+    ]
+    pm_labels = []
+    pm_datasets = []
+    pm_all_values = []
+    for item in pm_series_specs:
+        labels = []
+        values = []
+        for ts, row in rows_ts:
+            value = _first_numeric_for_aliases(row, item["aliases"])
+            if value is None:
+                continue
+            labels.append(ts.isoformat().replace("+00:00", "Z"))
+            values.append(round(value, 3))
+            pm_all_values.append(float(value))
+        if values:
+            if len(labels) > len(pm_labels):
+                pm_labels = labels
+            pm_datasets.append({"label": item["label"], "values": values})
+
+    if pm_datasets:
+        y_min, y_max = _calc_axis_range(pm_all_values, {"auto": True, "floor_zero": True})
+        series.append(
+            {
+                "key": "particulate_matter",
+                "label": "Particulate Matter",
+                "unit": "ug/m3",
+                "y_min": y_min,
+                "y_max": y_max,
+                "labels": pm_labels,
+                "datasets": pm_datasets,
+            }
+        )
 
     return {
         "instrument_uuid": instrument_uuid,
@@ -1579,6 +1683,9 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     }
                     html += `<br/><a href="/public/station/${encodeURIComponent(s.uuid)}">public dashboard</a>`;
                     marker.bindPopup(html);
+                    marker.on('click', () => {
+                      window.location.href = `/public/station/${encodeURIComponent(s.uuid)}`;
+                    });
                   });
                 }
               </script>
@@ -1914,6 +2021,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         if instrument_uuid not in instruments:
             abort(404, "Station not found")
 
+        user = current_user()
+        can_browse_download = bool(user) and station_is_accessible(user, instrument_uuid)
         snapshot = build_public_station_snapshot(storage_root, instrument_uuid)
         return render_template_string(
             """
@@ -1926,11 +2035,11 @@ def create_web_app(cfg: dict, access_store: AccessStore):
               <style>
                 html, body { height: 100%; overflow: hidden; }
                 .dashboard-root { height: 100vh; display: flex; flex-direction: column; }
-                #cards .card-body { padding: .65rem .8rem; }
-                .metric-value { font-size: 1.65rem; line-height: 1.1; }
-                #chartsWrap { flex: 1 1 auto; min-height: 0; overflow: auto; }
-                .chart-card { height: 220px; }
-                .chart-card canvas { height: 150px !important; }
+                #cards .card-body { padding: .5rem .65rem; }
+                .metric-value { font-size: 1.25rem; line-height: 1.1; }
+                #chartsWrap { flex: 1 1 auto; min-height: 0; overflow: hidden; }
+                .chart-card { height: 170px; }
+                .chart-card canvas { height: 112px !important; }
               </style>
             </head>
             <body class="bg-light">
@@ -1943,12 +2052,15 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 <div class="text-end">
                   <div class="small text-muted">Last update</div>
                   <div class="fw-semibold" id="lastUpdate">{{ snapshot.last_timestamp or "-" }}</div>
+                  {% if can_browse_download %}
+                    <a class="btn btn-sm btn-primary mt-2" href="{{ url_for('browse_station', instrument_uuid=snapshot.instrument_uuid) }}">Browse & Download Data</a>
+                  {% endif %}
                 </div>
               </div>
 
-              <div id="cards" class="row g-2 mb-2"></div>
+              <div id="cards" class="row g-1 mb-1"></div>
               <div id="chartsWrap">
-                <div id="charts" class="row g-2"></div>
+                <div id="charts" class="row g-1"></div>
               </div>
 
               <script>
@@ -1961,7 +2073,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   const value = (card.value === null || card.value === undefined) ? '--' : card.value;
                   const unit = card.unit || '';
                   return `
-                    <div class="col-6 col-md-4 col-xl-2">
+                    <div class="col-6 col-md-3 col-xl-2">
                       <div class="card h-100 shadow-sm">
                         <div class="card-body">
                           <div class="text-muted small">${card.label}</div>
@@ -1974,65 +2086,72 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
                 function renderCards(snapshot) {
                   const cardsEl = document.getElementById('cards');
-                  cardsEl.innerHTML = (snapshot.cards || []).map(cardHtml).join('');
-                }
-
-                function ensureChartCanvas(key, label, unit) {
-                  const chartsEl = document.getElementById('charts');
-                  const id = `chart_${key}`;
-                  if (document.getElementById(id)) {
-                    return id;
-                  }
-                  const col = document.createElement('div');
-                  col.className = 'col-12 col-md-6 col-xl-4';
-                  col.innerHTML = `
-                    <div class="card chart-card shadow-sm">
-                      <div class="card-body">
-                        <div class="d-flex justify-content-between">
-                          <h2 class="h6 mb-2">${label}</h2>
-                          <span class="text-muted small">${unit || ''}</span>
-                        </div>
-                        <canvas id="${id}" height="120"></canvas>
-                      </div>
-                    </div>
-                  `;
-                  chartsEl.appendChild(col);
-                  return id;
+                  cardsEl.innerHTML = (snapshot.cards || []).filter(c => c.value !== null && c.value !== undefined).map(cardHtml).join('');
                 }
 
                 function renderSeries(snapshot) {
-                  const series = snapshot.series || [];
+                  Object.keys(chartInstances).forEach((k) => {
+                    chartInstances[k].destroy();
+                    delete chartInstances[k];
+                  });
+                  const chartsEl = document.getElementById('charts');
+                  chartsEl.innerHTML = '';
+
+                  const series = (snapshot.series || []).slice(0, 6);
                   series.forEach((s, idx) => {
-                    const id = ensureChartCanvas(s.key, s.label, s.unit);
+                    const id = `chart_${s.key}`;
+                    const col = document.createElement('div');
+                    col.className = 'col-12 col-md-6 col-xl-4';
+                    col.innerHTML = `
+                      <div class="card chart-card shadow-sm">
+                        <div class="card-body">
+                          <div class="d-flex justify-content-between">
+                            <h2 class="h6 mb-1">${s.label}</h2>
+                            <span class="text-muted small">${s.unit || ''}</span>
+                          </div>
+                          <canvas id="${id}" height="110"></canvas>
+                        </div>
+                      </div>
+                    `;
+                    chartsEl.appendChild(col);
+
                     const canvas = document.getElementById(id);
                     if (!canvas) return;
-                    const color = colors[idx % colors.length];
+
                     const yMin = (s.y_min !== null && s.y_min !== undefined) ? s.y_min : undefined;
                     const yMax = (s.y_max !== null && s.y_max !== undefined) ? s.y_max : undefined;
-                    if (!chartInstances[s.key]) {
-                      chartInstances[s.key] = new Chart(canvas, {
-                        type: 'line',
-                        data: {
-                          labels: s.labels,
-                          datasets: [{ label: s.label, data: s.values, borderColor: color, tension: 0.25, pointRadius: 0 }]
-                        },
-                        options: {
-                          responsive: true,
-                          maintainAspectRatio: false,
-                          scales: {
-                            x: { ticks: { maxTicksLimit: 6 } },
-                            y: { beginAtZero: false, min: yMin, max: yMax }
-                          }
+                    const datasets = (s.datasets && Array.isArray(s.datasets))
+                      ? s.datasets.map((d, j) => ({
+                          label: d.label,
+                          data: d.values,
+                          borderColor: colors[(idx + j) % colors.length],
+                          tension: 0.2,
+                          pointRadius: 0
+                        }))
+                      : [{
+                          label: s.label,
+                          data: s.values,
+                          borderColor: colors[idx % colors.length],
+                          tension: 0.25,
+                          pointRadius: 0
+                        }];
+
+                    chartInstances[s.key] = new Chart(canvas, {
+                      type: 'line',
+                      data: {
+                        labels: s.labels,
+                        datasets
+                      },
+                      options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { display: datasets.length > 1 } },
+                        scales: {
+                          x: { ticks: { maxTicksLimit: 5 } },
+                          y: { beginAtZero: false, min: yMin, max: yMax }
                         }
-                      });
-                    } else {
-                      const ch = chartInstances[s.key];
-                      ch.data.labels = s.labels;
-                      ch.data.datasets[0].data = s.values;
-                      ch.options.scales.y.min = yMin;
-                      ch.options.scales.y.max = yMax;
-                      ch.update();
-                    }
+                      }
+                    });
                   });
                 }
 
@@ -2064,6 +2183,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             </html>
             """,
             snapshot=snapshot,
+            can_browse_download=can_browse_download,
         )
 
     @app.route("/api/public/station/<path:instrument_uuid>/snapshot")

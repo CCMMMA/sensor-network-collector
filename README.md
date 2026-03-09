@@ -430,6 +430,8 @@ Features:
 - public station dashboard (`/public/station/<uuid>`) with:
   - no authentication required
   - live cards/charts auto-refreshed from `/api/public/station/<uuid>/snapshot`
+  - air quality cards/trends shown when AQ fields are available (`aqi_*`, `pm_*`)
+  - automatic Y-axis scaling for pressure/temperature/wind speed/rain rate trends
 - authenticated or anonymous downloads depending on policy
 
 Policy levels (per instrument):
