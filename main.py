@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import paho.mqtt.client as mqtt
-from flask import Flask, abort, redirect, render_template_string, request, send_file, session, url_for
+from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file, session, url_for
 from influxdb_client import InfluxDBClient
 from influxdb_client.client.write_api import SYNCHRONOUS
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -1190,6 +1190,112 @@ def extract_numeric_series(rows, excluded=None):
     return sorted(numeric_keys)
 
 
+PUBLIC_METRIC_SPECS = [
+    {"key": "temperature", "label": "Temperature", "aliases": ["TempOut", "temperature", "outside_temp"], "unit": "C"},
+    {"key": "humidity", "label": "Humidity", "aliases": ["HumOut", "humidity"], "unit": "%"},
+    {"key": "pressure", "label": "Pressure", "aliases": ["Barometer", "pressure"], "unit": "hPa"},
+    {"key": "wind_speed", "label": "Wind Speed", "aliases": ["WindSpeed", "wind_speed"], "unit": "m/s"},
+    {"key": "wind_direction", "label": "Wind Direction", "aliases": ["WindDir", "wind_dir"], "unit": "deg"},
+    {"key": "rain_rate", "label": "Rain Rate", "aliases": ["RainRate", "rain_rate"], "unit": "mm/h"},
+    {"key": "aqi", "label": "AQI", "aliases": ["AQI", "CurrentAQI", "NowCastAQI", "aqi"], "unit": ""},
+]
+
+
+def _first_numeric_for_aliases(row: dict, aliases):
+    for alias in aliases:
+        if alias in row:
+            v = _to_float(row.get(alias))
+            if v is not None:
+                return v
+    lowered = {str(k).lower(): k for k in row.keys()}
+    for alias in aliases:
+        key = lowered.get(str(alias).lower())
+        if key is None:
+            continue
+        v = _to_float(row.get(key))
+        if v is not None:
+            return v
+    return None
+
+
+def build_public_station_snapshot(storage_root: str, instrument_uuid: str, max_points: int = 120):
+    rows = load_station_rows(storage_root, instrument_uuid, limit=2000)
+    preview = get_station_preview(storage_root, instrument_uuid)
+
+    if not rows:
+        return {
+            "instrument_uuid": instrument_uuid,
+            "station_name": preview.get("name") or instrument_uuid,
+            "last_timestamp": None,
+            "rows": 0,
+            "location": {
+                "latitude": preview.get("latitude"),
+                "longitude": preview.get("longitude"),
+            },
+            "cards": [],
+            "series": [],
+        }
+
+    rows_ts = []
+    for row in rows:
+        ts = parse_iso_ts(row.get("timestamp", ""))
+        if ts is None:
+            continue
+        rows_ts.append((ts, row))
+    rows_ts.sort(key=lambda x: x[0])
+    if max_points and len(rows_ts) > max_points:
+        rows_ts = rows_ts[-max_points:]
+
+    latest_row = rows_ts[-1][1] if rows_ts else rows[-1]
+    latest_ts = rows_ts[-1][0].isoformat().replace("+00:00", "Z") if rows_ts else latest_row.get("timestamp")
+
+    cards = []
+    for spec in PUBLIC_METRIC_SPECS:
+        value = _first_numeric_for_aliases(latest_row, spec["aliases"])
+        cards.append(
+            {
+                "key": spec["key"],
+                "label": spec["label"],
+                "value": None if value is None else round(value, 2),
+                "unit": spec["unit"],
+            }
+        )
+
+    series = []
+    for spec in PUBLIC_METRIC_SPECS:
+        labels = []
+        values = []
+        for ts, row in rows_ts:
+            value = _first_numeric_for_aliases(row, spec["aliases"])
+            if value is None:
+                continue
+            labels.append(ts.isoformat().replace("+00:00", "Z"))
+            values.append(round(value, 3))
+        if values:
+            series.append(
+                {
+                    "key": spec["key"],
+                    "label": spec["label"],
+                    "unit": spec["unit"],
+                    "labels": labels,
+                    "values": values,
+                }
+            )
+
+    return {
+        "instrument_uuid": instrument_uuid,
+        "station_name": latest_row.get("name") or preview.get("name") or instrument_uuid,
+        "last_timestamp": latest_ts,
+        "rows": len(rows_ts),
+        "location": {
+            "latitude": preview.get("latitude"),
+            "longitude": preview.get("longitude"),
+        },
+        "cards": cards,
+        "series": series,
+    }
+
+
 def coerce_for_influx_type(value, target_type: str):
     t = str(target_type or "").strip().lower()
     if t in ("integer", "int"):
@@ -1407,6 +1513,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                         <input type="checkbox" name="instrument" value="{{ st.uuid }}"> {{ st.name }} ({{ st.uuid }})
                         (policy={{ st.policy }}, rows={{ st.rows }})
                         <a href="{{ url_for('browse_station', instrument_uuid=st.uuid) }}">browse</a>
+                        | <a href="{{ url_for('public_station', instrument_uuid=st.uuid) }}">public view</a>
                       </label><br/>
                     {% endfor %}
                     <p>Date filter (optional):</p>
@@ -1414,6 +1521,19 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     <label>To <input class="form-control d-inline-block w-auto" type="date" name="to_date"></label>
                     <p><button class="btn btn-primary mt-2" type="submit">Download ZIP</button></p>
                   </form>
+                {% endif %}
+              </div>
+
+              <div class="panel">
+                <h2>Public station dashboards</h2>
+                {% if not stations %}
+                  <p>No station folders found under {{ storage_root }}.</p>
+                {% else %}
+                  <ul>
+                    {% for st in stations %}
+                      <li><a href="{{ url_for('public_station', instrument_uuid=st.uuid) }}">{{ st.name }} ({{ st.uuid }})</a></li>
+                    {% endfor %}
+                  </ul>
                 {% endif %}
               </div>
 
@@ -1448,6 +1568,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     } else {
                       html += '<br/>no access with current user';
                     }
+                    html += `<br/><a href="/public/station/${encodeURIComponent(s.uuid)}">public dashboard</a>`;
                     marker.bindPopup(html);
                   });
                 }
@@ -1776,6 +1897,162 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             request=request,
         )
 
+
+    @app.route("/public/station/<path:instrument_uuid>")
+    def public_station(instrument_uuid: str):
+        storage_root = storage_root_or_404()
+        instruments = set(available_instruments(storage_root))
+        if instrument_uuid not in instruments:
+            abort(404, "Station not found")
+
+        snapshot = build_public_station_snapshot(storage_root, instrument_uuid)
+        return render_template_string(
+            """
+            <html>
+            <head>
+              <title>Public Station View - {{ snapshot.station_name }}</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+              <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+              <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+            </head>
+            <body class="container-fluid py-3 bg-light">
+              <div class="d-flex flex-wrap justify-content-between align-items-center mb-3">
+                <div>
+                  <h1 class="h3 mb-1">Public Station Dashboard</h1>
+                  <div class="text-muted" id="stationTitle">{{ snapshot.station_name }} ({{ snapshot.instrument_uuid }})</div>
+                </div>
+                <div class="text-end">
+                  <div class="small text-muted">Last update</div>
+                  <div class="fw-semibold" id="lastUpdate">{{ snapshot.last_timestamp or "-" }}</div>
+                </div>
+              </div>
+
+              <div id="cards" class="row g-3 mb-3"></div>
+              <div id="charts" class="row g-3"></div>
+
+              <script>
+                const stationId = {{ snapshot.instrument_uuid | tojson }};
+                let lastTimestamp = {{ snapshot.last_timestamp | tojson }};
+                const chartInstances = {};
+                const colors = ['#0d6efd', '#20c997', '#fd7e14', '#6f42c1', '#dc3545', '#198754', '#6c757d'];
+
+                function cardHtml(card) {
+                  const value = (card.value === null || card.value === undefined) ? '--' : card.value;
+                  const unit = card.unit || '';
+                  return `
+                    <div class="col-12 col-sm-6 col-xl-3">
+                      <div class="card h-100 shadow-sm">
+                        <div class="card-body">
+                          <div class="text-muted small">${card.label}</div>
+                          <div class="display-6">${value}<span class="fs-6 ms-1">${unit}</span></div>
+                        </div>
+                      </div>
+                    </div>
+                  `;
+                }
+
+                function renderCards(snapshot) {
+                  const cardsEl = document.getElementById('cards');
+                  cardsEl.innerHTML = (snapshot.cards || []).map(cardHtml).join('');
+                }
+
+                function ensureChartCanvas(key, label, unit) {
+                  const chartsEl = document.getElementById('charts');
+                  const id = `chart_${key}`;
+                  if (document.getElementById(id)) {
+                    return id;
+                  }
+                  const col = document.createElement('div');
+                  col.className = 'col-12 col-lg-6';
+                  col.innerHTML = `
+                    <div class="card h-100 shadow-sm">
+                      <div class="card-body">
+                        <div class="d-flex justify-content-between">
+                          <h2 class="h6 mb-2">${label}</h2>
+                          <span class="text-muted small">${unit || ''}</span>
+                        </div>
+                        <canvas id="${id}" height="120"></canvas>
+                      </div>
+                    </div>
+                  `;
+                  chartsEl.appendChild(col);
+                  return id;
+                }
+
+                function renderSeries(snapshot) {
+                  const series = snapshot.series || [];
+                  series.forEach((s, idx) => {
+                    const id = ensureChartCanvas(s.key, s.label, s.unit);
+                    const canvas = document.getElementById(id);
+                    if (!canvas) return;
+                    const color = colors[idx % colors.length];
+                    if (!chartInstances[s.key]) {
+                      chartInstances[s.key] = new Chart(canvas, {
+                        type: 'line',
+                        data: {
+                          labels: s.labels,
+                          datasets: [{ label: s.label, data: s.values, borderColor: color, tension: 0.25, pointRadius: 0 }]
+                        },
+                        options: {
+                          responsive: true,
+                          maintainAspectRatio: false,
+                          scales: {
+                            x: { ticks: { maxTicksLimit: 6 } },
+                            y: { beginAtZero: false }
+                          }
+                        }
+                      });
+                    } else {
+                      const ch = chartInstances[s.key];
+                      ch.data.labels = s.labels;
+                      ch.data.datasets[0].data = s.values;
+                      ch.update();
+                    }
+                  });
+                }
+
+                function applySnapshot(snapshot) {
+                  document.getElementById('stationTitle').textContent = `${snapshot.station_name} (${snapshot.instrument_uuid})`;
+                  document.getElementById('lastUpdate').textContent = snapshot.last_timestamp || '-';
+                  renderCards(snapshot);
+                  renderSeries(snapshot);
+                }
+
+                async function pollSnapshot() {
+                  try {
+                    const resp = await fetch(`/api/public/station/${encodeURIComponent(stationId)}/snapshot?since=${encodeURIComponent(lastTimestamp || '')}`, { cache: 'no-store' });
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    if (!data.changed) return;
+                    lastTimestamp = data.snapshot.last_timestamp;
+                    applySnapshot(data.snapshot);
+                  } catch (_) {
+                    // keep page live even if polling occasionally fails
+                  }
+                }
+
+                applySnapshot({{ snapshot | tojson }});
+                setInterval(pollSnapshot, 5000);
+              </script>
+            </body>
+            </html>
+            """,
+            snapshot=snapshot,
+        )
+
+    @app.route("/api/public/station/<path:instrument_uuid>/snapshot")
+    def public_station_snapshot(instrument_uuid: str):
+        storage_root = storage_root_or_404()
+        instruments = set(available_instruments(storage_root))
+        if instrument_uuid not in instruments:
+            abort(404, "Station not found")
+
+        snapshot = build_public_station_snapshot(storage_root, instrument_uuid)
+        since = request.args.get("since", "")
+        changed = bool(snapshot.get("last_timestamp")) and snapshot.get("last_timestamp") != since
+        if not since:
+            changed = True
+        return jsonify({"changed": changed, "snapshot": snapshot})
 
     @app.route("/login", methods=["GET", "POST"])
     def login():

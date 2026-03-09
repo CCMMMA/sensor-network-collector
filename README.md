@@ -427,6 +427,9 @@ Features:
   - previous/next interval navigation
   - units shown in table headers and chart labels/axis
   - filtered download action
+- public station dashboard (`/public/station/<uuid>`) with:
+  - no authentication required
+  - live cards/charts auto-refreshed from `/api/public/station/<uuid>/snapshot`
 - authenticated or anonymous downloads depending on policy
 
 Policy levels (per instrument):
