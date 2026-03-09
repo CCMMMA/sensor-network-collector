@@ -1191,13 +1191,20 @@ def extract_numeric_series(rows, excluded=None):
 
 
 PUBLIC_METRIC_SPECS = [
-    {"key": "temperature", "label": "Temperature", "aliases": ["TempOut", "temperature", "outside_temp"], "unit": "C"},
-    {"key": "humidity", "label": "Humidity", "aliases": ["HumOut", "humidity"], "unit": "%"},
-    {"key": "pressure", "label": "Pressure", "aliases": ["Barometer", "pressure"], "unit": "hPa"},
-    {"key": "wind_speed", "label": "Wind Speed", "aliases": ["WindSpeed", "wind_speed"], "unit": "m/s"},
-    {"key": "wind_direction", "label": "Wind Direction", "aliases": ["WindDir", "wind_dir"], "unit": "deg"},
-    {"key": "rain_rate", "label": "Rain Rate", "aliases": ["RainRate", "rain_rate"], "unit": "mm/h"},
-    {"key": "aqi", "label": "AQI", "aliases": ["AQI", "CurrentAQI", "NowCastAQI", "aqi"], "unit": ""},
+    {
+        "key": "temperature",
+        "label": "Temperature",
+        "aliases": ["TempOut", "temperature", "outside_temp"],
+        "unit": "C",
+        "y_min": -20,
+        "y_max": 50,
+    },
+    {"key": "humidity", "label": "Humidity", "aliases": ["HumOut", "humidity"], "unit": "%", "y_min": 0, "y_max": 100},
+    {"key": "pressure", "label": "Pressure", "aliases": ["Barometer", "pressure"], "unit": "hPa", "y_min": 850, "y_max": 1100},
+    {"key": "wind_speed", "label": "Wind Speed", "aliases": ["WindSpeed", "wind_speed"], "unit": "m/s", "y_min": 0, "y_max": 40},
+    {"key": "wind_direction", "label": "Wind Direction", "aliases": ["WindDir", "wind_dir"], "unit": "deg", "y_min": 0, "y_max": 360},
+    {"key": "rain_rate", "label": "Rain Rate", "aliases": ["RainRate", "rain_rate"], "unit": "mm/h", "y_min": 0, "y_max": 50},
+    {"key": "aqi", "label": "AQI", "aliases": ["AQI", "CurrentAQI", "NowCastAQI", "aqi"], "unit": "", "y_min": 0, "y_max": 300},
 ]
 
 
@@ -1277,6 +1284,8 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, max_p
                     "key": spec["key"],
                     "label": spec["label"],
                     "unit": spec["unit"],
+                    "y_min": spec.get("y_min"),
+                    "y_max": spec.get("y_max"),
                     "labels": labels,
                     "values": values,
                 }
@@ -1914,8 +1923,18 @@ def create_web_app(cfg: dict, access_store: AccessStore):
               <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
               <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
               <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+              <style>
+                html, body { height: 100%; overflow: hidden; }
+                .dashboard-root { height: 100vh; display: flex; flex-direction: column; }
+                #cards .card-body { padding: .65rem .8rem; }
+                .metric-value { font-size: 1.65rem; line-height: 1.1; }
+                #chartsWrap { flex: 1 1 auto; min-height: 0; overflow: auto; }
+                .chart-card { height: 220px; }
+                .chart-card canvas { height: 150px !important; }
+              </style>
             </head>
-            <body class="container-fluid py-3 bg-light">
+            <body class="bg-light">
+              <div class="container-fluid py-3 dashboard-root">
               <div class="d-flex flex-wrap justify-content-between align-items-center mb-3">
                 <div>
                   <h1 class="h3 mb-1">Public Station Dashboard</h1>
@@ -1927,8 +1946,10 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 </div>
               </div>
 
-              <div id="cards" class="row g-3 mb-3"></div>
-              <div id="charts" class="row g-3"></div>
+              <div id="cards" class="row g-2 mb-2"></div>
+              <div id="chartsWrap">
+                <div id="charts" class="row g-2"></div>
+              </div>
 
               <script>
                 const stationId = {{ snapshot.instrument_uuid | tojson }};
@@ -1940,11 +1961,11 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   const value = (card.value === null || card.value === undefined) ? '--' : card.value;
                   const unit = card.unit || '';
                   return `
-                    <div class="col-12 col-sm-6 col-xl-3">
+                    <div class="col-6 col-md-4 col-xl-2">
                       <div class="card h-100 shadow-sm">
                         <div class="card-body">
                           <div class="text-muted small">${card.label}</div>
-                          <div class="display-6">${value}<span class="fs-6 ms-1">${unit}</span></div>
+                          <div class="metric-value">${value}<span class="fs-6 ms-1">${unit}</span></div>
                         </div>
                       </div>
                     </div>
@@ -1963,9 +1984,9 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     return id;
                   }
                   const col = document.createElement('div');
-                  col.className = 'col-12 col-lg-6';
+                  col.className = 'col-12 col-md-6 col-xl-4';
                   col.innerHTML = `
-                    <div class="card h-100 shadow-sm">
+                    <div class="card chart-card shadow-sm">
                       <div class="card-body">
                         <div class="d-flex justify-content-between">
                           <h2 class="h6 mb-2">${label}</h2>
@@ -1986,6 +2007,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     const canvas = document.getElementById(id);
                     if (!canvas) return;
                     const color = colors[idx % colors.length];
+                    const yMin = (s.y_min !== null && s.y_min !== undefined) ? s.y_min : undefined;
+                    const yMax = (s.y_max !== null && s.y_max !== undefined) ? s.y_max : undefined;
                     if (!chartInstances[s.key]) {
                       chartInstances[s.key] = new Chart(canvas, {
                         type: 'line',
@@ -1998,7 +2021,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                           maintainAspectRatio: false,
                           scales: {
                             x: { ticks: { maxTicksLimit: 6 } },
-                            y: { beginAtZero: false }
+                            y: { beginAtZero: false, min: yMin, max: yMax }
                           }
                         }
                       });
@@ -2006,6 +2029,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                       const ch = chartInstances[s.key];
                       ch.data.labels = s.labels;
                       ch.data.datasets[0].data = s.values;
+                      ch.options.scales.y.min = yMin;
+                      ch.options.scales.y.max = yMax;
                       ch.update();
                     }
                   });
@@ -2034,6 +2059,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 applySnapshot({{ snapshot | tojson }});
                 setInterval(pollSnapshot, 5000);
               </script>
+              </div>
             </body>
             </html>
             """,
