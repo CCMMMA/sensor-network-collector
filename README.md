@@ -13,6 +13,8 @@ Threaded MQTT collector for weather/sensor networks, aligned with `vantage-publi
 - Web GUI for data download with authentication and access policies
 - Map-based station discovery on the home page
 - Data browsing per station with charts and tables
+- Live station trend pages (auto-updating charts and latest table)
+- Public sensor network dashboard with auto-updating status and alarms
 
 ## Configuration Style (Homogeneous with `vantage-publisher`)
 
@@ -450,6 +452,54 @@ Downloads:
   - unauthorized stations are rejected
   - this applies to both browsing and download endpoints
 
+### Live station browsing and trends
+
+From the home page, users can open each allowed station trend page.
+
+Features:
+
+- chart and latest-values table refresh automatically (no manual reload button)
+- trend window selector:
+  - last minute
+  - 10 minutes
+  - hour
+  - 3 hours
+  - 6 hours
+  - 12 hours
+  - 24 hours
+  - 72 hours
+  - one week
+- variable multi-select with automatic chart update on add/remove
+- vertical scrolling for long variable lists and data tables
+- station name shown alongside UUID
+- units shown in table columns and chart labels
+
+HTTP endpoints used by the trend page:
+
+- `GET /station/<instrument_uuid>`
+- `GET /api/station/<instrument_uuid>/series?window=<1m|10m|1h|3h|6h|12h|24h|72h|1w>&vars=TempOut,HumOut`
+
+### Public Sensor Network Dashboard
+
+Public page:
+
+- `GET /dashboard`
+
+JSON feed:
+
+- `GET /api/dashboard`
+
+Behavior:
+
+- auto-updating station table (polling every 10 seconds)
+- shows all stations found in `pathStorage`
+- shows station name and UUID
+- shows latest timestamp, data age, sensor values, and status
+- raises alarms for:
+  - lost connectivity (stale latest data)
+  - low battery (battery-related fields below threshold)
+  - missing sensor data
+
 ### Web access configuration examples for `pathStorage`
 
 ### 1) Open data portal (anonymous download allowed for selected instruments)
@@ -551,6 +601,8 @@ Components:
 5. optional Flask web GUI:
   - SQLite auth/policy store
   - access-controlled downloads
+  - live station trend pages
+  - public network dashboard
 
 ## Data Flow
 
@@ -566,6 +618,10 @@ CSV sink (pathStorage)
   -> web GUI download portal (optional)
     -> policy checks (open/account/restricted)
       -> ZIP download for selected instruments/date range
+  -> station trend API (optional)
+    -> auto-updating chart/table in browser
+  -> public dashboard API (optional)
+    -> auto-updating network status and alarms
 ```
 
 ## Example: Many `vantage-publisher` -> flat MQTT -> Signal K
