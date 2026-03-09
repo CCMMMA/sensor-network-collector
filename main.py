@@ -1090,11 +1090,61 @@ def shift_months(dt: datetime, months: int):
     return dt.replace(year=y, month=m, day=d)
 
 
+TREND_INTERVALS = [
+    ("1m", "last minute"),
+    ("10m", "10 minutes"),
+    ("hour", "hour"),
+    ("3h", "3 hours"),
+    ("6h", "6 hours"),
+    ("12h", "12 hours"),
+    ("24h", "24 hours"),
+    ("72h", "72 hours"),
+    ("week", "one week"),
+]
+
+
+def normalize_interval(value: str):
+    raw = (value or "").strip().lower()
+    aliases = {
+        "1m": "1m",
+        "last_minute": "1m",
+        "10m": "10m",
+        "10minutes": "10m",
+        "hour": "hour",
+        "1h": "hour",
+        "3h": "3h",
+        "6h": "6h",
+        "12h": "12h",
+        "24h": "24h",
+        "day": "24h",
+        "72h": "72h",
+        "week": "week",
+        "1w": "week",
+        "month": "month",
+        "year": "year",
+        "custom": "custom",
+    }
+    return aliases.get(raw, "hour")
+
+
 def interval_start(anchor: datetime, interval: str):
+    interval = normalize_interval(interval)
+    if interval == "1m":
+        return anchor - timedelta(minutes=1)
+    if interval == "10m":
+        return anchor - timedelta(minutes=10)
     if interval == "hour":
         return anchor - timedelta(hours=1)
-    if interval == "day":
+    if interval == "3h":
+        return anchor - timedelta(hours=3)
+    if interval == "6h":
+        return anchor - timedelta(hours=6)
+    if interval == "12h":
+        return anchor - timedelta(hours=12)
+    if interval == "24h":
         return anchor - timedelta(days=1)
+    if interval == "72h":
+        return anchor - timedelta(hours=72)
     if interval == "week":
         return anchor - timedelta(weeks=1)
     if interval == "month":
@@ -1105,10 +1155,23 @@ def interval_start(anchor: datetime, interval: str):
 
 
 def shift_anchor(anchor: datetime, interval: str, steps: int):
+    interval = normalize_interval(interval)
+    if interval == "1m":
+        return anchor + timedelta(minutes=steps)
+    if interval == "10m":
+        return anchor + timedelta(minutes=10 * steps)
     if interval == "hour":
         return anchor + timedelta(hours=steps)
-    if interval == "day":
+    if interval == "3h":
+        return anchor + timedelta(hours=3 * steps)
+    if interval == "6h":
+        return anchor + timedelta(hours=6 * steps)
+    if interval == "12h":
+        return anchor + timedelta(hours=12 * steps)
+    if interval == "24h":
         return anchor + timedelta(days=steps)
+    if interval == "72h":
+        return anchor + timedelta(hours=72 * steps)
     if interval == "week":
         return anchor + timedelta(weeks=steps)
     if interval == "month":
@@ -1406,6 +1469,106 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, max_p
         },
         "cards": cards,
         "series": series,
+    }
+
+
+def _normalize_alarm_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return str(value).strip().lower()
+
+
+def _battery_alarms_from_row(row: dict):
+    alarms = []
+    battery_info = []
+    for key, raw in row.items():
+        lk = str(key).lower()
+        if "battery" not in lk:
+            continue
+
+        fval = _to_float(raw)
+        sval = _normalize_alarm_value(raw)
+        if fval is not None:
+            battery_info.append(f"{key}={round(fval, 3)}")
+        elif sval:
+            battery_info.append(f"{key}={raw}")
+
+        if "volt" in lk and fval is not None and fval < 3.0:
+            alarms.append(f"low_battery:{key}")
+        elif any(t in lk for t in ("status", "level", "percent", "pct")) and fval is not None and fval <= 20:
+            alarms.append(f"low_battery:{key}")
+        elif any(t in lk for t in ("status", "state")) and sval in ("low", "critical", "bad", "false", "0"):
+            alarms.append(f"low_battery:{key}")
+    return alarms, battery_info
+
+
+def build_admin_network_dashboard(storage_root: str):
+    now = utc_now()
+    stations = []
+    value_keys = set()
+
+    for instrument_uuid in collect_instruments(storage_root):
+        preview = get_station_preview(storage_root, instrument_uuid)
+        rows = load_station_rows(storage_root, instrument_uuid, limit=500)
+
+        latest_ts = None
+        latest_row = None
+        for row in rows:
+            ts = parse_iso_ts(row.get("timestamp", ""))
+            if ts is None:
+                continue
+            if latest_ts is None or ts > latest_ts:
+                latest_ts = ts
+                latest_row = row
+
+        alarms = []
+        values = {}
+        battery_info = []
+
+        if latest_ts is None or latest_row is None:
+            alarms.append("lost_connectivity:no_data")
+        else:
+            age_seconds = int((now - latest_ts).total_seconds())
+            if age_seconds > 15 * 60:
+                alarms.append(f"lost_connectivity:{age_seconds}s")
+
+            batt_alarms, battery_info = _battery_alarms_from_row(latest_row)
+            alarms.extend(batt_alarms)
+
+            numeric_count = 0
+            for key, raw in latest_row.items():
+                if key in ("timestamp", "topic", "uuid", "name"):
+                    continue
+                if isinstance(raw, str) and len(raw) > 180:
+                    continue
+                values[key] = raw
+                value_keys.add(key)
+                if _to_float(raw) is not None:
+                    numeric_count += 1
+            if numeric_count < 2:
+                alarms.append("sensor_failure:too_few_numeric_values")
+
+        stations.append(
+            {
+                "uuid": instrument_uuid,
+                "name": preview.get("name") or instrument_uuid,
+                "lastTimestamp": latest_ts.isoformat().replace("+00:00", "Z") if latest_ts else None,
+                "ageSeconds": (int((now - latest_ts).total_seconds()) if latest_ts else None),
+                "status": "ALARM" if alarms else "OK",
+                "alarms": alarms,
+                "batteryInfo": ", ".join(battery_info) if battery_info else "",
+                "values": values,
+            }
+        )
+
+    stations.sort(key=lambda s: (0 if s["status"] == "ALARM" else 1, s["uuid"]))
+    value_columns = sorted(value_keys)
+    return {
+        "updatedAt": now.isoformat().replace("+00:00", "Z"),
+        "valueColumns": value_columns,
+        "stations": stations,
     }
 
 
@@ -1714,9 +1877,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         preview = get_station_preview(storage_root, instrument_uuid)
         station_name = preview.get("name") or instrument_uuid
 
-        interval = request.args.get("interval", "day")
-        if interval not in ("hour", "day", "week", "month", "year", "custom"):
-            interval = "day"
+        interval = normalize_interval(request.args.get("interval", "hour"))
 
         from_date = parse_date_ymd(request.args.get("from_date", ""))
         to_date = parse_date_ymd(request.args.get("to_date", ""))
@@ -1772,7 +1933,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
         if not filtered_rows and rows_ts:
             fallback_end = rows_ts[-1][0]
-            fallback_start = interval_start(fallback_end, interval if interval != "custom" else "day")
+            fallback_start = interval_start(fallback_end, interval if interval != "custom" else "hour")
             filtered_rows = [row for ts, row in rows_ts if fallback_start <= ts <= fallback_end]
             win_start, win_end = fallback_start, fallback_end
 
@@ -1829,6 +1990,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
         prev_anchor = shift_anchor(anchor, interval, -1).isoformat().replace("+00:00", "Z")
         next_anchor = shift_anchor(anchor, interval, 1).isoformat().replace("+00:00", "Z")
+        interval_label = dict(TREND_INTERVALS).get(interval, interval)
 
         return render_template_string(
             """
@@ -1855,25 +2017,20 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 <form method="get" id="intervalForm">
                   <label>Window
                     <select name="interval" id="intervalSelect">
-                      {% for it in ['hour','day','week','month','year','custom'] %}
-                        <option value="{{ it }}" {% if it==interval %}selected{% endif %}>{{ it }}</option>
+                      {% for code, label in interval_options %}
+                        <option value="{{ code }}" {% if code==interval %}selected{% endif %}>{{ label }}</option>
                       {% endfor %}
                     </select>
                   </label>
-                  <label>From <input type="date" name="from_date" value="{{ request.args.get('from_date','') }}"/></label>
-                  <label>To <input type="date" name="to_date" value="{{ request.args.get('to_date','') }}"/></label>
                   <input type="hidden" name="anchor" value="{{ request.args.get('anchor','') }}"/>
                   {% for f in selected_fields %}<input type="hidden" name="field" value="{{ f }}"/>{% endfor %}
                   <input type="hidden" name="page_size" value="{{ page_size }}"/>
-                  <button class="btn btn-primary btn-sm" type="submit">Apply</button>
                 </form>
-                {% if interval != 'custom' %}
-                  <p>
-                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=prev_anchor, page_size=page_size, field=selected_fields) }}">&#8592; previous {{ interval }}</a>
-                    |
-                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=next_anchor, page_size=page_size, field=selected_fields) }}">next {{ interval }} &#8594;</a>
-                  </p>
-                {% endif %}
+                <p>
+                  <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=prev_anchor, page_size=page_size, field=selected_fields) }}">&#8592; previous {{ interval_label }}</a>
+                  |
+                  <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=next_anchor, page_size=page_size, field=selected_fields) }}">next {{ interval_label }} &#8594;</a>
+                </p>
                 <p>Showing data in window: {{ win_start }} to {{ win_end }} UTC</p>
               </div>
 
@@ -1991,6 +2148,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             instrument_uuid=instrument_uuid,
             station_name=station_name,
             interval=interval,
+            interval_options=TREND_INTERVALS,
+            interval_label=interval_label,
             win_start=win_start.isoformat().replace("+00:00", "Z"),
             win_end=win_end.isoformat().replace("+00:00", "Z"),
             prev_anchor=prev_anchor,
@@ -2033,11 +2192,13 @@ def create_web_app(cfg: dict, access_store: AccessStore):
               <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
               <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
               <style>
-                html, body { height: 100%; overflow: hidden; }
-                .dashboard-root { height: 100vh; display: flex; flex-direction: column; }
-                #cards .card-body { padding: .5rem .65rem; }
-                .metric-value { font-size: 1.25rem; line-height: 1.1; }
-                #chartsWrap { flex: 1 1 auto; min-height: 0; overflow: hidden; }
+                html, body { min-height: 100%; overflow-y: auto; }
+                .dashboard-root { min-height: 100vh; display: flex; flex-direction: column; }
+                #cards .card-body { padding: .3rem .45rem; }
+                .metric-label { font-size: .72rem; line-height: 1.1; margin-bottom: .1rem; }
+                .metric-value { font-size: .95rem; line-height: 1.0; font-weight: 600; }
+                .metric-unit { font-size: .72rem; margin-left: .2rem; }
+                #chartsWrap { flex: 1 1 auto; min-height: 0; overflow: visible; }
                 .chart-card { height: 170px; }
                 .chart-card canvas { height: 112px !important; }
               </style>
@@ -2073,11 +2234,11 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   const value = (card.value === null || card.value === undefined) ? '--' : card.value;
                   const unit = card.unit || '';
                   return `
-                    <div class="col-6 col-md-3 col-xl-2">
+                    <div class="col-6 col-md-2 col-xl-2">
                       <div class="card h-100 shadow-sm">
                         <div class="card-body">
-                          <div class="text-muted small">${card.label}</div>
-                          <div class="metric-value">${value}<span class="fs-6 ms-1">${unit}</span></div>
+                          <div class="text-muted metric-label">${card.label}</div>
+                          <div class="metric-value">${value}<span class="metric-unit">${unit}</span></div>
                         </div>
                       </div>
                     </div>
@@ -2375,6 +2536,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             <body class="container py-4">
             <h1 class="h3">Admin panel</h1>
             <p>Logged in as {{ admin_user.username }} - <a href="{{ url_for('index') }}">Home</a></p>
+            <p><a class="btn btn-outline-primary btn-sm" href="{{ url_for('admin_dashboard') }}">Sensor Network Dashboard</a></p>
 
             <div class="card mb-3"><div class="card-body">
             <h2 class="h5">Create user</h2>
@@ -2453,6 +2615,119 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             pending_requests=pending_requests,
             user_access=user_access,
         )
+
+    @app.route("/admin/dashboard")
+    def admin_dashboard():
+        admin_user = require_admin()
+        if not isinstance(admin_user, dict):
+            return admin_user
+
+        return render_template_string(
+            """
+            <html>
+            <head>
+              <title>Sensor Network Dashboard</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+              <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+              <style>
+                .table-wrap { max-height: 78vh; overflow: auto; border: 1px solid #ddd; }
+                table { border-collapse: collapse; width: 100%; font-size: 12px; }
+                th, td { border: 1px solid #ddd; padding: 4px; white-space: nowrap; }
+                th { position: sticky; top: 0; background: #f8f8f8; z-index: 2; }
+                .status-ok { color: #157347; font-weight: 700; }
+                .status-alarm { color: #bb2d3b; font-weight: 700; }
+              </style>
+            </head>
+            <body class="container-fluid py-3">
+              <p><a href="{{ url_for('admin') }}">Admin panel</a> | <a href="{{ url_for('index') }}">Home</a></p>
+              <h1>Sensor Network Dashboard</h1>
+              <p class="text-muted mb-1">Admin only page. Auto-refresh every 10 seconds.</p>
+              <p id="updatedAt">Updated at: -</p>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr id="headRow"></tr></thead>
+                  <tbody id="bodyRows"></tbody>
+                </table>
+              </div>
+              <script>
+                const endpoint = {{ url_for('admin_dashboard_api') | tojson }};
+                const headRow = document.getElementById('headRow');
+                const bodyRows = document.getElementById('bodyRows');
+                const updatedAt = document.getElementById('updatedAt');
+
+                function render(payload) {
+                  const columns = payload.valueColumns || [];
+                  headRow.innerHTML = '';
+                  ['Station', 'UUID', 'Timestamp', 'Age(s)', 'Status', 'Alarms', 'Battery'].forEach((h) => {
+                    const th = document.createElement('th');
+                    th.textContent = h;
+                    headRow.appendChild(th);
+                  });
+                  columns.forEach((c) => {
+                    const th = document.createElement('th');
+                    th.textContent = c;
+                    headRow.appendChild(th);
+                  });
+
+                  bodyRows.innerHTML = '';
+                  (payload.stations || []).forEach((st) => {
+                    const tr = document.createElement('tr');
+                    const fixed = [
+                      st.name || st.uuid,
+                      st.uuid || '',
+                      st.lastTimestamp || '',
+                      st.ageSeconds == null ? '' : st.ageSeconds,
+                      st.status || '',
+                      (st.alarms || []).join(', '),
+                      st.batteryInfo || ''
+                    ];
+                    fixed.forEach((value, idx) => {
+                      const td = document.createElement('td');
+                      td.textContent = String(value);
+                      if (idx === 4) {
+                        td.className = (String(value) === 'OK') ? 'status-ok' : 'status-alarm';
+                      }
+                      tr.appendChild(td);
+                    });
+
+                    columns.forEach((c) => {
+                      const td = document.createElement('td');
+                      const raw = st.values ? st.values[c] : '';
+                      td.textContent = (raw === null || raw === undefined) ? '' : String(raw);
+                      tr.appendChild(td);
+                    });
+                    bodyRows.appendChild(tr);
+                  });
+
+                  updatedAt.textContent = 'Updated at: ' + (payload.updatedAt || '-');
+                }
+
+                async function refresh() {
+                  try {
+                    const resp = await fetch(endpoint, { cache: 'no-store' });
+                    if (!resp.ok) return;
+                    const payload = await resp.json();
+                    render(payload);
+                  } catch (_) {
+                    // keep polling on transient errors
+                  }
+                }
+
+                refresh();
+                setInterval(refresh, 10000);
+              </script>
+            </body>
+            </html>
+            """
+        )
+
+    @app.route("/api/admin/dashboard")
+    def admin_dashboard_api():
+        admin_user = require_admin()
+        if not isinstance(admin_user, dict):
+            return admin_user
+        storage_root = storage_root_or_404()
+        return jsonify(build_admin_network_dashboard(storage_root))
 
     @app.route("/admin/create-user", methods=["POST"])
     def admin_create_user():
