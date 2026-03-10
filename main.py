@@ -1,20 +1,25 @@
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import math
+import mimetypes
 import os
 import re
 import secrets
 import signal
 import sqlite3
+import smtplib
 import sys
 import tempfile
 import threading
 import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from pathlib import Path
+from urllib.parse import urlencode
 
 import paho.mqtt.client as mqtt
 from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file, session, url_for
@@ -57,6 +62,36 @@ INFLUX_FIELD_CONFLICT_RE = re.compile(
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def send_email(cfg: dict, recipients, subject: str, body_text: str):
+    recipients = [r.strip() for r in (recipients or []) if isinstance(r, str) and r.strip()]
+    if not recipients:
+        return False
+    if not cfg.get("smtp_enabled"):
+        logger.info("SMTP disabled; skipped email subject=%s recipients=%d", subject, len(recipients))
+        return False
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = cfg.get("smtp_from", "")
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(body_text)
+
+    try:
+        smtp_host = cfg.get("smtp_host", "")
+        smtp_port = int(cfg.get("smtp_port", 587))
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as smtp:
+            if cfg.get("smtp_use_tls", True):
+                smtp.starttls()
+            if cfg.get("smtp_user"):
+                smtp.login(cfg.get("smtp_user", ""), cfg.get("smtp_pass", ""))
+            smtp.send_message(msg)
+        logger.info("Email sent subject=%s recipients=%d", subject, len(recipients))
+        return True
+    except Exception as e:
+        logger.warning("Email send failed subject=%s recipients=%d err=%s", subject, len(recipients), e)
+        return False
 
 
 # ----------------------------
@@ -257,6 +292,18 @@ def load_config(path: str, args) -> dict:
         "admin_password": str(
             cfg_value(raw, ["adminPassword"], env_name="ADMIN_PASSWORD", default="admin") or "admin"
         ),
+        "web_app_logo": str(cfg_value(raw, ["webAppLogo"], env_name="WEB_APP_LOGO", default="") or ""),
+        "base_url": str(cfg_value(raw, ["baseUrl"], env_name="BASE_URL", default="") or "").strip(),
+        "smtp_enabled": parse_boolish(cfg_value(raw, ["smtpEnabled"], env_name="SMTP_ENABLED", default=False), False),
+        "smtp_host": str(cfg_value(raw, ["smtpHost"], env_name="SMTP_HOST", default="") or "").strip(),
+        "smtp_port": int(cfg_value(raw, ["smtpPort"], env_name="SMTP_PORT", default=587)),
+        "smtp_user": str(cfg_value(raw, ["smtpUser"], env_name="SMTP_USER", default="") or ""),
+        "smtp_pass": str(cfg_value(raw, ["smtpPass"], env_name="SMTP_PASS", default="") or ""),
+        "smtp_from": str(cfg_value(raw, ["smtpFrom"], env_name="SMTP_FROM", default="") or "").strip(),
+        "smtp_use_tls": parse_boolish(cfg_value(raw, ["smtpUseTls"], env_name="SMTP_USE_TLS", default=True), True),
+        "watchdog_interval_sec": int(
+            cfg_value(raw, ["watchdogIntervalSec"], env_name="WATCHDOG_INTERVAL_SEC", default=60)
+        ),
     }
 
     raw_map = cfg_value(raw, ["signalkPathMap", "signalk_path_map"], env_name="SIGNALK_PATH_MAP", default={})
@@ -306,6 +353,12 @@ def load_config(path: str, args) -> dict:
 
     if not cfg["enable_influx"] and not cfg["enable_signalk"] and not cfg["enable_storage"]:
         raise RuntimeError("No outputs enabled: enable at least one of influxdb, signalk, storage")
+
+    if cfg["smtp_enabled"] and (not cfg["smtp_host"] or not cfg["smtp_from"]):
+        raise RuntimeError("SMTP enabled but smtpHost or smtpFrom is missing")
+
+    if not cfg["base_url"]:
+        cfg["base_url"] = f"http://{cfg['http_host']}:{cfg['http_port']}"
 
     cfg["config_path"] = str(Path(path).resolve())
     return cfg
@@ -670,7 +723,8 @@ class AccessStore:
                             email TEXT,
                             role TEXT NOT NULL DEFAULT 'user',
                             active INTEGER NOT NULL DEFAULT 1,
-                            created_at TEXT NOT NULL
+                            created_at TEXT NOT NULL,
+                            force_password_change INTEGER NOT NULL DEFAULT 0
                         );
 
                         CREATE TABLE IF NOT EXISTS account_requests (
@@ -697,12 +751,53 @@ class AccessStore:
                             PRIMARY KEY (username, instrument_uuid)
                         );
 
+                        CREATE TABLE IF NOT EXISTS login_tokens (
+                            token TEXT PRIMARY KEY,
+                            username TEXT NOT NULL,
+                            expires_at TEXT NOT NULL,
+                            created_at TEXT NOT NULL,
+                            used_at TEXT
+                        );
+
+                        CREATE TABLE IF NOT EXISTS anomalies (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            station_uuid TEXT NOT NULL,
+                            anomaly_type TEXT NOT NULL,
+                            message TEXT NOT NULL,
+                            severity TEXT NOT NULL DEFAULT 'warning',
+                            status TEXT NOT NULL DEFAULT 'open',
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL,
+                            resolved_at TEXT
+                        );
+
+                        CREATE TABLE IF NOT EXISTS anomaly_silence (
+                            station_uuid TEXT NOT NULL,
+                            anomaly_type TEXT NOT NULL,
+                            silenced_until TEXT NOT NULL,
+                            silenced_by TEXT NOT NULL,
+                            created_at TEXT NOT NULL,
+                            PRIMARY KEY (station_uuid, anomaly_type)
+                        );
+
+                        CREATE TABLE IF NOT EXISTS station_logos (
+                            station_uuid TEXT PRIMARY KEY,
+                            logo_path TEXT NOT NULL,
+                            uploaded_by TEXT NOT NULL,
+                            uploaded_at TEXT NOT NULL
+                        );
+
                         CREATE TABLE IF NOT EXISTS write_probe (
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
                             created_at TEXT NOT NULL
                         );
                         """
                     )
+                    # Backward-compatible migrations for existing DBs.
+                    try:
+                        con.execute("ALTER TABLE users ADD COLUMN force_password_change INTEGER NOT NULL DEFAULT 0")
+                    except sqlite3.OperationalError:
+                        pass
             except sqlite3.OperationalError as e:
                 if self._is_readonly_error(e):
                     raise RuntimeError(
@@ -757,7 +852,7 @@ class AccessStore:
     def get_user(self, username: str):
         with self._connect() as con:
             row = con.execute(
-                "SELECT username,email,role,active,created_at FROM users WHERE username = ?",
+                "SELECT username,email,role,active,created_at,force_password_change FROM users WHERE username = ?",
                 (username,),
             ).fetchone()
             return dict(row) if row else None
@@ -765,14 +860,14 @@ class AccessStore:
     def list_users(self):
         with self._connect() as con:
             rows = con.execute(
-                "SELECT username,email,role,active,created_at FROM users ORDER BY username"
+                "SELECT username,email,role,active,created_at,force_password_change FROM users ORDER BY username"
             ).fetchall()
             return [dict(r) for r in rows]
 
     def authenticate(self, username: str, password: str):
         with self._connect() as con:
             row = con.execute(
-                "SELECT username,password_hash,email,role,active,created_at FROM users WHERE username = ?",
+                "SELECT username,password_hash,email,role,active,created_at,force_password_change FROM users WHERE username = ?",
                 (username,),
             ).fetchone()
         if row is None:
@@ -787,6 +882,7 @@ class AccessStore:
             "role": row["role"],
             "active": int(row["active"]),
             "created_at": row["created_at"],
+            "force_password_change": int(row["force_password_change"] or 0),
         }
 
     def create_user(self, username: str, password: str, email: str, role: str = "user", active: int = 1):
@@ -978,6 +1074,264 @@ class AccessStore:
             return instrument_uuid in allowed
         return False
 
+    def set_force_password_change(self, username: str, force: bool):
+        with self._lock:
+            with self._connect() as con:
+                cur = con.execute(
+                    "UPDATE users SET force_password_change = ? WHERE username = ?",
+                    (1 if force else 0, username.strip()),
+                )
+                if cur.rowcount <= 0:
+                    return False, "User not found"
+        return True, "Password-change policy updated"
+
+    def change_password(self, username: str, new_password: str):
+        if not new_password:
+            return False, "Password is required"
+        with self._lock:
+            with self._connect() as con:
+                cur = con.execute(
+                    "UPDATE users SET password_hash = ?, force_password_change = 0 WHERE username = ?",
+                    (generate_password_hash(new_password), username.strip()),
+                )
+                if cur.rowcount <= 0:
+                    return False, "User not found"
+        return True, "Password updated"
+
+    def create_login_token(self, username: str, ttl_minutes: int = 60):
+        token = secrets.token_urlsafe(32)
+        now = utc_now()
+        expires = now + timedelta(minutes=max(1, ttl_minutes))
+        with self._lock:
+            with self._connect() as con:
+                con.execute(
+                    "INSERT INTO login_tokens(token,username,expires_at,created_at,used_at) VALUES(?,?,?,?,NULL)",
+                    (
+                        token,
+                        username.strip(),
+                        expires.isoformat().replace("+00:00", "Z"),
+                        now.isoformat().replace("+00:00", "Z"),
+                    ),
+                )
+        return token
+
+    def consume_login_token(self, token: str):
+        if not token:
+            return None
+        now = utc_now()
+        with self._lock:
+            with self._connect() as con:
+                row = con.execute(
+                    "SELECT token,username,expires_at,used_at FROM login_tokens WHERE token = ?",
+                    (token,),
+                ).fetchone()
+                if row is None:
+                    return None
+                if row["used_at"]:
+                    return None
+                exp = parse_iso_ts(row["expires_at"])
+                if exp is None or exp < now:
+                    return None
+                con.execute("UPDATE login_tokens SET used_at = ? WHERE token = ?", (now_utc_iso(), token))
+                return self.get_user(row["username"])
+
+    def list_admin_emails(self):
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT email FROM users WHERE role = 'admin' AND active = 1 AND email IS NOT NULL AND email <> ''"
+            ).fetchall()
+            return [r["email"] for r in rows if isinstance(r["email"], str) and r["email"].strip()]
+
+    def list_station_user_emails(self, station_uuid: str):
+        station_uuid = station_uuid.strip()
+        with self._connect() as con:
+            policy = self.get_policy(station_uuid)
+            emails = set(self.list_admin_emails())
+            if policy == "account":
+                rows = con.execute(
+                    "SELECT email FROM users WHERE role = 'user' AND active = 1 AND email IS NOT NULL AND email <> ''"
+                ).fetchall()
+                emails.update([r["email"] for r in rows if isinstance(r["email"], str) and r["email"].strip()])
+            elif policy == "restricted":
+                rows = con.execute(
+                    """
+                    SELECT u.email
+                    FROM users u
+                    JOIN user_instruments ui ON ui.username = u.username
+                    WHERE ui.instrument_uuid = ? AND u.active = 1 AND u.email IS NOT NULL AND u.email <> ''
+                    """,
+                    (station_uuid,),
+                ).fetchall()
+                emails.update([r["email"] for r in rows if isinstance(r["email"], str) and r["email"].strip()])
+            return sorted(emails)
+
+    def list_station_user_contacts(self, station_uuid: str):
+        station_uuid = station_uuid.strip()
+        contacts = {}
+        with self._connect() as con:
+            admin_rows = con.execute(
+                "SELECT username,email FROM users WHERE role='admin' AND active=1 AND email IS NOT NULL AND email <> ''"
+            ).fetchall()
+            for r in admin_rows:
+                contacts[r["email"]] = {"username": r["username"], "email": r["email"], "role": "admin"}
+
+            policy = self.get_policy(station_uuid)
+            if policy == "account":
+                rows = con.execute(
+                    "SELECT username,email FROM users WHERE role='user' AND active=1 AND email IS NOT NULL AND email <> ''"
+                ).fetchall()
+                for r in rows:
+                    contacts[r["email"]] = {"username": r["username"], "email": r["email"], "role": "user"}
+            elif policy == "restricted":
+                rows = con.execute(
+                    """
+                    SELECT u.username,u.email
+                    FROM users u
+                    JOIN user_instruments ui ON ui.username = u.username
+                    WHERE ui.instrument_uuid = ? AND u.active=1 AND u.email IS NOT NULL AND u.email <> ''
+                    """,
+                    (station_uuid,),
+                ).fetchall()
+                for r in rows:
+                    contacts[r["email"]] = {"username": r["username"], "email": r["email"], "role": "user"}
+        return list(contacts.values())
+
+    def upsert_anomaly(self, station_uuid: str, anomaly_type: str, message: str, severity: str = "warning"):
+        now = now_utc_iso()
+        with self._lock:
+            with self._connect() as con:
+                row = con.execute(
+                    """
+                    SELECT id, status
+                    FROM anomalies
+                    WHERE station_uuid = ? AND anomaly_type = ? AND status = 'open'
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (station_uuid, anomaly_type),
+                ).fetchone()
+                if row:
+                    con.execute(
+                        "UPDATE anomalies SET message = ?, updated_at = ? WHERE id = ?",
+                        (message, now, row["id"]),
+                    )
+                    return row["id"], False
+                cur = con.execute(
+                    """
+                    INSERT INTO anomalies(station_uuid, anomaly_type, message, severity, status, created_at, updated_at, resolved_at)
+                    VALUES(?,?,?,?, 'open',?,?,NULL)
+                    """,
+                    (station_uuid, anomaly_type, message, severity, now, now),
+                )
+                return cur.lastrowid, True
+
+    def resolve_anomaly(self, station_uuid: str, anomaly_type: str, message: str = "resolved"):
+        now = now_utc_iso()
+        with self._lock:
+            with self._connect() as con:
+                open_rows = con.execute(
+                    "SELECT id FROM anomalies WHERE station_uuid = ? AND anomaly_type = ? AND status = 'open'",
+                    (station_uuid, anomaly_type),
+                ).fetchall()
+                if not open_rows:
+                    return False
+                con.execute(
+                    """
+                    UPDATE anomalies
+                    SET status='resolved', message=?, updated_at=?, resolved_at=?
+                    WHERE station_uuid = ? AND anomaly_type = ? AND status = 'open'
+                    """,
+                    (message, now, now, station_uuid, anomaly_type),
+                )
+                return True
+
+    def list_open_anomalies(self):
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT id,station_uuid,anomaly_type,message,severity,status,created_at,updated_at,resolved_at
+                FROM anomalies
+                WHERE status = 'open'
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_anomalies_for_user(self, user):
+        if not user:
+            return []
+        with self._connect() as con:
+            if user.get("role") == "admin":
+                rows = con.execute(
+                    """
+                    SELECT id,station_uuid,anomaly_type,message,severity,status,created_at,updated_at,resolved_at
+                    FROM anomalies
+                    ORDER BY updated_at DESC
+                    LIMIT 1000
+                    """
+                ).fetchall()
+                return [dict(r) for r in rows]
+            rows = con.execute(
+                """
+                SELECT id,station_uuid,anomaly_type,message,severity,status,created_at,updated_at,resolved_at
+                FROM anomalies a
+                LEFT JOIN instrument_policies p ON p.instrument_uuid = a.station_uuid
+                LEFT JOIN user_instruments ui ON ui.instrument_uuid = a.station_uuid AND ui.username = ?
+                WHERE COALESCE(p.policy, 'account') <> 'restricted' OR ui.username IS NOT NULL
+                ORDER BY updated_at DESC
+                LIMIT 1000
+                """,
+                (user["username"],),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def set_anomaly_silence(self, station_uuid: str, anomaly_type: str, silenced_by: str, hours: int):
+        now = utc_now()
+        hours = min(24, max(1, int(hours)))
+        until = now + timedelta(hours=hours)
+        with self._lock:
+            with self._connect() as con:
+                con.execute(
+                    """
+                    INSERT INTO anomaly_silence(station_uuid, anomaly_type, silenced_until, silenced_by, created_at)
+                    VALUES(?,?,?,?,?)
+                    ON CONFLICT(station_uuid, anomaly_type)
+                    DO UPDATE SET silenced_until=excluded.silenced_until, silenced_by=excluded.silenced_by, created_at=excluded.created_at
+                    """,
+                    (station_uuid, anomaly_type, until.isoformat().replace("+00:00", "Z"), silenced_by, now_utc_iso()),
+                )
+        return until
+
+    def get_anomaly_silenced_until(self, station_uuid: str, anomaly_type: str):
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT silenced_until FROM anomaly_silence WHERE station_uuid = ? AND anomaly_type = ?",
+                (station_uuid, anomaly_type),
+            ).fetchone()
+            if row is None:
+                return None
+            return parse_iso_ts(row["silenced_until"])
+
+    def set_station_logo(self, station_uuid: str, logo_path: str, username: str):
+        with self._lock:
+            with self._connect() as con:
+                con.execute(
+                    """
+                    INSERT INTO station_logos(station_uuid, logo_path, uploaded_by, uploaded_at)
+                    VALUES(?,?,?,?)
+                    ON CONFLICT(station_uuid)
+                    DO UPDATE SET logo_path=excluded.logo_path, uploaded_by=excluded.uploaded_by, uploaded_at=excluded.uploaded_at
+                    """,
+                    (station_uuid, logo_path, username, now_utc_iso()),
+                )
+
+    def get_station_logo(self, station_uuid: str):
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT logo_path, uploaded_by, uploaded_at FROM station_logos WHERE station_uuid = ?",
+                (station_uuid,),
+            ).fetchone()
+            return dict(row) if row else None
+
 
 def collect_instruments(storage_root: str):
     root = Path(storage_root)
@@ -1148,6 +1502,11 @@ def parse_iso_ts(value: str):
         return None
 
 
+def safe_filename(name: str):
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name or "").strip())
+    return base[:180] or "file"
+
+
 def shift_months(dt: datetime, months: int):
     y = dt.year + ((dt.month - 1 + months) // 12)
     m = ((dt.month - 1 + months) % 12) + 1
@@ -1156,6 +1515,18 @@ def shift_months(dt: datetime, months: int):
 
 
 TREND_INTERVALS = [
+    ("1m", "last minute"),
+    ("10m", "10 minutes"),
+    ("hour", "hour"),
+    ("3h", "3 hours"),
+    ("6h", "6 hours"),
+    ("12h", "12 hours"),
+    ("24h", "24 hours"),
+    ("72h", "72 hours"),
+    ("week", "one week"),
+]
+
+PUBLIC_TREND_WINDOWS = [
     ("1m", "last minute"),
     ("10m", "10 minutes"),
     ("hour", "hour"),
@@ -1190,6 +1561,12 @@ def normalize_interval(value: str):
         "custom": "custom",
     }
     return aliases.get(raw, "hour")
+
+
+def normalize_public_window(value: str):
+    normalized = normalize_interval(value)
+    allowed = {k for k, _ in PUBLIC_TREND_WINDOWS}
+    return normalized if normalized in allowed else "hour"
 
 
 def interval_start(anchor: datetime, interval: str):
@@ -1418,7 +1795,8 @@ def _calc_axis_range(values, axis_spec=None):
     return round(lo, 3), round(hi, 3)
 
 
-def build_public_station_snapshot(storage_root: str, instrument_uuid: str, max_points: int = 120):
+def build_public_station_snapshot(storage_root: str, instrument_uuid: str, window: str = "hour", max_points: int = 240):
+    window = normalize_public_window(window)
     rows = load_station_rows(storage_root, instrument_uuid, limit=2000)
     preview = get_station_preview(storage_root, instrument_uuid)
 
@@ -1434,20 +1812,25 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, max_p
             },
             "cards": [],
             "series": [],
+            "window": window,
         }
 
-    rows_ts = []
+    rows_ts_all = []
     for row in rows:
         ts = parse_iso_ts(row.get("timestamp", ""))
         if ts is None:
             continue
-        rows_ts.append((ts, row))
-    rows_ts.sort(key=lambda x: x[0])
+        rows_ts_all.append((ts, row))
+    rows_ts_all.sort(key=lambda x: x[0])
+
+    latest_row = rows_ts_all[-1][1] if rows_ts_all else rows[-1]
+    latest_dt = rows_ts_all[-1][0] if rows_ts_all else parse_iso_ts(latest_row.get("timestamp", "")) or utc_now()
+    latest_ts = latest_dt.isoformat().replace("+00:00", "Z")
+
+    win_start = interval_start(latest_dt, window)
+    rows_ts = [(ts, row) for ts, row in rows_ts_all if ts >= win_start]
     if max_points and len(rows_ts) > max_points:
         rows_ts = rows_ts[-max_points:]
-
-    latest_row = rows_ts[-1][1] if rows_ts else rows[-1]
-    latest_ts = rows_ts[-1][0].isoformat().replace("+00:00", "Z") if rows_ts else latest_row.get("timestamp")
 
     cards = []
     for spec in PUBLIC_METRIC_SPECS:
@@ -1528,6 +1911,7 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, max_p
         "station_name": latest_row.get("name") or preview.get("name") or instrument_uuid,
         "last_timestamp": latest_ts,
         "rows": len(rows_ts),
+        "window": window,
         "location": {
             "latitude": preview.get("latitude"),
             "longitude": preview.get("longitude"),
@@ -1569,6 +1953,95 @@ def _battery_alarms_from_row(row: dict):
     return alarms, battery_info
 
 
+def compute_station_usual_update_seconds(rows):
+    timestamps = []
+    for row in rows:
+        ts = parse_iso_ts(row.get("timestamp", ""))
+        if ts is not None:
+            timestamps.append(ts)
+    timestamps.sort()
+    if len(timestamps) < 3:
+        return None
+    deltas = []
+    for i in range(1, len(timestamps)):
+        delta = (timestamps[i] - timestamps[i - 1]).total_seconds()
+        if delta > 0:
+            deltas.append(delta)
+    if len(deltas) < 2:
+        return None
+    deltas.sort()
+    return int(deltas[len(deltas) // 2])
+
+
+def evaluate_station_anomalies(station_uuid: str, rows, now_dt: datetime):
+    latest_ts = None
+    latest_row = None
+    for row in rows:
+        ts = parse_iso_ts(row.get("timestamp", ""))
+        if ts is None:
+            continue
+        if latest_ts is None or ts > latest_ts:
+            latest_ts = ts
+            latest_row = row
+
+    alarms = []
+    values = {}
+    battery_info = []
+    missing_fields = []
+    expected_keys = set()
+    usual_update_seconds = compute_station_usual_update_seconds(rows)
+    failure_threshold_seconds = None
+    if usual_update_seconds is not None:
+        failure_threshold_seconds = max(2 * usual_update_seconds, 60)
+
+    for row in rows:
+        for key, raw in row.items():
+            if key in ("timestamp", "topic", "uuid", "name"):
+                continue
+            if isinstance(raw, str) and len(raw) > 180:
+                continue
+            expected_keys.add(key)
+
+    if latest_ts is None or latest_row is None:
+        alarms.append("lost_connectivity:no_data")
+    else:
+        age_seconds = int((now_dt - latest_ts).total_seconds())
+        if failure_threshold_seconds is None:
+            failure_threshold_seconds = 15 * 60
+        if age_seconds > failure_threshold_seconds:
+            alarms.append(f"lost_connectivity:{age_seconds}s(threshold={failure_threshold_seconds}s)")
+
+        batt_alarms, battery_info = _battery_alarms_from_row(latest_row)
+        alarms.extend(batt_alarms)
+
+        numeric_count = 0
+        for key in expected_keys:
+            raw = latest_row.get(key)
+            if _is_missing_sensor_value(raw):
+                missing_fields.append(key)
+                continue
+            values[key] = raw
+            if _to_float(raw) is not None:
+                numeric_count += 1
+        if numeric_count < 2:
+            alarms.append("sensor_failure:too_few_numeric_values")
+        if missing_fields:
+            short = ",".join(missing_fields[:8])
+            suffix = "" if len(missing_fields) <= 8 else ",..."
+            alarms.append(f"sensor_failure:missing_values[{len(missing_fields)}]={short}{suffix}")
+
+    return {
+        "latest_ts": latest_ts,
+        "values": values,
+        "battery_info": battery_info,
+        "missing_fields": missing_fields,
+        "expected_keys": expected_keys,
+        "alarms": alarms,
+        "usual_update_seconds": usual_update_seconds,
+        "failure_threshold_seconds": failure_threshold_seconds,
+    }
+
+
 def build_admin_network_dashboard(storage_root: str):
     now = utc_now()
     stations = []
@@ -1577,58 +2050,9 @@ def build_admin_network_dashboard(storage_root: str):
     for instrument_uuid in collect_instruments(storage_root):
         preview = get_station_preview(storage_root, instrument_uuid)
         rows = load_station_rows(storage_root, instrument_uuid, limit=500)
-
-        latest_ts = None
-        latest_row = None
-        for row in rows:
-            ts = parse_iso_ts(row.get("timestamp", ""))
-            if ts is None:
-                continue
-            if latest_ts is None or ts > latest_ts:
-                latest_ts = ts
-                latest_row = row
-
-        alarms = []
-        values = {}
-        battery_info = []
-        missing_fields = []
-        expected_keys = set()
-
-        for row in rows:
-            for key, raw in row.items():
-                if key in ("timestamp", "topic", "uuid", "name"):
-                    continue
-                if isinstance(raw, str) and len(raw) > 180:
-                    continue
-                expected_keys.add(key)
-
-        if latest_ts is None or latest_row is None:
-            alarms.append("lost_connectivity:no_data")
-        else:
-            age_seconds = int((now - latest_ts).total_seconds())
-            if age_seconds > 15 * 60:
-                alarms.append(f"lost_connectivity:{age_seconds}s")
-
-            batt_alarms, battery_info = _battery_alarms_from_row(latest_row)
-            alarms.extend(batt_alarms)
-
-            numeric_count = 0
-            for key in expected_keys:
-                raw = latest_row.get(key)
-                if _is_missing_sensor_value(raw):
-                    missing_fields.append(key)
-                    continue
-                values[key] = raw
-                if _to_float(raw) is not None:
-                    numeric_count += 1
-            if numeric_count < 2:
-                alarms.append("sensor_failure:too_few_numeric_values")
-            if missing_fields:
-                short = ",".join(missing_fields[:8])
-                suffix = "" if len(missing_fields) <= 8 else ",..."
-                alarms.append(f"sensor_failure:missing_values[{len(missing_fields)}]={short}{suffix}")
-
-        value_keys.update(expected_keys)
+        summary = evaluate_station_anomalies(instrument_uuid, rows, now)
+        latest_ts = summary["latest_ts"]
+        value_keys.update(summary["expected_keys"])
 
         stations.append(
             {
@@ -1636,12 +2060,14 @@ def build_admin_network_dashboard(storage_root: str):
                 "name": preview.get("name") or instrument_uuid,
                 "lastTimestamp": latest_ts.isoformat().replace("+00:00", "Z") if latest_ts else None,
                 "ageSeconds": (int((now - latest_ts).total_seconds()) if latest_ts else None),
-                "status": "ALARM" if alarms else "OK",
-                "alarms": alarms,
-                "batteryInfo": ", ".join(battery_info) if battery_info else "",
-                "missingFields": missing_fields,
-                "missingCount": len(missing_fields),
-                "values": values,
+                "usualUpdateSeconds": summary["usual_update_seconds"],
+                "failureThresholdSeconds": summary["failure_threshold_seconds"],
+                "status": "ALARM" if summary["alarms"] else "OK",
+                "alarms": summary["alarms"],
+                "batteryInfo": ", ".join(summary["battery_info"]) if summary["battery_info"] else "",
+                "missingFields": summary["missing_fields"],
+                "missingCount": len(summary["missing_fields"]),
+                "values": summary["values"],
             }
         )
 
@@ -1652,6 +2078,70 @@ def build_admin_network_dashboard(storage_root: str):
         "valueColumns": value_columns,
         "stations": stations,
     }
+
+
+def anomaly_base_type(anomaly_code: str):
+    return str(anomaly_code or "").split(":", 1)[0]
+
+
+def run_watchdog_loop(cfg: dict, access_store: AccessStore, stop_event: threading.Event):
+    storage_root = cfg.get("storage_root")
+    if not storage_root:
+        logger.info("Watchdog disabled: storage is not configured")
+        return
+
+    interval = max(10, int(cfg.get("watchdog_interval_sec", 60)))
+    logger.info("Watchdog started (interval=%ss)", interval)
+
+    while not stop_event.is_set():
+        now = utc_now()
+        instruments = collect_instruments(storage_root)
+        seen_pairs = set()
+
+        for instrument_uuid in instruments:
+            rows = load_station_rows(storage_root, instrument_uuid, limit=500)
+            summary = evaluate_station_anomalies(instrument_uuid, rows, now)
+
+            active_types = set()
+            for alarm in summary["alarms"]:
+                anomaly_type = anomaly_base_type(alarm)
+                active_types.add(anomaly_type)
+                seen_pairs.add((instrument_uuid, anomaly_type))
+                anomaly_id, is_new = access_store.upsert_anomaly(
+                    instrument_uuid,
+                    anomaly_type,
+                    alarm,
+                    severity="critical" if anomaly_type in ("lost_connectivity", "sensor_failure") else "warning",
+                )
+                silenced_until = access_store.get_anomaly_silenced_until(instrument_uuid, anomaly_type)
+                if is_new and (silenced_until is None or silenced_until <= now):
+                    contacts = access_store.list_station_user_contacts(instrument_uuid)
+                    for c in contacts:
+                        token = access_store.create_login_token(c["username"], ttl_minutes=60)
+                        fast_link = f"{cfg['base_url'].rstrip('/')}/fast-login?{urlencode({'token': token})}"
+                        body = (
+                            f"Station: {instrument_uuid}\n"
+                            f"Anomaly: {alarm}\n"
+                            f"Detected at: {now_utc_iso()}\n\n"
+                            f"Open anomalies and optionally silence for up to 24h:\n"
+                            f"{cfg['base_url'].rstrip('/')}/anomalies\n\n"
+                            f"Fast login link (expires in 60 minutes):\n{fast_link}\n"
+                        )
+                        send_email(
+                            cfg,
+                            [c["email"]],
+                            f"[Sensor Network Alarm] {instrument_uuid} - {anomaly_type}",
+                            body,
+                        )
+
+            # Resolve anomalies that are no longer active.
+            for open_anomaly in access_store.list_open_anomalies():
+                if open_anomaly["station_uuid"] != instrument_uuid:
+                    continue
+                if open_anomaly["anomaly_type"] not in active_types:
+                    access_store.resolve_anomaly(instrument_uuid, open_anomaly["anomaly_type"], "resolved")
+
+        stop_event.wait(interval)
 
 
 def coerce_for_influx_type(value, target_type: str):
@@ -1781,6 +2271,12 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             abort(403)
         return user
 
+    def require_login():
+        user = current_user()
+        if not user:
+            return redirect(url_for("login", next=request.path))
+        return user
+
     def storage_root_or_404():
         storage_root = cfg.get("storage_root")
         if not storage_root:
@@ -1792,6 +2288,39 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
     def station_is_accessible(user, instrument_uuid: str):
         return access_store.can_download(user, instrument_uuid)
+
+    def logo_url(path: str):
+        if not path:
+            return None
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            return None
+        return url_for("asset_file", kind="app", name=p.name)
+
+    app_logo_path = str(cfg.get("web_app_logo") or "").strip()
+
+    def station_logo_dir():
+        root = storage_root_or_404()
+        out = Path(root) / "_logos"
+        out.mkdir(parents=True, exist_ok=True)
+        return out
+
+    @app.route("/assets/<kind>/<path:name>")
+    def asset_file(kind: str, name: str):
+        if kind == "app":
+            p = Path(app_logo_path) if app_logo_path else None
+            if p is None or not p.exists() or p.name != name:
+                abort(404)
+            mime, _ = mimetypes.guess_type(str(p))
+            return send_file(p, mimetype=mime or "application/octet-stream")
+
+        if kind == "station":
+            p = station_logo_dir() / safe_filename(name)
+            if not p.exists():
+                abort(404)
+            mime, _ = mimetypes.guess_type(str(p))
+            return send_file(p, mimetype=mime or "application/octet-stream")
+        abort(404)
 
     @app.route("/")
     def index():
@@ -1840,9 +2369,11 @@ def create_web_app(cfg: dict, access_store: AccessStore):
               </style>
             </head>
             <body class="container py-4">
+              {% if app_logo_url %}<img src="{{ app_logo_url }}" alt="App logo" style="max-height:56px; margin-bottom:8px;">{% endif %}
               <h1>Sensor Network Collector - Data Portal</h1>
               {% if user %}
                 <p>Logged in as <b>{{ user.username }}</b> ({{ user.role }}) - <a href="{{ url_for('logout') }}">Logout</a></p>
+                <p><a href="{{ url_for('anomalies_log') }}">Anomalies log</a></p>
                 {% if user.role == 'admin' %}<p><a href="{{ url_for('admin') }}">Admin panel</a></p>{% endif %}
               {% else %}
                 <p><a href="{{ url_for('login') }}">Login</a> | <a href="{{ url_for('request_account') }}">Request account</a></p>
@@ -1942,6 +2473,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             stations=stations,
             clickable=clickable,
             center=center,
+            app_logo_url=logo_url(app_logo_path),
         )
 
     @app.route("/station/<path:instrument_uuid>")
@@ -1958,6 +2490,10 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
         preview = get_station_preview(storage_root, instrument_uuid)
         station_name = preview.get("name") or instrument_uuid
+        station_logo_row = access_store.get_station_logo(instrument_uuid)
+        station_logo_url = None
+        if station_logo_row:
+            station_logo_url = url_for("asset_file", kind="station", name=Path(station_logo_row["logo_path"]).name)
 
         interval = normalize_interval(request.args.get("interval", "hour"))
 
@@ -2091,8 +2627,12 @@ def create_web_app(cfg: dict, access_store: AccessStore):
               </style>
             </head>
             <body class="container-fluid py-3">
+              {% if app_logo_url %}<img src="{{ app_logo_url }}" alt="App logo" style="max-height:48px; margin-bottom:8px;">{% endif %}
               <p><a href="{{ url_for('index') }}">Home</a></p>
               <h1>Station {{ station_name }} ({{ instrument_uuid }})</h1>
+              {% if station_logo_url %}
+                <p><img src="{{ station_logo_url }}" alt="Station logo" style="max-height:48px;"></p>
+              {% endif %}
 
               <div class="panel">
                 <h2>Time interval</h2>
@@ -2124,6 +2664,14 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   <label>To <input type="date" name="to_date" value="{{ request.args.get('to_date','') }}"></label>
                   <button class="btn btn-primary btn-sm" type="submit">Download ZIP</button>
                 </form>
+                {% if user %}
+                <hr/>
+                <h3 class="h6">Station logo</h3>
+                <form method="post" action="{{ url_for('upload_station_logo', instrument_uuid=instrument_uuid) }}" enctype="multipart/form-data">
+                  <input class="form-control form-control-sm w-auto d-inline-block" type="file" name="logo" accept="image/*" required>
+                  <button class="btn btn-secondary btn-sm" type="submit">Upload logo</button>
+                </form>
+                {% endif %}
               </div>
 
               <div class="panel">
@@ -2229,6 +2777,9 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             """,
             instrument_uuid=instrument_uuid,
             station_name=station_name,
+            user=user,
+            app_logo_url=logo_url(app_logo_path),
+            station_logo_url=station_logo_url,
             interval=interval,
             interval_options=TREND_INTERVALS,
             interval_label=interval_label,
@@ -2254,6 +2805,36 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             request=request,
         )
 
+    @app.route("/station/<path:instrument_uuid>/logo", methods=["POST"])
+    def upload_station_logo(instrument_uuid: str):
+        user = require_login()
+        if not isinstance(user, dict):
+            return user
+        storage_root = storage_root_or_404()
+        instruments = set(available_instruments(storage_root))
+        if instrument_uuid not in instruments:
+            abort(404, "Station not found")
+        if not station_is_accessible(user, instrument_uuid):
+            abort(403)
+
+        f = request.files.get("logo")
+        if f is None or not f.filename:
+            abort(400, "Missing logo file")
+        original = safe_filename(f.filename)
+        ext = Path(original).suffix.lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"):
+            abort(400, "Unsupported logo format")
+
+        content = f.read()
+        if not content:
+            abort(400, "Empty logo file")
+        digest = hashlib.sha256(content).hexdigest()[:12]
+        out_name = safe_filename(f"{instrument_uuid}_{digest}{ext}")
+        out_path = station_logo_dir() / out_name
+        out_path.write_bytes(content)
+        access_store.set_station_logo(instrument_uuid, str(out_path), user["username"])
+        return redirect(url_for("browse_station", instrument_uuid=instrument_uuid))
+
 
     @app.route("/public/station/<path:instrument_uuid>")
     def public_station(instrument_uuid: str):
@@ -2264,7 +2845,12 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
         user = current_user()
         can_browse_download = bool(user) and station_is_accessible(user, instrument_uuid)
-        snapshot = build_public_station_snapshot(storage_root, instrument_uuid)
+        selected_window = normalize_public_window(request.args.get("window", "hour"))
+        snapshot = build_public_station_snapshot(storage_root, instrument_uuid, window=selected_window)
+        station_logo_row = access_store.get_station_logo(instrument_uuid)
+        station_logo_url = None
+        if station_logo_row:
+            station_logo_url = url_for("asset_file", kind="station", name=Path(station_logo_row["logo_path"]).name)
         return render_template_string(
             """
             <html>
@@ -2289,10 +2875,22 @@ def create_web_app(cfg: dict, access_store: AccessStore):
               <div class="container-fluid py-3 dashboard-root">
               <div class="d-flex flex-wrap justify-content-between align-items-center mb-3">
                 <div>
+                  <div class="mb-2">
+                    {% if app_logo_url %}<img src="{{ app_logo_url }}" alt="App logo" style="max-height:44px; margin-right:8px;">{% endif %}
+                    {% if station_logo_url %}<img src="{{ station_logo_url }}" alt="Station logo" style="max-height:44px;">{% endif %}
+                  </div>
                   <h1 class="h3 mb-1">Public Station Dashboard</h1>
                   <div class="text-muted" id="stationTitle">{{ snapshot.station_name }} ({{ snapshot.instrument_uuid }})</div>
                 </div>
                 <div class="text-end">
+                  <div class="mb-2">
+                    <label class="small text-muted">Trend window</label>
+                    <select id="windowSelect" class="form-select form-select-sm">
+                      {% for code, label in window_options %}
+                        <option value="{{ code }}" {% if code == selected_window %}selected{% endif %}>{{ label }}</option>
+                      {% endfor %}
+                    </select>
+                  </div>
                   <div class="small text-muted">Last update</div>
                   <div class="fw-semibold" id="lastUpdate">{{ snapshot.last_timestamp or "-" }}</div>
                   {% if can_browse_download %}
@@ -2309,7 +2907,9 @@ def create_web_app(cfg: dict, access_store: AccessStore):
               <script>
                 const stationId = {{ snapshot.instrument_uuid | tojson }};
                 let lastTimestamp = {{ snapshot.last_timestamp | tojson }};
+                let currentWindow = {{ selected_window | tojson }};
                 const chartInstances = {};
+                const windowSelect = document.getElementById('windowSelect');
                 const colors = ['#0d6efd', '#20c997', '#fd7e14', '#6f42c1', '#dc3545', '#198754', '#6c757d'];
 
                 function cardHtml(card) {
@@ -2405,9 +3005,14 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   renderSeries(snapshot);
                 }
 
-                async function pollSnapshot() {
+                async function pollSnapshot(forceRefresh = false) {
                   try {
-                    const resp = await fetch(`/api/public/station/${encodeURIComponent(stationId)}/snapshot?since=${encodeURIComponent(lastTimestamp || '')}`, { cache: 'no-store' });
+                    const qs = new URLSearchParams({
+                      since: lastTimestamp || '',
+                      window: currentWindow,
+                      force: forceRefresh ? '1' : '0'
+                    });
+                    const resp = await fetch(`/api/public/station/${encodeURIComponent(stationId)}/snapshot?${qs.toString()}`, { cache: 'no-store' });
                     if (!resp.ok) return;
                     const data = await resp.json();
                     if (!data.changed) return;
@@ -2419,6 +3024,12 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 }
 
                 applySnapshot({{ snapshot | tojson }});
+                if (windowSelect) {
+                  windowSelect.addEventListener('change', () => {
+                    currentWindow = windowSelect.value;
+                    pollSnapshot(true);
+                  });
+                }
                 setInterval(pollSnapshot, 5000);
               </script>
               </div>
@@ -2427,6 +3038,10 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             """,
             snapshot=snapshot,
             can_browse_download=can_browse_download,
+            app_logo_url=logo_url(app_logo_path),
+            station_logo_url=station_logo_url,
+            selected_window=selected_window,
+            window_options=PUBLIC_TREND_WINDOWS,
         )
 
     @app.route("/api/public/station/<path:instrument_uuid>/snapshot")
@@ -2436,9 +3051,13 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         if instrument_uuid not in instruments:
             abort(404, "Station not found")
 
-        snapshot = build_public_station_snapshot(storage_root, instrument_uuid)
+        window = normalize_public_window(request.args.get("window", "hour"))
+        snapshot = build_public_station_snapshot(storage_root, instrument_uuid, window=window)
         since = request.args.get("since", "")
+        force = parse_boolish(request.args.get("force", "0"), False)
         changed = bool(snapshot.get("last_timestamp")) and snapshot.get("last_timestamp") != since
+        if force:
+            changed = True
         if not since:
             changed = True
         return jsonify({"changed": changed, "snapshot": snapshot})
@@ -2452,6 +3071,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             user = access_store.authenticate(username, password)
             if user:
                 session["username"] = user["username"]
+                if int(user.get("force_password_change", 0)) == 1:
+                    return redirect(url_for("change_password"))
                 nxt = request.args.get("next") or url_for("index")
                 return redirect(nxt)
             err = "Invalid credentials or inactive user"
@@ -2490,10 +3111,66 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             err=err,
         )
 
+    @app.route("/fast-login")
+    def fast_login():
+        token = request.args.get("token", "")
+        user = access_store.consume_login_token(token)
+        if not user:
+            abort(403, "Invalid or expired login token")
+        session["username"] = user["username"]
+        if int(user.get("force_password_change", 0)) == 1:
+            return redirect(url_for("change_password"))
+        return redirect(url_for("index"))
+
     @app.route("/logout")
     def logout():
         session.pop("username", None)
         return redirect(url_for("index"))
+
+    @app.route("/change-password", methods=["GET", "POST"])
+    def change_password():
+        user = require_login()
+        if not isinstance(user, dict):
+            return user
+        msg = ""
+        err = ""
+        if request.method == "POST":
+            p1 = request.form.get("password", "")
+            p2 = request.form.get("password2", "")
+            if not p1 or len(p1) < 8:
+                err = "Password must be at least 8 characters"
+            elif p1 != p2:
+                err = "Passwords do not match"
+            else:
+                ok, txt = access_store.change_password(user["username"], p1)
+                if ok:
+                    msg = txt
+                else:
+                    err = txt
+        return render_template_string(
+            """
+            <html>
+            <head>
+              <title>Change password</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+              <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+            </head>
+            <body class="container py-5">
+              <h1 class="h4">Change password</h1>
+              {% if msg %}<div class="alert alert-success">{{ msg }}</div>{% endif %}
+              {% if err %}<div class="alert alert-danger">{{ err }}</div>{% endif %}
+              <form method="post">
+                <div class="mb-3"><label class="form-label">New password</label><input class="form-control" type="password" name="password"></div>
+                <div class="mb-3"><label class="form-label">Confirm password</label><input class="form-control" type="password" name="password2"></div>
+                <button class="btn btn-primary" type="submit">Update password</button>
+              </form>
+              <p class="mt-3"><a href="{{ url_for('index') }}">Home</a></p>
+            </body>
+            </html>
+            """,
+            msg=msg,
+            err=err,
+        )
 
     @app.route("/request-account", methods=["GET", "POST"])
     def request_account():
@@ -2507,6 +3184,13 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             ok, text = access_store.create_account_request(username, password, email, reason)
             if ok:
                 msg = text
+                if email:
+                    send_email(
+                        cfg,
+                        [email],
+                        "Sensor Network Collector: registration request received",
+                        f"Hello {username},\n\nYour registration request has been received and is pending admin approval.",
+                    )
             else:
                 err = text
 
@@ -2676,7 +3360,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             {% for u in users %}
               <div class="card mb-2"><div class="card-body">
                 <b>{{ u.username }}</b> role={{ u.role }} active={{ u.active }}<br/>
-                currently allowed: {{ user_access[u.username] }}
+                currently allowed: {{ user_access[u.username] }} | force_password_change={{ u.force_password_change }}
                 <form method="post" action="{{ url_for('admin_set_user_access') }}" class="row g-2 mt-1">
                   <input type="hidden" name="username" value="{{ u.username }}">
                   <div class="col-md-5"><input class="form-control" name="instrument_uuid" placeholder="Instrument UUID"></div>
@@ -2685,6 +3369,10 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     <option value="0">revoke</option>
                   </select></div>
                   <div class="col-md-2"><button class="btn btn-secondary btn-sm" type="submit">Apply</button></div>
+                </form>
+                <form method="post" action="{{ url_for('admin_force_password') }}" class="mt-1">
+                  <input type="hidden" name="username" value="{{ u.username }}">
+                  <button class="btn btn-warning btn-sm" type="submit">Force password change</button>
                 </form>
               </div></div>
             {% endfor %}
@@ -2806,7 +3494,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
                 function render(payload) {
                   headRow.innerHTML = '';
-                  ['Station', 'UUID', 'Timestamp', 'Age(s)', 'Status', 'Alarms', 'Missing values', 'Battery', 'Group', 'Data'].forEach((h) => {
+                  ['Station', 'UUID', 'Timestamp', 'Age(s)', 'Usual update(s)', 'Fail threshold(s)', 'Status', 'Alarms', 'Missing values', 'Battery', 'Group', 'Data'].forEach((h) => {
                     const th = document.createElement('th');
                     th.textContent = h;
                     headRow.appendChild(th);
@@ -2828,6 +3516,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                           st.uuid || '',
                           st.lastTimestamp || '',
                           st.ageSeconds == null ? '' : st.ageSeconds,
+                          st.usualUpdateSeconds == null ? '' : st.usualUpdateSeconds,
+                          st.failureThresholdSeconds == null ? '' : st.failureThresholdSeconds,
                           st.status || '',
                           (st.alarms || []).join(', '),
                           (st.missingFields && st.missingFields.length) ? st.missingFields.join(', ') : '',
@@ -2837,7 +3527,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                           const td = document.createElement('td');
                           td.textContent = String(value);
                           td.rowSpan = entries.length;
-                          if (colIdx === 4) {
+                          if (colIdx === 6) {
                             td.className = (String(value) === 'OK') ? 'status-ok' : 'status-alarm';
                           }
                           tr.appendChild(td);
@@ -2895,6 +3585,70 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         storage_root = storage_root_or_404()
         return jsonify(build_admin_network_dashboard(storage_root))
 
+    @app.route("/anomalies")
+    def anomalies_log():
+        user = require_login()
+        if not isinstance(user, dict):
+            return user
+        items = access_store.list_anomalies_for_user(user)
+        return render_template_string(
+            """
+            <html>
+            <head>
+              <title>Anomalies log</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+              <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+            </head>
+            <body class="container py-4">
+              <p><a href="{{ url_for('index') }}">Home</a></p>
+              <h1 class="h4">Anomalies log</h1>
+              <table class="table table-sm table-bordered table-striped">
+                <thead>
+                  <tr><th>Station</th><th>Type</th><th>Status</th><th>Message</th><th>Updated</th><th>Action</th></tr>
+                </thead>
+                <tbody>
+                {% for a in items %}
+                  <tr>
+                    <td>{{ a.station_uuid }}</td>
+                    <td>{{ a.anomaly_type }}</td>
+                    <td>{{ a.status }}</td>
+                    <td>{{ a.message }}</td>
+                    <td>{{ a.updated_at }}</td>
+                    <td>
+                      {% if a.status == 'open' %}
+                      <form method="post" action="{{ url_for('silence_anomaly') }}" class="d-flex gap-1">
+                        <input type="hidden" name="station_uuid" value="{{ a.station_uuid }}">
+                        <input type="hidden" name="anomaly_type" value="{{ a.anomaly_type }}">
+                        <input class="form-control form-control-sm" style="max-width:110px" type="number" min="1" max="24" name="hours" value="24">
+                        <button class="btn btn-warning btn-sm" type="submit">Silence</button>
+                      </form>
+                      {% endif %}
+                    </td>
+                  </tr>
+                {% endfor %}
+                </tbody>
+              </table>
+            </body>
+            </html>
+            """,
+            items=items,
+        )
+
+    @app.route("/anomalies/silence", methods=["POST"])
+    def silence_anomaly():
+        user = require_login()
+        if not isinstance(user, dict):
+            return user
+        station_uuid = request.form.get("station_uuid", "").strip()
+        anomaly_type = request.form.get("anomaly_type", "").strip()
+        hours = int(request.form.get("hours", "24") or 24)
+        if not station_uuid or not anomaly_type:
+            abort(400, "Missing station_uuid or anomaly_type")
+        if user.get("role") != "admin" and not station_is_accessible(user, station_uuid):
+            abort(403)
+        access_store.set_anomaly_silence(station_uuid, anomaly_type, user["username"], hours)
+        return redirect(url_for("anomalies_log"))
+
     @app.route("/admin/create-user", methods=["POST"])
     def admin_create_user():
         admin_user = require_admin()
@@ -2912,6 +3666,15 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         ok, msg = access_store.create_user(username, password, email, role=role)
         if not ok:
             abort(400, msg)
+        if email.strip():
+            token = access_store.create_login_token(username.strip(), ttl_minutes=60)
+            link = f"{cfg['base_url'].rstrip('/')}{url_for('fast_login')}?{urlencode({'token': token})}"
+            send_email(
+                cfg,
+                [email.strip()],
+                "Welcome to Sensor Network Collector",
+                f"Hello {username},\n\nYour account has been created.\nFast login link (expires in 60 minutes):\n{link}\n",
+            )
         return redirect(url_for("admin"))
 
     @app.route("/admin/requests/<int:request_id>/approve", methods=["POST"])
@@ -2922,6 +3685,16 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         ok, msg = access_store.approve_request(request_id, admin_user["username"])
         if not ok:
             abort(400, msg)
+        req = next((r for r in access_store.list_account_requests() if int(r["id"]) == int(request_id)), None)
+        if req and req.get("email"):
+            token = access_store.create_login_token(req["username"], ttl_minutes=60)
+            link = f"{cfg['base_url'].rstrip('/')}{url_for('fast_login')}?{urlencode({'token': token})}"
+            send_email(
+                cfg,
+                [req["email"]],
+                "Sensor Network Collector: account approved",
+                f"Hello {req['username']},\n\nYour account request has been approved.\nFast login link (expires in 60 minutes):\n{link}\n",
+            )
         return redirect(url_for("admin"))
 
     @app.route("/admin/requests/<int:request_id>/reject", methods=["POST"])
@@ -2962,6 +3735,19 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             abort(400, msg)
         return redirect(url_for("admin"))
 
+    @app.route("/admin/force-password", methods=["POST"])
+    def admin_force_password():
+        admin_user = require_admin()
+        if not isinstance(admin_user, dict):
+            return admin_user
+        username = request.form.get("username", "").strip()
+        if not username:
+            abort(400, "Username is required")
+        ok, msg = access_store.set_force_password_change(username, True)
+        if not ok:
+            abort(400, msg)
+        return redirect(url_for("admin"))
+
     return app
 
 
@@ -2978,6 +3764,8 @@ runtime = {
     "csv_storage": None,
     "http_thread": None,
     "access_store": None,
+    "watchdog_thread": None,
+    "watchdog_stop_event": None,
 }
 
 
@@ -3147,6 +3935,13 @@ def on_message(client, userdata, message):
 def shutdown(signum, frame):
     logger.info("Shutting down (signal=%s)...", signum)
 
+    stop_event = runtime.get("watchdog_stop_event")
+    if stop_event is not None:
+        try:
+            stop_event.set()
+        except Exception:
+            pass
+
     influx_client = runtime.get("influx_client")
     if influx_client is not None:
         try:
@@ -3185,6 +3980,17 @@ def start_web_gui(cfg: dict):
 
     runtime["access_store"] = access_store
     runtime["http_thread"] = thread
+
+    stop_event = threading.Event()
+    watchdog_thread = threading.Thread(
+        target=run_watchdog_loop,
+        args=(cfg, access_store, stop_event),
+        name="collector-watchdog",
+        daemon=True,
+    )
+    watchdog_thread.start()
+    runtime["watchdog_stop_event"] = stop_event
+    runtime["watchdog_thread"] = watchdog_thread
 
     logger.info("Web GUI enabled on http://%s:%s", cfg["http_host"], cfg["http_port"])
 
