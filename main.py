@@ -3156,7 +3156,10 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                       options: {
                         responsive: true,
                         maintainAspectRatio: false,
-                        plugins: { legend: { display: datasets.length > 1 } },
+                        plugins: {
+                          legend: { display: datasets.length > 1 },
+                          tooltip: { enabled: false }
+                        },
                         scales: {
                           x: {
                             type: 'linear',
