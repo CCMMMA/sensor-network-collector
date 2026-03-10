@@ -18,6 +18,8 @@ Set:
 
 - `/` home/map
 - `/login`, `/logout`
+- `/forgot-password`
+- `/reset-password?token=...`
 - `/request-account`
 - `/change-password`
 - `/fast-login?token=...`
@@ -45,6 +47,7 @@ With SMTP enabled:
 - registration request confirmation email
 - welcome email when admin creates user
 - approval email when request is approved
+- password-reset email from forgot-password flow
 - anomaly warning emails to admins and station-related users
 
 SMTP fallback behavior:
@@ -56,6 +59,9 @@ SMTP fallback behavior:
 
 - admin can force user password change
 - forced users are redirected to `/change-password` at login
+- users can request a password reset from `/forgot-password`
+- reset links are delivered by email and open `/reset-password?token=...`
+- reset flow requires a valid `baseUrl` and working SMTP configuration
 
 ## Anomaly log and silencing
 
@@ -80,6 +86,9 @@ SMTP fallback behavior:
   - 24 hours
   - 72 hours
   - one week
+- public station dashboard remembers selected trend window in a browser cookie
+- station dashboard also remembers selected trend interval in a browser cookie
+- when a public dashboard trend window is changed, trend chart x-axis is recomputed to match the selected time window
 
 ## Admin dashboard behavior
 

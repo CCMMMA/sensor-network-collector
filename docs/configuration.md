@@ -51,6 +51,11 @@ Example:
 - `storage`: enable CSV sink
 - `pathStorage`: root directory for hourly station files
 
+Storage units:
+
+- CSV files keep raw publisher units and values as received on MQTT.
+- No Signal K-style normalization is applied to file storage.
+
 Example:
 
 ```json
@@ -65,6 +70,11 @@ Example:
 - `influxdb`: enable Influx sink
 - `influxdbUrl`, `influxdbToken`, `influxdbOrg`, `influxdbBucket`
 - `influxMeasurement`
+
+Influx units:
+
+- InfluxDB fields keep raw publisher units and values as received on MQTT.
+- Signal K conversions are not reused for Influx writes.
 
 Example:
 
@@ -87,6 +97,7 @@ Example:
 - `signalkAccessPollSec`, `signalkAccessTimeoutSec`
 - `signalkContextPrefix`, `signalkSourceLabel`
 - `signalkPathMap`
+- empty `meta` keys or empty-string `meta` values are ignored before sending deltas
 
 Example:
 
@@ -116,6 +127,15 @@ context: meteo.it_uniparthenope_meteo_ws1
 name path: meteo.it_uniparthenope_meteo_ws1.name
 ```
 
+Signal K value normalization:
+
+- temperature -> Kelvin
+- pressure -> Pa
+- humidity percent -> ratio
+- angular values -> radians
+- rain totals / evapotranspiration totals -> meters
+- rain rate -> meters per second
+
 ### Web GUI and security
 
 - `httpEnabled`, `httpHost`, `httpPort`
@@ -141,6 +161,11 @@ Example:
 }
 ```
 
+`baseUrl` is used for:
+
+- fast-login links in welcome, approval, and anomaly emails
+- password-reset links from the forgot-password flow
+
 ### SMTP and notifications
 
 - `smtpEnabled`
@@ -155,6 +180,7 @@ Behavior:
 - if `smtpPort`, `smtpUser`, and `smtpPass` are omitted, SMTP defaults to unauthenticated port `25`
 - if `smtpUser` is set, SMTP login is attempted
 - `smtpUseTls` can still explicitly force TLS behavior; default logic follows the port/auth fallback
+- forgot-password and reset emails require both SMTP configuration and a correct `baseUrl`
 
 Example:
 

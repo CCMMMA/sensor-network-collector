@@ -48,6 +48,7 @@ Example:
 ```
 
 If `meta` is present it is sent as Signal K metadata delta for that path.
+Empty `meta` keys and empty-string `meta` values are discarded before publish.
 
 The collector also emits payload `name` as Signal K value path `name` inside the computed context.
 
@@ -67,6 +68,13 @@ Before sending to Signal K, collector converts to SI-friendly conventions:
 - pressure (hPa-like values) -> Pa
 - humidity percent -> ratio
 - angular/heading/direction-like values -> radians
+- rain totals and evapotranspiration totals -> meters
+- rain rate -> meters per second
+
+Signal K delta notes:
+
+- delta updates use a `source` object
+- metadata deltas are only emitted when sanitized `meta` content remains
 
 ## Access request flow
 

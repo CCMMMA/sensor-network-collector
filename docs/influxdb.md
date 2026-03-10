@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Write normalized MQTT payloads to InfluxDB v2 for time-series analytics.
+Write flattened MQTT payloads to InfluxDB v2 for time-series analytics.
 
 ## Configuration keys
 
@@ -30,6 +30,19 @@ For each message:
   - flattened scalar payload fields
 - timestamp:
   - payload `Datetime` / `DatetimeWS` if valid, else current UTC
+
+Unit behavior:
+
+- InfluxDB fields keep the raw publisher units as received on MQTT.
+- Signal K normalization is not applied to Influx writes.
+
+Examples:
+
+- `TempOut` is stored in `C`
+- `HumOut` is stored in `%`
+- `Barometer` is stored in `hPa`
+- `WindDir` is stored in `deg`
+- `RainRate` is stored in `mm/h`
 
 ## Field type conflict handling (422)
 

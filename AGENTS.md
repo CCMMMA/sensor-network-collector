@@ -20,10 +20,12 @@
 - Prefer small, reviewable commits.
 - Do not commit secrets, credentials, or environment-specific values.
 - Update `README.md` when behavior or configuration changes.
+- Keep `docs/*.md` aligned with current behavior for Web GUI, Signal K, storage, and deployment flows.
 
 ## Validation
 - For each change, at minimum:
   - Ensure `python main.py --config config.json` starts without syntax/runtime import errors.
+  - Refresh Markdown docs when user-visible behavior, URLs, units, or configuration semantics change.
   - Verify dependency updates are reflected in `requirements.txt`.
 
 ## File/Scope Conventions

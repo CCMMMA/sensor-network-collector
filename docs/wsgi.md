@@ -37,7 +37,7 @@ Required keys:
 - `authDbPath`
 - `webSessionSecret`
 - `adminPassword`
-- `baseUrl` (must match public URL for email fast-login links)
+- `baseUrl` (must match public URL for email fast-login and password-reset links)
 
 Optional but commonly relevant:
 
@@ -115,3 +115,4 @@ Then add TLS (certbot recommended).
 - Verify login/session persistence across restarts
 - Verify anomalies page and admin dashboard load
 - Verify fast-login links in email use correct host (`baseUrl`)
+- Verify forgot-password emails generate reset links with the same public host

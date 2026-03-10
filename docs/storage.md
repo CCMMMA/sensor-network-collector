@@ -48,6 +48,16 @@ python3 main.py --config config.json --storage false
 - nested objects/arrays serialized as JSON strings
 - `timestamp`, `topic`, `uuid` and flattened fields are included
 - `name` is stored in CSV when present and is also reused by the web GUI and Signal K forwarding
+- units are preserved exactly as published on MQTT; CSV storage does not normalize to Signal K units
+
+Examples:
+
+- `TempOut` remains in `C`
+- `HumOut` remains in `%`
+- `Barometer` remains in `hPa`
+- `WindDir` remains in `deg`
+- `RainRate` remains in `mm/h`
+- AQI and particulate fields remain in the units sent by the publisher
 
 ## Operational recommendations
 

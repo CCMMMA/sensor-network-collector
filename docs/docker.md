@@ -83,6 +83,7 @@ Important:
 - Use network-reachable hostnames for MQTT/InfluxDB/SMTP (not `localhost` unless service runs in same container).
 - Use a strong `webSessionSecret`.
 - Set strong `adminPassword`.
+- Set `baseUrl` to the public HTTPS URL used by browsers, so fast-login and password-reset email links are correct.
 - If email delivery is not needed, omit `smtpHost` and the application will skip email sending.
 - For plain unauthenticated relay inside trusted networks, you can omit `smtpPort`, `smtpUser`, and `smtpPass`; SMTP falls back to port `25`.
 

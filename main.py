@@ -349,6 +349,7 @@ def load_config(path: str, args) -> dict:
                 if meta is None and "meta:" in v:
                     meta = v.get("meta:")
                 entry = {"path": path}
+                meta = sanitize_signalk_meta(meta)
                 if meta is not None:
                     entry["meta"] = meta
                 parsed_map[key] = entry
@@ -445,6 +446,16 @@ def convert_signalk_value(key: str, path: str, value):
     # Relative humidity ratio [0..1].
     if "humidity" in path_l or key_l in ("humout", "humin"):
         return v / 100.0 if v > 1.0 else v
+
+    # Rain/ET quantities in Signal K are meters or meters/second.
+    if any(token in key_l for token in ("rainday", "rainmonth", "rainyear", "rainstorm", "etday", "etmonth", "etyear")):
+        return v / 1000.0 if abs(v) > 1.0 else v
+    if "rainrate" in key_l:
+        return (v / 1000.0) / 3600.0 if abs(v) > 0.01 else v
+    if "precipitation" in path_l and "rate" in path_l:
+        return (v / 1000.0) / 3600.0 if abs(v) > 0.01 else v
+    if "precipitation" in path_l:
+        return v / 1000.0 if abs(v) > 1.0 else v
 
     # Angular quantities in Signal K are radians.
     angle_tokens = ("angle", "heading", "bearing", "course", "track", "yaw", "pitch", "roll", "leeway")
@@ -693,6 +704,7 @@ def build_signalk_delta(topic: str, data: dict, tags: dict, dt: datetime, cfg: d
 
         values.append({"path": path, "value": value})
 
+        mapped_meta = sanitize_signalk_meta(mapped_meta)
         if mapped_meta is not None and path not in seen_meta_paths:
             metas.append({"path": path, "value": mapped_meta})
             seen_meta_paths.add(path)
@@ -772,6 +784,14 @@ class AccessStore:
                         );
 
                         CREATE TABLE IF NOT EXISTS login_tokens (
+                            token TEXT PRIMARY KEY,
+                            username TEXT NOT NULL,
+                            expires_at TEXT NOT NULL,
+                            created_at TEXT NOT NULL,
+                            used_at TEXT
+                        );
+
+                        CREATE TABLE IF NOT EXISTS password_reset_tokens (
                             token TEXT PRIMARY KEY,
                             username TEXT NOT NULL,
                             expires_at TEXT NOT NULL,
@@ -883,6 +903,22 @@ class AccessStore:
                 "SELECT username,email,role,active,created_at,force_password_change FROM users ORDER BY username"
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def find_active_user_by_identity(self, identity: str):
+        identity = identity.strip()
+        if not identity:
+            return None
+        with self._connect() as con:
+            row = con.execute(
+                """
+                SELECT username,email,role,active,created_at,force_password_change
+                FROM users
+                WHERE active = 1 AND (username = ? OR lower(email) = lower(?))
+                LIMIT 1
+                """,
+                (identity, identity),
+            ).fetchone()
+        return dict(row) if row else None
 
     def authenticate(self, username: str, password: str):
         with self._connect() as con:
@@ -1154,6 +1190,48 @@ class AccessStore:
                     return None
                 con.execute("UPDATE login_tokens SET used_at = ? WHERE token = ?", (now_utc_iso(), token))
                 return self.get_user(row["username"])
+
+    def create_password_reset_token(self, username: str, ttl_minutes: int = 30):
+        token = secrets.token_urlsafe(32)
+        now = utc_now()
+        expires = now + timedelta(minutes=max(1, ttl_minutes))
+        with self._lock:
+            with self._connect() as con:
+                con.execute(
+                    "INSERT INTO password_reset_tokens(token,username,expires_at,created_at,used_at) VALUES(?,?,?,?,NULL)",
+                    (
+                        token,
+                        username.strip(),
+                        expires.isoformat().replace("+00:00", "Z"),
+                        now.isoformat().replace("+00:00", "Z"),
+                    ),
+                )
+        return token
+
+    def get_password_reset_user(self, token: str):
+        if not token:
+            return None
+        now = utc_now()
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT token,username,expires_at,used_at FROM password_reset_tokens WHERE token = ?",
+                (token,),
+            ).fetchone()
+        if row is None or row["used_at"]:
+            return None
+        exp = parse_iso_ts(row["expires_at"])
+        if exp is None or exp < now:
+            return None
+        return self.get_user(row["username"])
+
+    def consume_password_reset_token(self, token: str):
+        user = self.get_password_reset_user(token)
+        if user is None:
+            return None
+        with self._lock:
+            with self._connect() as con:
+                con.execute("UPDATE password_reset_tokens SET used_at = ? WHERE token = ?", (now_utc_iso(), token))
+        return user
 
     def list_admin_emails(self):
         with self._connect() as con:
@@ -1471,25 +1549,45 @@ def _extract_lat_lon_from_row(row: dict):
 
 
 DEFAULT_FIELD_UNITS = {
-    "TempIn": "K",
-    "TempOut": "K",
-    "HumIn": "ratio",
-    "HumOut": "ratio",
-    "Barometer": "Pa",
-    "BarTrend": "Pa/s",
+    "TempIn": "C",
+    "TempOut": "C",
+    "HumIn": "%",
+    "HumOut": "%",
+    "Barometer": "hPa",
+    "BarTrend": "hPa/h",
     "WindSpeed": "m/s",
     "WindSpeed10Min": "m/s",
-    "WindDir": "rad",
-    "RainRate": "m/s",
-    "RainStorm": "m",
-    "RainDay": "m",
-    "RainMonth": "m",
-    "RainYear": "m",
-    "ETDay": "m",
-    "ETMonth": "m",
-    "ETYear": "m",
+    "WindDir": "deg",
+    "RainRate": "mm/h",
+    "RainStorm": "mm",
+    "RainDay": "mm",
+    "RainMonth": "mm",
+    "RainYear": "mm",
+    "ETDay": "mm",
+    "ETMonth": "mm",
+    "ETYear": "mm",
     "SolarRad": "W/m2",
     "BatteryVolts": "V",
+    "temp": "C",
+    "heat_index": "C",
+    "dew_point": "C",
+    "wet_bulb": "C",
+    "hum": "%",
+    "bar": "hPa",
+    "pm_1": "ug/m3",
+    "pm_2p5": "ug/m3",
+    "pm_10": "ug/m3",
+    "pm_2p5_1_hour": "ug/m3",
+    "pm_2p5_3_hour": "ug/m3",
+    "pm_2p5_24_hour": "ug/m3",
+    "pm_2p5_nowcast": "ug/m3",
+    "pm_10_1_hour": "ug/m3",
+    "pm_10_3_hour": "ug/m3",
+    "pm_10_24_hour": "ug/m3",
+    "pm_10_nowcast": "ug/m3",
+    "aqi_val": "AQI",
+    "aqi_1_hour_val": "AQI",
+    "aqi_nowcast_val": "AQI",
 }
 
 
@@ -1504,6 +1602,38 @@ def get_field_units(cfg: dict):
                 if isinstance(units, str) and units.strip():
                     out[str(key)] = units.strip()
     return out
+
+
+def compose_external_url(base_url: str, path: str, query=None) -> str:
+    root = str(base_url or "").strip().rstrip("/")
+    suffix = "/" + str(path or "").lstrip("/")
+    out = f"{root}{suffix}" if root else suffix
+    if query:
+        return f"{out}?{urlencode(query)}"
+    return out
+
+
+def sanitize_signalk_meta(meta):
+    if not isinstance(meta, dict):
+        return None
+    cleaned = {}
+    for key, value in meta.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        cleaned[str(key)] = value
+    return cleaned or None
+
+
+def request_preference_cookie(request_obj, param_name: str, cookie_name: str, normalizer, default: str):
+    raw = request_obj.args.get(param_name)
+    if raw is not None and str(raw).strip():
+        return normalizer(raw)
+    cookie_val = request_obj.cookies.get(cookie_name, "")
+    if cookie_val:
+        return normalizer(cookie_val)
+    return default
 
 
 def parse_iso_ts(value: str):
@@ -1826,6 +1956,8 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, windo
             "station_name": preview.get("name") or instrument_uuid,
             "last_timestamp": None,
             "rows": 0,
+            "window_start": None,
+            "window_end": None,
             "location": {
                 "latitude": preview.get("latitude"),
                 "longitude": preview.get("longitude"),
@@ -1868,12 +2000,16 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, windo
     for spec in PUBLIC_SERIES_SPECS:
         labels = []
         values = []
+        points = []
         for ts, row in rows_ts:
             value = _first_numeric_for_aliases(row, spec["aliases"])
             if value is None:
                 continue
-            labels.append(ts.isoformat().replace("+00:00", "Z"))
-            values.append(round(value, 3))
+            iso_ts = ts.isoformat().replace("+00:00", "Z")
+            rounded = round(value, 3)
+            labels.append(iso_ts)
+            values.append(rounded)
+            points.append({"x": iso_ts, "y": rounded})
         if values:
             y_min, y_max = _calc_axis_range(values, spec.get("axis"))
             series.append(
@@ -1885,6 +2021,7 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, windo
                     "y_max": y_max,
                     "labels": labels,
                     "values": values,
+                    "points": points,
                 }
             )
 
@@ -1900,17 +2037,21 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, windo
     for item in pm_series_specs:
         labels = []
         values = []
+        points = []
         for ts, row in rows_ts:
             value = _first_numeric_for_aliases(row, item["aliases"])
             if value is None:
                 continue
-            labels.append(ts.isoformat().replace("+00:00", "Z"))
-            values.append(round(value, 3))
+            iso_ts = ts.isoformat().replace("+00:00", "Z")
+            rounded = round(value, 3)
+            labels.append(iso_ts)
+            values.append(rounded)
+            points.append({"x": iso_ts, "y": rounded})
             pm_all_values.append(float(value))
         if values:
             if len(labels) > len(pm_labels):
                 pm_labels = labels
-            pm_datasets.append({"label": item["label"], "values": values})
+            pm_datasets.append({"label": item["label"], "values": values, "points": points})
 
     if pm_datasets:
         y_min, y_max = _calc_axis_range(pm_all_values, {"auto": True, "floor_zero": True})
@@ -1932,6 +2073,8 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, windo
         "last_timestamp": latest_ts,
         "rows": len(rows_ts),
         "window": window,
+        "window_start": win_start.isoformat().replace("+00:00", "Z"),
+        "window_end": latest_dt.isoformat().replace("+00:00", "Z"),
         "location": {
             "latitude": preview.get("latitude"),
             "longitude": preview.get("longitude"),
@@ -2138,13 +2281,13 @@ def run_watchdog_loop(cfg: dict, access_store: AccessStore, stop_event: threadin
                     contacts = access_store.list_station_user_contacts(instrument_uuid)
                     for c in contacts:
                         token = access_store.create_login_token(c["username"], ttl_minutes=60)
-                        fast_link = f"{cfg['base_url'].rstrip('/')}/fast-login?{urlencode({'token': token})}"
+                        fast_link = compose_external_url(cfg["base_url"], "fast-login", {"token": token})
                         body = (
                             f"Station: {instrument_uuid}\n"
                             f"Anomaly: {alarm}\n"
                             f"Detected at: {now_utc_iso()}\n\n"
                             f"Open anomalies and optionally silence for up to 24h:\n"
-                            f"{cfg['base_url'].rstrip('/')}/anomalies\n\n"
+                            f"{compose_external_url(cfg['base_url'], 'anomalies')}\n\n"
                             f"Fast login link (expires in 60 minutes):\n{fast_link}\n"
                         )
                         send_email(
@@ -2515,7 +2658,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         if station_logo_row:
             station_logo_url = url_for("asset_file", kind="station", name=Path(station_logo_row["logo_path"]).name)
 
-        interval = normalize_interval(request.args.get("interval", "hour"))
+        interval = request_preference_cookie(request, "interval", "station_trend_window", normalize_interval, "hour")
 
         from_date = parse_date_ymd(request.args.get("from_date", ""))
         to_date = parse_date_ymd(request.args.get("to_date", ""))
@@ -2789,7 +2932,10 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 const intervalSel = document.getElementById('intervalSelect');
                 const intervalForm = document.getElementById('intervalForm');
                 if (intervalSel && intervalForm) {
-                  intervalSel.addEventListener('change', () => intervalForm.submit());
+                  intervalSel.addEventListener('change', () => {
+                    document.cookie = `station_trend_window=${encodeURIComponent(intervalSel.value)}; path=/; max-age=31536000; samesite=lax`;
+                    intervalForm.submit();
+                  });
                 }
               </script>
             </body>
@@ -2865,7 +3011,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
         user = current_user()
         can_browse_download = bool(user) and station_is_accessible(user, instrument_uuid)
-        selected_window = normalize_public_window(request.args.get("window", "hour"))
+        selected_window = request_preference_cookie(request, "window", "public_trend_window", normalize_public_window, "hour")
         snapshot = build_public_station_snapshot(storage_root, instrument_uuid, window=selected_window)
         station_logo_row = access_store.get_station_logo(instrument_uuid)
         station_logo_url = None
@@ -2961,6 +3107,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   chartsEl.innerHTML = '';
 
                   const series = (snapshot.series || []).slice(0, 6);
+                  const xMin = snapshot.window_start ? Date.parse(snapshot.window_start) : undefined;
+                  const xMax = snapshot.window_end ? Date.parse(snapshot.window_end) : undefined;
                   series.forEach((s, idx) => {
                     const id = `chart_${s.key}`;
                     const col = document.createElement('div');
@@ -2986,14 +3134,14 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     const datasets = (s.datasets && Array.isArray(s.datasets))
                       ? s.datasets.map((d, j) => ({
                           label: d.label,
-                          data: d.values,
+                          data: d.points || [],
                           borderColor: colors[(idx + j) % colors.length],
                           tension: 0.2,
                           pointRadius: 0
                         }))
                       : [{
                           label: s.label,
-                          data: s.values,
+                          data: s.points || [],
                           borderColor: colors[idx % colors.length],
                           tension: 0.25,
                           pointRadius: 0
@@ -3010,7 +3158,19 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                         maintainAspectRatio: false,
                         plugins: { legend: { display: datasets.length > 1 } },
                         scales: {
-                          x: { ticks: { maxTicksLimit: 5 } },
+                          x: {
+                            type: 'linear',
+                            min: xMin,
+                            max: xMax,
+                            ticks: {
+                              maxTicksLimit: 5,
+                              callback: (value) => {
+                                const d = new Date(value);
+                                if (Number.isNaN(d.getTime())) return '';
+                                return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                              }
+                            }
+                          },
                           y: { beginAtZero: false, min: yMin, max: yMax }
                         }
                       }
@@ -3051,6 +3211,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 if (windowSelect) {
                   windowSelect.addEventListener('change', () => {
                     currentWindow = windowSelect.value;
+                    document.cookie = `public_trend_window=${encodeURIComponent(currentWindow)}; path=/; max-age=31536000; samesite=lax`;
                     const url = new URL(window.location.href);
                     url.searchParams.set('window', currentWindow);
                     window.history.replaceState({}, '', url.toString());
@@ -3128,7 +3289,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     </div>
                     <button class="btn btn-primary w-100" type="submit">Login</button>
                   </form>
-                  <p class="mt-3 mb-1"><a href="{{ url_for('request_account') }}">Request account</a></p>
+                  <p class="mt-3 mb-1"><a href="{{ url_for('forgot_password') }}">Forgot password?</a></p>
+                  <p class="mb-1"><a href="{{ url_for('request_account') }}">Request account</a></p>
                   <p><a href="{{ url_for('index') }}">Home</a></p>
                 </div>
               </div>
@@ -3195,6 +3357,124 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             </body>
             </html>
             """,
+            msg=msg,
+            err=err,
+        )
+
+    @app.route("/forgot-password", methods=["GET", "POST"])
+    def forgot_password():
+        msg = ""
+        err = ""
+        if request.method == "POST":
+            identity = request.form.get("identity", "").strip()
+            user = access_store.find_active_user_by_identity(identity)
+            if user and user.get("email"):
+                token = access_store.create_password_reset_token(user["username"], ttl_minutes=30)
+                link = compose_external_url(cfg["base_url"], url_for("reset_password"), {"token": token})
+                send_email(
+                    cfg,
+                    [user["email"]],
+                    "Sensor Network Collector: password reset",
+                    (
+                        f"Hello {user['username']},\n\n"
+                        f"Use the following link to reset your password. It expires in 30 minutes:\n{link}\n"
+                    ),
+                )
+            msg = "If the account exists and has an email address, a reset link has been sent."
+
+        return render_template_string(
+            """
+            <html>
+            <head>
+              <title>Forgot password</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+              <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+            </head>
+            <body class="container py-5">
+              <div class="row justify-content-center">
+                <div class="col-12 col-md-6 col-lg-4">
+                  <h1 class="h3 mb-3">Forgot password</h1>
+                  {% if msg %}<div class="alert alert-success">{{ msg }}</div>{% endif %}
+                  {% if err %}<div class="alert alert-danger">{{ err }}</div>{% endif %}
+                  <form method="post">
+                    <div class="mb-3">
+                      <label class="form-label">Username or email</label>
+                      <input class="form-control" name="identity">
+                    </div>
+                    <button class="btn btn-primary w-100" type="submit">Send reset link</button>
+                  </form>
+                  <p class="mt-3"><a href="{{ url_for('login') }}">Back to login</a></p>
+                </div>
+              </div>
+            </body>
+            </html>
+            """,
+            msg=msg,
+            err=err,
+        )
+
+    @app.route("/reset-password", methods=["GET", "POST"])
+    def reset_password():
+        token = request.args.get("token", "").strip()
+        user = access_store.get_password_reset_user(token)
+        if user is None:
+            abort(403, "Invalid or expired password reset token")
+
+        msg = ""
+        err = ""
+        if request.method == "POST":
+            p1 = request.form.get("password", "")
+            p2 = request.form.get("password2", "")
+            if not p1 or len(p1) < 8:
+                err = "Password must be at least 8 characters"
+            elif p1 != p2:
+                err = "Passwords do not match"
+            else:
+                consumed_user = access_store.consume_password_reset_token(token)
+                if consumed_user is None:
+                    err = "Invalid or expired password reset token"
+                else:
+                    ok, txt = access_store.change_password(consumed_user["username"], p1)
+                    if ok:
+                        msg = txt
+                    else:
+                        err = txt
+
+        return render_template_string(
+            """
+            <html>
+            <head>
+              <title>Reset password</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+              <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+            </head>
+            <body class="container py-5">
+              <div class="row justify-content-center">
+                <div class="col-12 col-md-6 col-lg-4">
+                  <h1 class="h3 mb-3">Reset password</h1>
+                  <p class="text-muted">Account: {{ user.username }}</p>
+                  {% if msg %}<div class="alert alert-success">{{ msg }}</div>{% endif %}
+                  {% if err %}<div class="alert alert-danger">{{ err }}</div>{% endif %}
+                  {% if not msg %}
+                  <form method="post">
+                    <div class="mb-3">
+                      <label class="form-label">New password</label>
+                      <input class="form-control" type="password" name="password">
+                    </div>
+                    <div class="mb-3">
+                      <label class="form-label">Confirm password</label>
+                      <input class="form-control" type="password" name="password2">
+                    </div>
+                    <button class="btn btn-primary w-100" type="submit">Reset password</button>
+                  </form>
+                  {% endif %}
+                  <p class="mt-3"><a href="{{ url_for('login') }}">Back to login</a></p>
+                </div>
+              </div>
+            </body>
+            </html>
+            """,
+            user=user,
             msg=msg,
             err=err,
         )
@@ -3695,7 +3975,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             abort(400, msg)
         if email.strip():
             token = access_store.create_login_token(username.strip(), ttl_minutes=60)
-            link = f"{cfg['base_url'].rstrip('/')}{url_for('fast_login')}?{urlencode({'token': token})}"
+            link = compose_external_url(cfg["base_url"], url_for("fast_login"), {"token": token})
             send_email(
                 cfg,
                 [email.strip()],
@@ -3715,7 +3995,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         req = next((r for r in access_store.list_account_requests() if int(r["id"]) == int(request_id)), None)
         if req and req.get("email"):
             token = access_store.create_login_token(req["username"], ttl_minutes=60)
-            link = f"{cfg['base_url'].rstrip('/')}{url_for('fast_login')}?{urlencode({'token': token})}"
+            link = compose_external_url(cfg["base_url"], url_for("fast_login"), {"token": token})
             send_email(
                 cfg,
                 [req["email"]],

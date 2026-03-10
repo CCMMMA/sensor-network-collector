@@ -20,6 +20,7 @@ Threaded MQTT collector for weather/sensor networks, aligned with `vantage-publi
   - if `smtpHost` is not configured, emails are skipped
   - if `smtpPort`/`smtpUser`/`smtpPass` are omitted, SMTP defaults to unauthenticated port `25`
 - Admin-enforced password change and user self-service password update
+- Self-service forgot-password and reset-by-email flow
 - Web app logo and per-station logo upload/display
 
 ## Configuration Style (Homogeneous with `vantage-publisher`)
@@ -104,6 +105,7 @@ Components:
   - access-controlled downloads
   - live station trend pages
   - public network dashboard
+  - public station dashboard with selectable trend windows persisted in cookies
   - account emails + fast-login links
   - branding (app logo + station logo)
 
@@ -189,6 +191,29 @@ Context examples:
 python3 -m py_compile main.py
 python3 main.py --config config.json --dry
 ```
+
+## Units and normalization
+
+- CSV storage and InfluxDB keep the raw publisher units as received on MQTT.
+- Signal K output applies protocol-oriented conversions before publish:
+  - temperature -> Kelvin
+  - pressure -> Pa
+  - humidity percent -> ratio
+  - angular values -> radians
+  - rain totals / evapotranspiration totals -> meters
+  - rain rate -> meters per second
+
+See:
+
+- storage units and CSV behavior: [link](docs/storage.md)
+- InfluxDB record behavior: [link](docs/influxdb.md)
+- Signal K conversion rules: [link](docs/signalk.md)
+
+## Web UI notes
+
+- `baseUrl` is used to compose externally visible links in email messages, including fast-login and password-reset URLs.
+- Public station dashboard trend-window choice is remembered in browser cookies.
+- Station dashboard trend interval choice is also remembered in browser cookies.
 
 ## Security notes
 
