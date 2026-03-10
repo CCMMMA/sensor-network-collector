@@ -71,6 +71,9 @@ def send_email(cfg: dict, recipients, subject: str, body_text: str):
     if not cfg.get("smtp_enabled"):
         logger.info("SMTP disabled; skipped email subject=%s recipients=%d", subject, len(recipients))
         return False
+    if not str(cfg.get("smtp_host", "") or "").strip():
+        logger.info("SMTP host not configured; skipped email subject=%s recipients=%d", subject, len(recipients))
+        return False
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -80,7 +83,7 @@ def send_email(cfg: dict, recipients, subject: str, body_text: str):
 
     try:
         smtp_host = cfg.get("smtp_host", "")
-        smtp_port = int(cfg.get("smtp_port", 587))
+        smtp_port = int(cfg.get("smtp_port", 25))
         with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as smtp:
             if cfg.get("smtp_use_tls", True):
                 smtp.starttls()
@@ -231,6 +234,19 @@ def load_config(path: str, args) -> dict:
     if enable_storage and not storage_root:
         raise RuntimeError("Storage is enabled but pathStorage/storage_root is not configured")
 
+    smtp_port_raw = cfg_value(raw, ["smtpPort"], env_name="SMTP_PORT", default=None)
+    smtp_user_raw = cfg_value(raw, ["smtpUser"], env_name="SMTP_USER", default=None)
+    smtp_pass_raw = cfg_value(raw, ["smtpPass"], env_name="SMTP_PASS", default=None)
+    smtp_use_tls_raw = cfg_value(raw, ["smtpUseTls"], env_name="SMTP_USE_TLS", default=None)
+
+    smtp_user = str(smtp_user_raw or "")
+    smtp_pass = str(smtp_pass_raw or "")
+    smtp_port = int(smtp_port_raw) if smtp_port_raw not in (None, "") else 25
+    if smtp_use_tls_raw is None:
+        smtp_use_tls = not (smtp_port == 25 and not smtp_user)
+    else:
+        smtp_use_tls = parse_boolish(smtp_use_tls_raw, True)
+
     cfg = {
         "log_level": log_level,
         "mqtt_broker": mqtt_broker,
@@ -296,11 +312,11 @@ def load_config(path: str, args) -> dict:
         "base_url": str(cfg_value(raw, ["baseUrl"], env_name="BASE_URL", default="") or "").strip(),
         "smtp_enabled": parse_boolish(cfg_value(raw, ["smtpEnabled"], env_name="SMTP_ENABLED", default=False), False),
         "smtp_host": str(cfg_value(raw, ["smtpHost"], env_name="SMTP_HOST", default="") or "").strip(),
-        "smtp_port": int(cfg_value(raw, ["smtpPort"], env_name="SMTP_PORT", default=587)),
-        "smtp_user": str(cfg_value(raw, ["smtpUser"], env_name="SMTP_USER", default="") or ""),
-        "smtp_pass": str(cfg_value(raw, ["smtpPass"], env_name="SMTP_PASS", default="") or ""),
+        "smtp_port": smtp_port,
+        "smtp_user": smtp_user,
+        "smtp_pass": smtp_pass,
         "smtp_from": str(cfg_value(raw, ["smtpFrom"], env_name="SMTP_FROM", default="") or "").strip(),
-        "smtp_use_tls": parse_boolish(cfg_value(raw, ["smtpUseTls"], env_name="SMTP_USE_TLS", default=True), True),
+        "smtp_use_tls": smtp_use_tls,
         "watchdog_interval_sec": int(
             cfg_value(raw, ["watchdogIntervalSec"], env_name="WATCHDOG_INTERVAL_SEC", default=60)
         ),
@@ -354,8 +370,8 @@ def load_config(path: str, args) -> dict:
     if not cfg["enable_influx"] and not cfg["enable_signalk"] and not cfg["enable_storage"]:
         raise RuntimeError("No outputs enabled: enable at least one of influxdb, signalk, storage")
 
-    if cfg["smtp_enabled"] and (not cfg["smtp_host"] or not cfg["smtp_from"]):
-        raise RuntimeError("SMTP enabled but smtpHost or smtpFrom is missing")
+    if cfg["smtp_enabled"] and not cfg["smtp_from"]:
+        raise RuntimeError("SMTP enabled but smtpFrom is missing")
 
     if not cfg["base_url"]:
         cfg["base_url"] = f"http://{cfg['http_host']}:{cfg['http_port']}"
@@ -398,7 +414,7 @@ def sanitize_signalk_key(key: str) -> str:
 
 
 def topic_to_context(topic: str, prefix: str) -> str:
-    parts = [sanitize_signalk_key(p) for p in str(topic).split("/") if p]
+    parts = [sanitize_signalk_key(p.replace(".", "_")) for p in str(topic).split("/") if p]
     suffix = ".".join(parts) if parts else "unknown"
     head = str(prefix or "meteo").strip(".")
     return f"{head}.{suffix}" if head else suffix
