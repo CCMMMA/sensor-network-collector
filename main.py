@@ -3019,6 +3019,10 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 }
 
                 function applySnapshot(snapshot) {
+                  currentWindow = snapshot.window || currentWindow;
+                  if (windowSelect && windowSelect.value !== currentWindow) {
+                    windowSelect.value = currentWindow;
+                  }
                   document.getElementById('stationTitle').textContent = `${snapshot.station_name} (${snapshot.instrument_uuid})`;
                   document.getElementById('lastUpdate').textContent = snapshot.last_timestamp || '-';
                   renderCards(snapshot);
@@ -3047,6 +3051,9 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 if (windowSelect) {
                   windowSelect.addEventListener('change', () => {
                     currentWindow = windowSelect.value;
+                    const url = new URL(window.location.href);
+                    url.searchParams.set('window', currentWindow);
+                    window.history.replaceState({}, '', url.toString());
                     pollSnapshot(true);
                   });
                 }
