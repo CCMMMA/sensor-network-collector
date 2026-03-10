@@ -76,13 +76,13 @@ python3 main.py --config config.json --dry
 
 Detailed documentation has been split into dedicated pages:
 
-- Docker deployment: [docs/docker.md](/Users/raffaelemontella/Documents/New project 2/sensor-network-collector.old/docs/docker.md)
-- Production WSGI setup: [docs/wsgi.md](/Users/raffaelemontella/Documents/New project 2/sensor-network-collector.old/docs/wsgi.md)
-- Configuration reference: [docs/configuration.md](/Users/raffaelemontella/Documents/New project 2/sensor-network-collector.old/docs/configuration.md)
-- Signal K forwarding: [docs/signalk.md](/Users/raffaelemontella/Documents/New project 2/sensor-network-collector.old/docs/signalk.md)
-- CSV storage: [docs/storage.md](/Users/raffaelemontella/Documents/New project 2/sensor-network-collector.old/docs/storage.md)
-- Web GUI and policies: [docs/webgui.md](/Users/raffaelemontella/Documents/New project 2/sensor-network-collector.old/docs/webgui.md)
-- InfluxDB sink: [docs/influxdb.md](/Users/raffaelemontella/Documents/New project 2/sensor-network-collector.old/docs/influxdb.md)
+- Docker deployment: [link](docs/docker.md)
+- Production WSGI setup: [link](docs/wsgi.md)
+- Configuration reference: [link](docs/configuration.md)
+- Signal K forwarding: [link](docs/signalk.md)
+- CSV storage: [link](docs/storage.md)
+- Web GUI and policies: [](docs/webgui.md)
+- InfluxDB sink: [link](docs/influxdb.md)
 
 ## Architecture
 
