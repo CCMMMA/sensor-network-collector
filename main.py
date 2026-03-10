@@ -3131,21 +3131,29 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
                     const yMin = (s.y_min !== null && s.y_min !== undefined) ? s.y_min : undefined;
                     const yMax = (s.y_max !== null && s.y_max !== undefined) ? s.y_max : undefined;
+                    const styleDataset = (dataset, color) => {
+                      const pointCount = Array.isArray(dataset.data) ? dataset.data.length : 0;
+                      const sparse = pointCount <= 2;
+                      return {
+                        ...dataset,
+                        borderColor: color,
+                        borderWidth: 2,
+                        tension: sparse ? 0 : 0.25,
+                        spanGaps: true,
+                        showLine: pointCount > 1,
+                        pointRadius: sparse ? 3 : 0,
+                        pointHoverRadius: sparse ? 4 : 0
+                      };
+                    };
                     const datasets = (s.datasets && Array.isArray(s.datasets))
-                      ? s.datasets.map((d, j) => ({
+                      ? s.datasets.map((d, j) => styleDataset({
                           label: d.label,
-                          data: d.points || [],
-                          borderColor: colors[(idx + j) % colors.length],
-                          tension: 0.2,
-                          pointRadius: 0
-                        }))
-                      : [{
+                          data: d.points || []
+                        }, colors[(idx + j) % colors.length]))
+                      : [styleDataset({
                           label: s.label,
-                          data: s.points || [],
-                          borderColor: colors[idx % colors.length],
-                          tension: 0.25,
-                          pointRadius: 0
-                        }];
+                          data: s.points || []
+                        }, colors[idx % colors.length])];
 
                     chartInstances[s.key] = new Chart(canvas, {
                       type: 'line',
