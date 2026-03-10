@@ -81,7 +81,7 @@ Detailed documentation has been split into dedicated pages:
 - Configuration reference: [link](docs/configuration.md)
 - Signal K forwarding: [link](docs/signalk.md)
 - CSV storage: [link](docs/storage.md)
-- Web GUI and policies: [](docs/webgui.md)
+- Web GUI and policies: [link](docs/webgui.md)
 - InfluxDB sink: [link](docs/influxdb.md)
 
 ## Architecture
