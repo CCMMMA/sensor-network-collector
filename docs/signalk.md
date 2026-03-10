@@ -10,7 +10,7 @@
 `context` is derived from MQTT topic:
 
 ```text
-<contextPrefix>.<topic with '/' replaced by '.'>
+<contextPrefix>.<topic segments joined with '.', with '.' inside each segment converted to '_'>
 ```
 
 Example:
@@ -18,6 +18,12 @@ Example:
 - topic `it/uniparthenope/meteo/ws1`
 - prefix `meteo`
 - context `meteo.it.uniparthenope.meteo.ws1`
+
+If topic is flat MQTT with dots inside a single segment:
+
+- topic `it.uniparthenope.meteo.ws1`
+- prefix `meteo`
+- context `meteo.it_uniparthenope_meteo_ws1`
 
 ## Path mapping
 
@@ -42,6 +48,16 @@ Example:
 ```
 
 If `meta` is present it is sent as Signal K metadata delta for that path.
+
+The collector also emits payload `name` as Signal K value path `name` inside the computed context.
+
+Example:
+
+```text
+context: meteo.it_uniparthenope_meteo_ws1
+path: name
+full Signal K address: meteo.it_uniparthenope_meteo_ws1.name
+```
 
 ## Unit conversion rules
 

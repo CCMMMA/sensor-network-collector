@@ -17,6 +17,8 @@ Threaded MQTT collector for weather/sensor networks, aligned with `vantage-publi
 - Public sensor network dashboard with auto-updating status and alarms
 - Watchdog anomaly detection with persisted anomaly log (SQLite)
 - SMTP notifications (welcome, registration, alarms with fast-login link)
+  - if `smtpHost` is not configured, emails are skipped
+  - if `smtpPort`/`smtpUser`/`smtpPass` are omitted, SMTP defaults to unauthenticated port `25`
 - Admin-enforced password change and user self-service password update
 - Web app logo and per-station logo upload/display
 
@@ -177,8 +179,9 @@ python3 main.py --config config.json
 
 Context examples:
 
-- topic `it.uniparthenope.meteo.ws1` -> `meteo.it.uniparthenope.meteo.ws1`
+- topic `it.uniparthenope.meteo.ws1` -> `meteo.it_uniparthenope_meteo_ws1`
 - topic `it/uniparthenope/meteo/ws2` -> `meteo.it.uniparthenope.meteo.ws2`
+- if payload contains `name`, it is also sent to Signal K as path `name` inside the computed context
 
 ## Validation
 

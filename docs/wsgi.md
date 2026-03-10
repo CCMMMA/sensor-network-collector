@@ -39,6 +39,12 @@ Required keys:
 - `adminPassword`
 - `baseUrl` (must match public URL for email fast-login links)
 
+Optional but commonly relevant:
+
+- `webAppLogo`
+- `smtpHost` / `smtpFrom` for account and alarm emails
+- if `smtpHost` is omitted, email features remain inactive
+
 ## Run Gunicorn
 
 ```bash

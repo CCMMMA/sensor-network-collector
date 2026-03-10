@@ -66,6 +66,7 @@ With `--dry`, Influx writes are logged but not sent.
 
 - verify token/org/bucket
 - verify URL reachability from runtime environment
+- note: SMTP fallback settings are unrelated to InfluxDB; email config can be absent without affecting Influx writes
 
 ### 422 type conflicts
 

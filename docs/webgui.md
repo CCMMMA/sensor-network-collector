@@ -47,6 +47,11 @@ With SMTP enabled:
 - approval email when request is approved
 - anomaly warning emails to admins and station-related users
 
+SMTP fallback behavior:
+
+- if `smtpHost` is missing, emails are skipped
+- if `smtpPort`, `smtpUser`, and `smtpPass` are omitted, the app uses unauthenticated SMTP on port `25`
+
 ## Password management
 
 - admin can force user password change
@@ -64,6 +69,17 @@ With SMTP enabled:
 - `webAppLogo` sets global app logo
 - station users can upload per-station logo from station page
 - public station page shows app logo + station logo together
+- public station dashboard trend charts update in-place without full page reload
+- public station dashboard trend window can be selected as:
+  - last minute
+  - 10 minutes
+  - hour
+  - 3 hours
+  - 6 hours
+  - 12 hours
+  - 24 hours
+  - 72 hours
+  - one week
 
 ## Admin dashboard behavior
 

@@ -47,6 +47,7 @@ python3 main.py --config config.json --storage false
 - scalar values (`bool`, `int`, `float`, `str`) stored directly
 - nested objects/arrays serialized as JSON strings
 - `timestamp`, `topic`, `uuid` and flattened fields are included
+- `name` is stored in CSV when present and is also reused by the web GUI and Signal K forwarding
 
 ## Operational recommendations
 

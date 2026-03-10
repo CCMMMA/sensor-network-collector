@@ -649,6 +649,10 @@ def build_signalk_delta(topic: str, data: dict, tags: dict, dt: datetime, cfg: d
             }
         )
 
+    station_name = data.get("name")
+    if isinstance(station_name, str) and station_name.strip():
+        values.append({"path": "name", "value": station_name.strip()})
+
     for key, raw in data.items():
         if key in (
             "position",

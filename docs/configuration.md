@@ -101,6 +101,21 @@ Example:
 }
 ```
 
+Context rule:
+
+- MQTT topic is split on `/`
+- inside each segment, `.` is converted to `_`
+- segments are then joined with `.`
+- payload `name` is emitted as Signal K path `name`
+
+Example:
+
+```text
+topic: it.uniparthenope.meteo.ws1
+context: meteo.it_uniparthenope_meteo_ws1
+name path: meteo.it_uniparthenope_meteo_ws1.name
+```
+
 ### Web GUI and security
 
 - `httpEnabled`, `httpHost`, `httpPort`
@@ -134,7 +149,25 @@ Example:
 - `smtpFrom`
 - `smtpUseTls`
 
+Behavior:
+
+- if `smtpHost` is not set, the application does not try to send emails
+- if `smtpPort`, `smtpUser`, and `smtpPass` are omitted, SMTP defaults to unauthenticated port `25`
+- if `smtpUser` is set, SMTP login is attempted
+- `smtpUseTls` can still explicitly force TLS behavior; default logic follows the port/auth fallback
+
 Example:
+
+```json
+{
+  "smtpEnabled": true,
+  "smtpHost": "smtp.mailprovider.net",
+  "smtpFrom": "noreply@example.org",
+  "smtpPort": 25
+}
+```
+
+Authenticated SMTP example:
 
 ```json
 {
