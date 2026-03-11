@@ -3077,6 +3077,73 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 const chartInstances = {};
                 const windowSelect = document.getElementById('windowSelect');
                 const colors = ['#0d6efd', '#20c997', '#fd7e14', '#6f42c1', '#dc3545', '#198754', '#6c757d'];
+                const SECOND_MS = 1000;
+                const MINUTE_MS = 60 * SECOND_MS;
+                const HOUR_MS = 60 * MINUTE_MS;
+
+                function normalizeChartPoints(points) {
+                  return (points || [])
+                    .map((p) => {
+                      const x = Date.parse(p.x);
+                      const y = Number(p.y);
+                      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+                      return { x, y };
+                    })
+                    .filter(Boolean);
+                }
+
+                function ceilToStep(ts, stepMs) {
+                  if (!Number.isFinite(ts) || !stepMs) return ts;
+                  return Math.ceil(ts / stepMs) * stepMs;
+                }
+
+                function appendSteppedTicks(ticks, startMs, endMs, stepMs) {
+                  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || !stepMs || endMs < startMs) return;
+                  for (let tick = ceilToStep(startMs, stepMs); tick <= endMs; tick += stepMs) {
+                    ticks.push(tick);
+                  }
+                }
+
+                function buildWindowTicks(windowCode, xMin, xMax) {
+                  if (!Number.isFinite(xMin) || !Number.isFinite(xMax) || xMax <= xMin) return [];
+                  const ticks = [xMin];
+                  if (windowCode === '1m') {
+                    appendSteppedTicks(ticks, xMin, xMax, 10 * SECOND_MS);
+                  } else if (windowCode === '10m') {
+                    appendSteppedTicks(ticks, xMin, xMax, 1 * MINUTE_MS);
+                  } else if (windowCode === 'hour') {
+                    appendSteppedTicks(ticks, xMin, xMax, 10 * MINUTE_MS);
+                  } else if (windowCode === '3h') {
+                    appendSteppedTicks(ticks, xMin, xMax, 15 * MINUTE_MS);
+                  } else if (windowCode === '6h') {
+                    appendSteppedTicks(ticks, xMin, xMax, 30 * MINUTE_MS);
+                  } else if (windowCode === '12h') {
+                    appendSteppedTicks(ticks, xMin, xMax, 1 * HOUR_MS);
+                  } else if (windowCode === '24h') {
+                    appendSteppedTicks(ticks, xMin, xMax - HOUR_MS, 3 * HOUR_MS);
+                    appendSteppedTicks(ticks, Math.max(xMin, xMax - HOUR_MS), xMax, 15 * MINUTE_MS);
+                  } else if (windowCode === '72h') {
+                    appendSteppedTicks(ticks, xMin, xMax - 3 * HOUR_MS, 6 * HOUR_MS);
+                    appendSteppedTicks(ticks, Math.max(xMin, xMax - 3 * HOUR_MS), xMax - HOUR_MS, 1 * HOUR_MS);
+                    appendSteppedTicks(ticks, Math.max(xMin, xMax - HOUR_MS), xMax, 15 * MINUTE_MS);
+                  } else {
+                    appendSteppedTicks(ticks, xMin, xMax, 1 * HOUR_MS);
+                  }
+                  ticks.push(xMax);
+                  return [...new Set(ticks.map((v) => Math.round(v)))].sort((a, b) => a - b);
+                }
+
+                function formatWindowTick(value, windowCode) {
+                  const d = new Date(value);
+                  if (Number.isNaN(d.getTime())) return '';
+                  if (windowCode === '1m') {
+                    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                  }
+                  if (windowCode === '72h') {
+                    return d.toLocaleString([], { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+                  }
+                  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                }
 
                 function cardHtml(card) {
                   const value = (card.value === null || card.value === undefined) ? '--' : card.value;
@@ -3109,6 +3176,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   const series = (snapshot.series || []).slice(0, 6);
                   const xMin = snapshot.window_start ? Date.parse(snapshot.window_start) : undefined;
                   const xMax = snapshot.window_end ? Date.parse(snapshot.window_end) : undefined;
+                  const customTicks = buildWindowTicks(snapshot.window || currentWindow, xMin, xMax);
                   series.forEach((s, idx) => {
                     const id = `chart_${s.key}`;
                     const col = document.createElement('div');
@@ -3148,11 +3216,11 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     const datasets = (s.datasets && Array.isArray(s.datasets))
                       ? s.datasets.map((d, j) => styleDataset({
                           label: d.label,
-                          data: d.points || []
+                          data: normalizeChartPoints(d.points)
                         }, colors[(idx + j) % colors.length]))
                       : [styleDataset({
                           label: s.label,
-                          data: s.points || []
+                          data: normalizeChartPoints(s.points)
                         }, colors[idx % colors.length])];
 
                     chartInstances[s.key] = new Chart(canvas, {
@@ -3173,12 +3241,12 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                             type: 'linear',
                             min: xMin,
                             max: xMax,
+                            afterBuildTicks: (axis) => {
+                              axis.ticks = customTicks.map((tick) => ({ value: tick }));
+                            },
                             ticks: {
-                              maxTicksLimit: 5,
                               callback: (value) => {
-                                const d = new Date(value);
-                                if (Number.isNaN(d.getTime())) return '';
-                                return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                                return formatWindowTick(value, snapshot.window || currentWindow);
                               }
                             }
                           },
