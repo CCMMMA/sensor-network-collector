@@ -99,6 +99,25 @@ If `signalkToken` is empty or invalid:
 - `signalkSourceLabel`
 - `signalkPathMap`
 
+## Operational note: path changes
+
+If you change `signalkPathMap` paths, the Signal K server may continue to expose old paths that were written previously.
+
+Typical example:
+
+- old mapping: `environment.outside.humidity`
+- new mapping: `environment.outside.relativeHumidity`
+
+After updating the collector config:
+
+1. restart the collector
+2. restart the Signal K server
+3. verify the API model only updates the new paths
+
+If old paths still remain visible after restart, clear the persisted Signal K model/state on the server side and let the collector republish fresh data.
+
+Changing the collector mapping stops future writes to old paths, but it does not delete stale values already stored by the Signal K server.
+
 ## CLI override
 
 ```bash
