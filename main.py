@@ -1435,7 +1435,16 @@ def collect_instruments(storage_root: str):
     root = Path(storage_root)
     if not root.exists() or not root.is_dir():
         return []
-    return sorted([p.name for p in root.iterdir() if p.is_dir()])
+    instruments = []
+    for p in root.iterdir():
+        if not p.is_dir():
+            continue
+        if p.name.startswith("_") or p.name.startswith("."):
+            continue
+        if next(p.rglob("*.csv"), None) is None:
+            continue
+        instruments.append(p.name)
+    return sorted(instruments)
 
 
 def parse_date_ymd(value: str):
@@ -1869,6 +1878,13 @@ PUBLIC_SERIES_SPECS = [
         "axis": {"auto": True},
     },
     {
+        "key": "humidity",
+        "label": "Humidity Trend",
+        "aliases": ["HumOut", "humidity", "hum"],
+        "unit": "%",
+        "axis": {"min": 0, "max": 100},
+    },
+    {
         "key": "pressure",
         "label": "Pressure Trend",
         "aliases": ["Barometer", "pressure", "bar"],
@@ -1881,6 +1897,13 @@ PUBLIC_SERIES_SPECS = [
         "aliases": ["WindSpeed", "wind_speed"],
         "unit": "m/s",
         "axis": {"auto": True, "floor_zero": True},
+    },
+    {
+        "key": "wind_direction",
+        "label": "Wind Direction Trend",
+        "aliases": ["WindDir", "wind_dir"],
+        "unit": "deg",
+        "axis": {"min": 0, "max": 360},
     },
     {
         "key": "rain_rate",
@@ -1945,9 +1968,103 @@ def _calc_axis_range(values, axis_spec=None):
     return round(lo, 3), round(hi, 3)
 
 
-def build_public_station_snapshot(storage_root: str, instrument_uuid: str, window: str = "hour", max_points: int = 240):
+def _influx_range_start_for_window(window: str):
     window = normalize_public_window(window)
-    rows = load_station_rows(storage_root, instrument_uuid, limit=2000)
+    if window == "1m":
+        return "-10m"
+    if window == "10m":
+        return "-2h"
+    if window == "hour":
+        return "-12h"
+    if window == "3h":
+        return "-24h"
+    if window == "6h":
+        return "-48h"
+    if window == "12h":
+        return "-72h"
+    if window == "24h":
+        return "-7d"
+    if window == "72h":
+        return "-14d"
+    if window == "week":
+        return "-21d"
+    return "-14d"
+
+
+def _query_influx_station_rows(cfg: dict, instrument_uuid: str, window: str, max_points: int = 1200):
+    if not cfg or not cfg.get("enable_influx"):
+        return []
+    influx_client = runtime.get("influx_client")
+    if influx_client is None:
+        return []
+
+    range_start = _influx_range_start_for_window(window)
+    query = f"""
+from(bucket: {json.dumps(cfg["influxdb_bucket"])})
+  |> range(start: {range_start})
+  |> filter(fn: (r) => r._measurement == {json.dumps(cfg["influx_measurement"])} and r.uuid == {json.dumps(instrument_uuid)})
+  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> sort(columns: ["_time"])
+  |> limit(n: {int(max_points)})
+"""
+    try:
+        tables = influx_client.query_api().query(query=query, org=cfg["influxdb_org"])
+    except Exception as e:
+        logger.warning("Influx query failed for public dashboard station=%s: %s", instrument_uuid, e)
+        return []
+
+    out = []
+    for table in tables:
+        for record in table.records:
+            values = dict(record.values or {})
+            ts = values.get("_time")
+            if isinstance(ts, datetime):
+                ts_iso = ts.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            else:
+                ts_iso = str(ts or "")
+            row = {"timestamp": ts_iso, "uuid": instrument_uuid}
+            for key, value in values.items():
+                if key.startswith("_") or key in ("result", "table"):
+                    continue
+                row[key] = value
+            out.append(row)
+    out.sort(key=lambda row: row.get("timestamp", ""))
+    return out
+
+
+def _merge_station_rows(*row_sets):
+    merged = {}
+    for rows in row_sets:
+        for row in rows or []:
+            ts = str(row.get("timestamp") or "").strip()
+            if not ts:
+                continue
+            if ts not in merged:
+                merged[ts] = dict(row)
+            else:
+                combined = dict(row)
+                combined.update({k: v for k, v in merged[ts].items() if v is not None and v != ""})
+                merged[ts] = combined
+    return [merged[k] for k in sorted(merged.keys())]
+
+
+def _aqi_status(value):
+    v = _to_float(value)
+    if v is None:
+        return None
+    if v <= 50:
+        return {"level": "good", "label": "Good conditions", "color": "#198754"}
+    if v <= 100:
+        return {"level": "warning", "label": "Warning conditions", "color": "#ffc107"}
+    return {"level": "bad", "label": "Bad conditions", "color": "#dc3545"}
+
+
+def build_public_station_snapshot(storage_root: str, instrument_uuid: str, window: str = "hour", max_points: int = 240, cfg: dict = None):
+    window = normalize_public_window(window)
+    cfg = cfg or runtime.get("config") or {}
+    storage_rows = load_station_rows(storage_root, instrument_uuid, limit=2000)
+    influx_rows = _query_influx_station_rows(cfg, instrument_uuid, window, max_points=max(600, max_points * 4))
+    rows = _merge_station_rows(influx_rows, storage_rows)
     preview = get_station_preview(storage_root, instrument_uuid)
 
     if not rows:
@@ -1964,6 +2081,7 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, windo
             },
             "cards": [],
             "series": [],
+            "aqi_status": None,
             "window": window,
         }
 
@@ -1995,6 +2113,8 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, windo
                 "unit": spec["unit"],
             }
         )
+
+    aqi_status = _aqi_status(_first_numeric_for_aliases(latest_row, ["aqi_val", "AQI", "CurrentAQI", "aqi"]))
 
     series = []
     for spec in PUBLIC_SERIES_SPECS:
@@ -2081,6 +2201,7 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, windo
         },
         "cards": cards,
         "series": series,
+        "aqi_status": aqi_status,
     }
 
 
@@ -3012,7 +3133,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         user = current_user()
         can_browse_download = bool(user) and station_is_accessible(user, instrument_uuid)
         selected_window = request_preference_cookie(request, "window", "public_trend_window", normalize_public_window, "hour")
-        snapshot = build_public_station_snapshot(storage_root, instrument_uuid, window=selected_window)
+        snapshot = build_public_station_snapshot(storage_root, instrument_uuid, window=selected_window, cfg=cfg)
         station_logo_row = access_store.get_station_logo(instrument_uuid)
         station_logo_url = None
         if station_logo_row:
@@ -3035,6 +3156,15 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 #chartsWrap { flex: 1 1 auto; min-height: 0; overflow: visible; }
                 .chart-card { height: 170px; }
                 .chart-card canvas { height: 112px !important; }
+                .aqi-card { min-height: 94px; }
+                .aqi-stack { display: flex; gap: .45rem; align-items: center; }
+                .aqi-lights { display: flex; flex-direction: column-reverse; gap: .35rem; }
+                .aqi-light { width: 16px; height: 16px; border-radius: 50%; background: #d9d9d9; border: 1px solid rgba(0,0,0,.15); opacity: .35; }
+                .aqi-light.active { opacity: 1; box-shadow: 0 0 0 2px rgba(0,0,0,.05); }
+                .aqi-light.good.active { background: #198754; }
+                .aqi-light.warning.active { background: #ffc107; }
+                .aqi-light.bad.active { background: #dc3545; }
+                .aqi-status-value { font-size: 1.4rem; line-height: 1; font-weight: 700; }
               </style>
             </head>
             <body class="bg-light">
@@ -3066,6 +3196,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
               </div>
 
               <div id="cards" class="row g-1 mb-1"></div>
+              <div id="aqiStatus" class="row g-1 mb-1"></div>
               <div id="chartsWrap">
                 <div id="charts" class="row g-1"></div>
               </div>
@@ -3149,7 +3280,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   const value = (card.value === null || card.value === undefined) ? '--' : card.value;
                   const unit = card.unit || '';
                   return `
-                    <div class="col-6 col-md-2 col-xl-2">
+                    <div class="col-6 col-md-4 col-xl-2">
                       <div class="card h-100 shadow-sm">
                         <div class="card-body">
                           <div class="text-muted metric-label">${card.label}</div>
@@ -3160,9 +3291,42 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   `;
                 }
 
+                function renderAqiStatus(snapshot) {
+                  const el = document.getElementById('aqiStatus');
+                  const status = snapshot.aqi_status;
+                  if (!el) return;
+                  if (!status) {
+                    el.innerHTML = '';
+                    return;
+                  }
+                  const valueCard = (snapshot.cards || []).find((c) => c.key === 'aqi_current');
+                  const value = valueCard && valueCard.value !== null && valueCard.value !== undefined ? valueCard.value : '--';
+                  el.innerHTML = `
+                    <div class="col-12 col-md-6 col-xl-3">
+                      <div class="card shadow-sm aqi-card">
+                        <div class="card-body">
+                          <div class="text-muted metric-label">Air Quality Status</div>
+                          <div class="aqi-stack">
+                            <div class="aqi-lights">
+                              <span class="aqi-light good ${status.level === 'good' ? 'active' : ''}"></span>
+                              <span class="aqi-light warning ${status.level === 'warning' ? 'active' : ''}"></span>
+                              <span class="aqi-light bad ${status.level === 'bad' ? 'active' : ''}"></span>
+                            </div>
+                            <div>
+                              <div class="aqi-status-value">${value}</div>
+                              <div class="fw-semibold">${status.label}</div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  `;
+                }
+
                 function renderCards(snapshot) {
                   const cardsEl = document.getElementById('cards');
                   cardsEl.innerHTML = (snapshot.cards || []).filter(c => c.value !== null && c.value !== undefined).map(cardHtml).join('');
+                  renderAqiStatus(snapshot);
                 }
 
                 function renderSeries(snapshot) {
@@ -3173,7 +3337,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   const chartsEl = document.getElementById('charts');
                   chartsEl.innerHTML = '';
 
-                  const series = (snapshot.series || []).slice(0, 6);
+                  const series = snapshot.series || [];
                   const xMin = snapshot.window_start ? Date.parse(snapshot.window_start) : undefined;
                   const xMax = snapshot.window_end ? Date.parse(snapshot.window_end) : undefined;
                   const customTicks = buildWindowTicks(snapshot.window || currentWindow, xMin, xMax);
@@ -3319,7 +3483,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             abort(404, "Station not found")
 
         window = normalize_public_window(request.args.get("window", "hour"))
-        snapshot = build_public_station_snapshot(storage_root, instrument_uuid, window=window)
+        snapshot = build_public_station_snapshot(storage_root, instrument_uuid, window=window, cfg=cfg)
         since = request.args.get("since", "")
         force = parse_boolish(request.args.get("force", "0"), False)
         changed = bool(snapshot.get("last_timestamp")) and snapshot.get("last_timestamp") != since
