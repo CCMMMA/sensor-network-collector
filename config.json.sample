@@ -45,7 +45,7 @@
       }
     },
     "HumIn": {
-      "path": "environment.inside.humidity",
+      "path": "environment.inside.relativeHumidity",
       "meta": {
         "displayName": "Inside Humidity",
         "units": "ratio",
@@ -85,7 +85,7 @@
       }
     },
     "HumOut": {
-      "path": "environment.outside.humidity",
+      "path": "environment.outside.relativeHumidity",
       "meta": {
         "displayName": "Outside Humidity",
         "units": "ratio",
@@ -93,7 +93,7 @@
       }
     },
     "RainRate": {
-      "path": "environment.rain.rate",
+      "path": "environment.precipitation.rate",
       "meta": {
         "displayName": "Rain Rate",
         "units": "m/s",

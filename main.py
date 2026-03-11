@@ -449,7 +449,7 @@ def convert_signalk_value(key: str, path: str, value):
 
     # Rain/ET quantities in Signal K are meters or meters/second.
     if any(token in key_l for token in ("rainday", "rainmonth", "rainyear", "rainstorm", "etday", "etmonth", "etyear")):
-        return v / 1000.0 if abs(v) > 1.0 else v
+        return v / 1000.0 if abs(v) >= 1.0 else v
     if "rainrate" in key_l:
         return (v / 1000.0) / 3600.0 if abs(v) > 0.01 else v
     if "precipitation" in path_l and "rate" in path_l:
