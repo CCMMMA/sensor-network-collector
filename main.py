@@ -1991,7 +1991,7 @@ def _influx_range_start_for_window(window: str):
     return "-14d"
 
 
-def _query_influx_station_rows(cfg: dict, instrument_uuid: str, window: str, max_points: int = 1200):
+def _query_influx_station_rows(cfg: dict, instrument_uuid: str, window: str):
     if not cfg or not cfg.get("enable_influx"):
         return []
     influx_client = runtime.get("influx_client")
@@ -2004,8 +2004,6 @@ from(bucket: {json.dumps(cfg["influxdb_bucket"])})
   |> range(start: {range_start})
   |> filter(fn: (r) => r._measurement == {json.dumps(cfg["influx_measurement"])} and r.uuid == {json.dumps(instrument_uuid)})
   |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-  |> sort(columns: ["_time"], desc: true)
-  |> limit(n: {int(max_points)})
   |> sort(columns: ["_time"])
 """
     try:
@@ -2031,6 +2029,16 @@ from(bucket: {json.dumps(cfg["influxdb_bucket"])})
             out.append(row)
     out.sort(key=lambda row: row.get("timestamp", ""))
     return out
+
+
+def _decimate_timeseries(rows_ts, max_points: int):
+    if not max_points or len(rows_ts) <= max_points:
+        return rows_ts
+    step = max(1, math.ceil(len(rows_ts) / max_points))
+    sampled = rows_ts[::step]
+    if sampled and sampled[-1] != rows_ts[-1]:
+        sampled.append(rows_ts[-1])
+    return sampled
 
 
 def _merge_station_rows(*row_sets):
@@ -2073,7 +2081,7 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, windo
         to_date=latest_hint.date(),
         limit=None,
     )
-    influx_rows = _query_influx_station_rows(cfg, instrument_uuid, window, max_points=max(600, max_points * 4))
+    influx_rows = _query_influx_station_rows(cfg, instrument_uuid, window)
     rows = _merge_station_rows(influx_rows, storage_rows)
 
     if not rows:
@@ -2108,8 +2116,7 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, windo
 
     win_start = interval_start(latest_dt, window)
     rows_ts = [(ts, row) for ts, row in rows_ts_all if ts >= win_start]
-    if max_points and len(rows_ts) > max_points:
-        rows_ts = rows_ts[-max_points:]
+    rows_ts = _decimate_timeseries(rows_ts, max_points)
 
     cards = []
     for spec in PUBLIC_METRIC_SPECS:
