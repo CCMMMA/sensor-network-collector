@@ -3521,37 +3521,56 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   border: 2px solid rgba(13,110,253,.18);
                   box-shadow: 0 1rem 3rem rgba(0,0,0,.25);
                 }
-                .chart-card.fullscreen canvas { height: calc(100vh - 270px) !important; }
+                .chart-card.fullscreen canvas { height: calc(100vh - 330px) !important; }
                 .chart-card .fullscreen-branding { display: none; }
                 .chart-card.fullscreen .fullscreen-branding {
-                  display: flex;
+                  display: grid;
+                  grid-template-columns: minmax(90px, 140px) 1fr minmax(90px, 140px);
                   align-items: center;
-                  justify-content: space-between;
                   gap: .75rem;
                   margin-bottom: .5rem;
                 }
                 .fullscreen-branding-logos { display: flex; align-items: center; gap: .5rem; }
-                .fullscreen-branding img { max-height: 38px; }
-                .fullscreen-station-name { font-weight: 700; font-size: 1rem; }
+                .fullscreen-branding-logo-left { justify-content: flex-start; }
+                .fullscreen-branding-logo-right { justify-content: flex-end; }
+                .fullscreen-branding img { max-height: 38px; max-width: 100%; object-fit: contain; }
+                .fullscreen-station-name { font-weight: 700; font-size: 1rem; text-align: center; }
                 .chart-card .fullscreen-stats { display: none; }
                 .chart-card.fullscreen .fullscreen-stats {
-                  display: flex;
-                  flex-wrap: nowrap;
-                  overflow-x: auto;
+                  display: grid;
+                  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
                   gap: .5rem;
-                  margin-top: .5rem;
+                  margin-top: auto;
+                  padding-top: .5rem;
+                  align-items: stretch;
                 }
                 .chart-card.fullscreen .fullscreen-hint { display: none; }
                 .chart-card .fullscreen-hint { font-size: .72rem; color: #6c757d; }
                 .stat-chip {
-                  min-width: 110px;
                   border: 1px solid #dee2e6;
                   border-radius: .5rem;
-                  padding: .35rem .5rem;
+                  padding: .5rem .65rem;
                   background: #fff;
+                }
+                .stat-chip-grid {
+                  display: grid;
+                  grid-template-columns: repeat(3, minmax(0, 1fr));
+                  gap: .6rem;
+                }
+                .stat-chip-section {
+                  min-width: 0;
+                  display: flex;
+                  flex-direction: column;
+                  gap: .15rem;
                 }
                 .stat-chip-label { font-size: .72rem; color: #6c757d; }
                 .stat-chip-value { font-weight: 700; line-height: 1.1; }
+                .stat-chip-time {
+                  font-size: .72rem;
+                  color: #6c757d;
+                  line-height: 1.2;
+                  word-break: break-word;
+                }
                 .aqi-card { min-height: 94px; }
                 .aqi-stack { display: flex; gap: .45rem; align-items: center; }
                 .aqi-lights { display: flex; flex-direction: column-reverse; gap: .35rem; }
@@ -3776,14 +3795,22 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     return items.map((item) => `
                       <div class="stat-chip">
                         <div class="fw-semibold small">${item.label || ''}</div>
-                        <div class="stat-chip-label">current</div>
-                        <div class="stat-chip-value">${item.current}${unit ? ` ${unit}` : ''}</div>
-                        <div class="stat-chip-label mt-1">min</div>
-                        <div class="stat-chip-value">${item.min}${unit ? ` ${unit}` : ''}</div>
-                        <div class="stat-chip-label">${item.min_at ? formatStatTimestamp(item.min_at) : ''}</div>
-                        <div class="stat-chip-label mt-1">max</div>
-                        <div class="stat-chip-value">${item.max}${unit ? ` ${unit}` : ''}</div>
-                        <div class="stat-chip-label">${item.max_at ? formatStatTimestamp(item.max_at) : ''}</div>
+                        <div class="stat-chip-grid">
+                          <div class="stat-chip-section">
+                            <div class="stat-chip-label">current</div>
+                            <div class="stat-chip-value">${item.current}${unit ? ` ${unit}` : ''}</div>
+                          </div>
+                          <div class="stat-chip-section">
+                            <div class="stat-chip-label">min</div>
+                            <div class="stat-chip-value">${item.min}${unit ? ` ${unit}` : ''}</div>
+                            <div class="stat-chip-time">${item.min_at ? formatStatTimestamp(item.min_at) : ''}</div>
+                          </div>
+                          <div class="stat-chip-section">
+                            <div class="stat-chip-label">max</div>
+                            <div class="stat-chip-value">${item.max}${unit ? ` ${unit}` : ''}</div>
+                            <div class="stat-chip-time">${item.max_at ? formatStatTimestamp(item.max_at) : ''}</div>
+                          </div>
+                        </div>
                       </div>
                     `).join('');
                   };
@@ -3859,11 +3886,13 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                         <div class="card chart-card shadow-sm">
                           <div class="card-body">
                             <div class="fullscreen-branding">
-                              <div class="fullscreen-branding-logos">
+                              <div class="fullscreen-branding-logos fullscreen-branding-logo-left">
                                 ${appLogoUrl ? `<img src="${appLogoUrl}" alt="App logo">` : ''}
-                                ${stationLogoUrl ? `<img src="${stationLogoUrl}" alt="Station logo">` : ''}
                               </div>
                               <div class="fullscreen-station-name"></div>
+                              <div class="fullscreen-branding-logos fullscreen-branding-logo-right">
+                                ${stationLogoUrl ? `<img src="${stationLogoUrl}" alt="Station logo">` : ''}
+                              </div>
                             </div>
                             <div class="d-flex justify-content-between">
                               <h2 class="h6 mb-1 chart-title"></h2>
@@ -3900,7 +3929,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
                     col.querySelector('.chart-title').textContent = s.label;
                     col.querySelector('.chart-unit').textContent = s.unit || '';
-                    col.querySelector('.fullscreen-station-name').textContent = `${snapshot.station_name} (${snapshot.instrument_uuid})`;
+                    col.querySelector('.fullscreen-station-name').textContent = snapshot.station_name || snapshot.instrument_uuid;
                     col.querySelector('.fullscreen-stats').innerHTML = renderStats(s.stats, s.unit || '');
                     const canvas = col.querySelector('canvas');
                     if (!canvas) return;

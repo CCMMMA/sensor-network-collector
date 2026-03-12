@@ -193,12 +193,13 @@ SMTP fallback behavior:
 - the focused chart state can be opened directly with query string `focus=<chart_key>`
 - in focused mode the top of the chart view shows:
   - web app logo
+  - station name centered
   - station logo
-  - station name and UUID
 - when a chart is focused, the page shows compact numeric widgets horizontally below the chart for the selected trend window:
   - current
   - min
   - max
+- the focused bottom stats bar is sized to keep current, min, and max visible within the viewport
 - min and max widgets also show the date and time when those values occurred
 - multi-series charts display one set of min/max/current values per sub-series
 
