@@ -2345,15 +2345,29 @@ def _aqi_status(value):
     return {"level": "bad", "label": "Bad conditions", "color": "#dc3545"}
 
 
-def _build_series_stats(values, label: str = ""):
-    clean = [float(v) for v in values if v is not None]
+def _build_series_stats(points, label: str = ""):
+    clean = []
+    for point in points or []:
+        if not isinstance(point, dict):
+            continue
+        y = _to_float(point.get("y"))
+        x = str(point.get("x") or "").strip()
+        if y is None or not x:
+            continue
+        clean.append({"x": x, "y": float(y)})
     if not clean:
         return None
+    min_point = min(clean, key=lambda item: item["y"])
+    max_point = max(clean, key=lambda item: item["y"])
+    current_point = clean[-1]
     return {
         "label": label,
-        "current": round(clean[-1], 3),
-        "min": round(min(clean), 3),
-        "max": round(max(clean), 3),
+        "current": round(current_point["y"], 3),
+        "current_at": current_point["x"],
+        "min": round(min_point["y"], 3),
+        "min_at": min_point["x"],
+        "max": round(max_point["y"], 3),
+        "max_at": max_point["x"],
     }
 
 
@@ -2459,7 +2473,7 @@ def build_public_station_snapshot(
                     "labels": labels,
                     "values": values,
                     "points": points,
-                    "stats": _build_series_stats(values, resolved_spec["label"]),
+                    "stats": _build_series_stats(points, resolved_spec["label"]),
                 }
             )
 
@@ -2496,7 +2510,7 @@ def build_public_station_snapshot(
         y_min, y_max, y_step = _calc_axis_settings(pm_all_values, pm_spec.get("axis"))
         dataset_stats = []
         for dataset in pm_datasets:
-            dataset_stats.append(_build_series_stats(dataset.get("values") or [], dataset.get("label", "")))
+            dataset_stats.append(_build_series_stats(dataset.get("points") or [], dataset.get("label", "")))
         series.append(
             {
                 "key": "particulate_matter",
@@ -3508,6 +3522,17 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   box-shadow: 0 1rem 3rem rgba(0,0,0,.25);
                 }
                 .chart-card.fullscreen canvas { height: calc(100vh - 270px) !important; }
+                .chart-card .fullscreen-branding { display: none; }
+                .chart-card.fullscreen .fullscreen-branding {
+                  display: flex;
+                  align-items: center;
+                  justify-content: space-between;
+                  gap: .75rem;
+                  margin-bottom: .5rem;
+                }
+                .fullscreen-branding-logos { display: flex; align-items: center; gap: .5rem; }
+                .fullscreen-branding img { max-height: 38px; }
+                .fullscreen-station-name { font-weight: 700; font-size: 1rem; }
                 .chart-card .fullscreen-stats { display: none; }
                 .chart-card.fullscreen .fullscreen-stats {
                   display: flex;
@@ -3587,6 +3612,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 const chartCards = {};
                 const windowSelect = document.getElementById('windowSelect');
                 let focusedChartKey = {{ selected_focus | tojson }};
+                const appLogoUrl = {{ app_logo_url | tojson }};
+                const stationLogoUrl = {{ station_logo_url | tojson }};
                 const colors = ['#0d6efd', '#20c997', '#fd7e14', '#6f42c1', '#dc3545', '#198754', '#6c757d'];
                 const SECOND_MS = 1000;
                 const MINUTE_MS = 60 * SECOND_MS;
@@ -3647,13 +3674,35 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 function formatWindowTick(value, windowCode) {
                   const d = new Date(value);
                   if (Number.isNaN(d.getTime())) return '';
+                  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                }
+
+                function formatWindowTickWithDayChange(value, windowCode, index, ticks) {
+                  const d = new Date(value);
+                  if (Number.isNaN(d.getTime())) return '';
                   if (windowCode === '1m') {
                     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
                   }
-                  if (windowCode === '72h') {
-                    return d.toLocaleString([], { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+                  const prevTick = (Array.isArray(ticks) && index > 0) ? ticks[index - 1] : null;
+                  const prevDate = prevTick && Number.isFinite(prevTick.value) ? new Date(prevTick.value) : null;
+                  const dayChanged = !prevDate || prevDate.toDateString() !== d.toDateString();
+                  const timeLabel = formatWindowTick(value, windowCode);
+                  if (dayChanged) {
+                    return `${d.toLocaleDateString([], { year: 'numeric', month: '2-digit', day: '2-digit' })} ${timeLabel}`;
                   }
-                  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                  return timeLabel;
+                }
+
+                function formatStatTimestamp(value) {
+                  const d = new Date(value);
+                  if (Number.isNaN(d.getTime())) return '';
+                  return d.toLocaleString([], {
+                    year: 'numeric',
+                    month: '2-digit',
+                    day: '2-digit',
+                    hour: '2-digit',
+                    minute: '2-digit'
+                  });
                 }
 
                 function cardHtml(card) {
@@ -3731,8 +3780,10 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                         <div class="stat-chip-value">${item.current}${unit ? ` ${unit}` : ''}</div>
                         <div class="stat-chip-label mt-1">min</div>
                         <div class="stat-chip-value">${item.min}${unit ? ` ${unit}` : ''}</div>
+                        <div class="stat-chip-label">${item.min_at ? formatStatTimestamp(item.min_at) : ''}</div>
                         <div class="stat-chip-label mt-1">max</div>
                         <div class="stat-chip-value">${item.max}${unit ? ` ${unit}` : ''}</div>
+                        <div class="stat-chip-label">${item.max_at ? formatStatTimestamp(item.max_at) : ''}</div>
                       </div>
                     `).join('');
                   };
@@ -3807,6 +3858,13 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                       col.innerHTML = `
                         <div class="card chart-card shadow-sm">
                           <div class="card-body">
+                            <div class="fullscreen-branding">
+                              <div class="fullscreen-branding-logos">
+                                ${appLogoUrl ? `<img src="${appLogoUrl}" alt="App logo">` : ''}
+                                ${stationLogoUrl ? `<img src="${stationLogoUrl}" alt="Station logo">` : ''}
+                              </div>
+                              <div class="fullscreen-station-name"></div>
+                            </div>
                             <div class="d-flex justify-content-between">
                               <h2 class="h6 mb-1 chart-title"></h2>
                               <span class="text-muted small chart-unit"></span>
@@ -3842,6 +3900,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
                     col.querySelector('.chart-title').textContent = s.label;
                     col.querySelector('.chart-unit').textContent = s.unit || '';
+                    col.querySelector('.fullscreen-station-name').textContent = `${snapshot.station_name} (${snapshot.instrument_uuid})`;
                     col.querySelector('.fullscreen-stats').innerHTML = renderStats(s.stats, s.unit || '');
                     const canvas = col.querySelector('canvas');
                     if (!canvas) return;
@@ -3869,8 +3928,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                                 axis.ticks = customTicks.map((tick) => ({ value: tick }));
                               },
                               ticks: {
-                                callback: (value) => {
-                                  return formatWindowTick(value, snapshot.window || currentWindow);
+                                callback: (value, index, ticks) => {
+                                  return formatWindowTickWithDayChange(value, snapshot.window || currentWindow, index, ticks);
                                 }
                               }
                             },
@@ -3893,7 +3952,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                       chart.options.scales.x.afterBuildTicks = (axis) => {
                         axis.ticks = customTicks.map((tick) => ({ value: tick }));
                       };
-                      chart.options.scales.x.ticks.callback = (value) => formatWindowTick(value, snapshot.window || currentWindow);
+                      chart.options.scales.x.ticks.callback = (value, index, ticks) => formatWindowTickWithDayChange(value, snapshot.window || currentWindow, index, ticks);
                       chart.options.scales.y.min = yMin;
                       chart.options.scales.y.max = yMax;
                       chart.options.scales.y.ticks = yStep ? { stepSize: yStep } : {};

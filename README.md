@@ -222,6 +222,7 @@ See:
 - Station dashboard trend interval choice is also remembered in browser cookies.
 - The auth SQLite database also stores chart-control rights and per-station trend-chart axis settings used by the Public Station Dashboard.
 - Public station dashboard supports `focus=<chart_key>` in the query string to open a specific trend chart in focused full-screen mode.
+- Public station dashboard trend charts show the full date on the x-axis when the displayed day changes.
 
 ## Security notes
 

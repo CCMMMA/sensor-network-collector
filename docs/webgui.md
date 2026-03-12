@@ -184,16 +184,22 @@ SMTP fallback behavior:
 - public station dashboard remembers selected trend window in a browser cookie
 - station dashboard also remembers selected trend interval in a browser cookie
 - when a public dashboard trend window is changed, trend chart x-axis is recomputed to match the selected time window
+- when the plotted range crosses a day boundary, the x-axis prints the full date at the tick where the day changes
 - public station dashboard trend chart Y-axis settings are loaded per station from the auth SQLite DB
 - Y-axis step size is applied directly to chart ticks when configured
 - double-clicking a trend chart toggles a focused full-screen view for that chart
 - double-clicking again restores the normal multi-chart layout
 - pressing `Esc` also exits the focused chart view
 - the focused chart state can be opened directly with query string `focus=<chart_key>`
+- in focused mode the top of the chart view shows:
+  - web app logo
+  - station logo
+  - station name and UUID
 - when a chart is focused, the page shows compact numeric widgets horizontally below the chart for the selected trend window:
   - current
   - min
   - max
+- min and max widgets also show the date and time when those values occurred
 - multi-series charts display one set of min/max/current values per sub-series
 
 ## Admin dashboard behavior
