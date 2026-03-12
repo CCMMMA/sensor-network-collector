@@ -3507,13 +3507,14 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   border: 2px solid rgba(13,110,253,.18);
                   box-shadow: 0 1rem 3rem rgba(0,0,0,.25);
                 }
-                .chart-card.fullscreen canvas { height: calc(100vh - 220px) !important; }
+                .chart-card.fullscreen canvas { height: calc(100vh - 270px) !important; }
                 .chart-card .fullscreen-stats { display: none; }
                 .chart-card.fullscreen .fullscreen-stats {
                   display: flex;
-                  flex-wrap: wrap;
+                  flex-wrap: nowrap;
+                  overflow-x: auto;
                   gap: .5rem;
-                  margin-bottom: .5rem;
+                  margin-top: .5rem;
                 }
                 .chart-card.fullscreen .fullscreen-hint { display: none; }
                 .chart-card .fullscreen-hint { font-size: .72rem; color: #6c757d; }
@@ -3583,6 +3584,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 let lastTimestamp = {{ snapshot.last_timestamp | tojson }};
                 let currentWindow = {{ selected_window | tojson }};
                 const chartInstances = {};
+                const chartCards = {};
                 const windowSelect = document.getElementById('windowSelect');
                 let focusedChartKey = {{ selected_focus | tojson }};
                 const colors = ['#0d6efd', '#20c997', '#fd7e14', '#6f42c1', '#dc3545', '#198754', '#6c757d'];
@@ -3708,13 +3710,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 }
 
                 function renderSeries(snapshot) {
-                  Object.keys(chartInstances).forEach((k) => {
-                    chartInstances[k].destroy();
-                    delete chartInstances[k];
-                  });
                   const chartsEl = document.getElementById('charts');
-                  chartsEl.innerHTML = '';
-
                   const series = snapshot.series || [];
                   const knownKeys = new Set(series.map((item) => item.key));
                   if (focusedChartKey && !knownKeys.has(focusedChartKey)) {
@@ -3761,46 +3757,39 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     });
                     syncFocusUrl();
                   };
+
+                  Object.keys(chartCards).forEach((key) => {
+                    if (knownKeys.has(key)) return;
+                    if (chartInstances[key]) {
+                      chartInstances[key].destroy();
+                      delete chartInstances[key];
+                    }
+                    if (chartCards[key]) {
+                      chartCards[key].remove();
+                      delete chartCards[key];
+                    }
+                  });
+
+                  const styleDataset = (dataset, color) => {
+                    const pointCount = Array.isArray(dataset.data) ? dataset.data.length : 0;
+                    const sparse = pointCount <= 2;
+                    return {
+                      ...dataset,
+                      borderColor: color,
+                      borderWidth: 2,
+                      tension: sparse ? 0 : 0.25,
+                      spanGaps: true,
+                      showLine: pointCount > 1,
+                      pointRadius: sparse ? 3 : 0,
+                      pointHoverRadius: sparse ? 4 : 0
+                    };
+                  };
+
                   series.forEach((s, idx) => {
                     const id = `chart_${s.key}`;
-                    const col = document.createElement('div');
-                    col.className = 'col-12 col-md-6 col-xl-4';
-                    col.dataset.chartKey = s.key;
-                    col.innerHTML = `
-                      <div class="card chart-card shadow-sm">
-                        <div class="card-body">
-                          <div class="d-flex justify-content-between">
-                            <h2 class="h6 mb-1">${s.label}</h2>
-                            <span class="text-muted small">${s.unit || ''}</span>
-                          </div>
-                          <div class="fullscreen-stats">${renderStats(s.stats, s.unit || '')}</div>
-                          <div class="fullscreen-hint mb-1">Double-click to focus this chart.</div>
-                          <canvas id="${id}" height="110"></canvas>
-                        </div>
-                      </div>
-                    `;
-                    chartsEl.appendChild(col);
-
-                    const canvas = document.getElementById(id);
-                    if (!canvas) return;
-
                     const yMin = (s.y_min !== null && s.y_min !== undefined) ? s.y_min : undefined;
                     const yMax = (s.y_max !== null && s.y_max !== undefined) ? s.y_max : undefined;
                     const yStep = (s.y_step !== null && s.y_step !== undefined) ? s.y_step : undefined;
-                    const styleDataset = (dataset, color) => {
-                      const pointCount = Array.isArray(dataset.data) ? dataset.data.length : 0;
-                      const sparse = pointCount <= 2;
-                      return {
-                        ...dataset,
-                        borderColor: color,
-                        borderWidth: 2,
-                        tension: sparse ? 0 : 0.25,
-                        spanGaps: true,
-                        showLine: pointCount > 1,
-                        pointRadius: sparse ? 3 : 0,
-                        pointHoverRadius: sparse ? 4 : 0
-                      };
-                    };
                     const datasets = (s.datasets && Array.isArray(s.datasets))
                       ? s.datasets.map((d, j) => styleDataset({
                           label: d.label,
@@ -3810,57 +3799,106 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                           label: s.label,
                           data: normalizeChartPoints(s.points)
                         }, colors[idx % colors.length])];
+                    let col = chartCards[s.key];
+                    if (!col) {
+                      col = document.createElement('div');
+                      col.className = 'col-12 col-md-6 col-xl-4';
+                      col.dataset.chartKey = s.key;
+                      col.innerHTML = `
+                        <div class="card chart-card shadow-sm">
+                          <div class="card-body">
+                            <div class="d-flex justify-content-between">
+                              <h2 class="h6 mb-1 chart-title"></h2>
+                              <span class="text-muted small chart-unit"></span>
+                            </div>
+                            <div class="fullscreen-hint mb-1">Double-click to focus this chart.</div>
+                            <canvas id="${id}" height="110"></canvas>
+                            <div class="fullscreen-stats"></div>
+                          </div>
+                        </div>
+                      `;
+                      chartsEl.appendChild(col);
+                      chartCards[s.key] = col;
 
-                    chartInstances[s.key] = new Chart(canvas, {
-                      type: 'line',
-                      data: {
-                        labels: s.labels,
-                        datasets
-                      },
-                      options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        plugins: {
-                          legend: { display: datasets.length > 1 },
-                          tooltip: { enabled: false }
+                      const card = col.querySelector('.chart-card');
+                      const canvas = col.querySelector('canvas');
+                      const toggleFocus = () => {
+                        focusedChartKey = (focusedChartKey === s.key) ? '' : s.key;
+                        applyChartFocus();
+                      };
+                      if (card) {
+                        card.addEventListener('dblclick', toggleFocus);
+                      }
+                      if (canvas) {
+                        canvas.addEventListener('dblclick', (event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          toggleFocus();
+                        });
+                      }
+                    } else if (!chartsEl.contains(col)) {
+                      chartsEl.appendChild(col);
+                    }
+
+                    col.querySelector('.chart-title').textContent = s.label;
+                    col.querySelector('.chart-unit').textContent = s.unit || '';
+                    col.querySelector('.fullscreen-stats').innerHTML = renderStats(s.stats, s.unit || '');
+                    const canvas = col.querySelector('canvas');
+                    if (!canvas) return;
+
+                    if (!chartInstances[s.key]) {
+                      chartInstances[s.key] = new Chart(canvas, {
+                        type: 'line',
+                        data: {
+                          labels: s.labels,
+                          datasets
                         },
-                        scales: {
-                          x: {
-                            type: 'linear',
-                            min: xMin,
-                            max: xMax,
-                            afterBuildTicks: (axis) => {
-                              axis.ticks = customTicks.map((tick) => ({ value: tick }));
-                            },
-                            ticks: {
-                              callback: (value) => {
-                                return formatWindowTick(value, snapshot.window || currentWindow);
-                              }
-                            }
+                        options: {
+                          responsive: true,
+                          maintainAspectRatio: false,
+                          plugins: {
+                            legend: { display: datasets.length > 1 },
+                            tooltip: { enabled: false }
                           },
-                          y: {
-                            beginAtZero: false,
-                            min: yMin,
-                            max: yMax,
-                            ticks: yStep ? { stepSize: yStep } : {}
+                          scales: {
+                            x: {
+                              type: 'linear',
+                              min: xMin,
+                              max: xMax,
+                              afterBuildTicks: (axis) => {
+                                axis.ticks = customTicks.map((tick) => ({ value: tick }));
+                              },
+                              ticks: {
+                                callback: (value) => {
+                                  return formatWindowTick(value, snapshot.window || currentWindow);
+                                }
+                              }
+                            },
+                            y: {
+                              beginAtZero: false,
+                              min: yMin,
+                              max: yMax,
+                              ticks: yStep ? { stepSize: yStep } : {}
+                            }
                           }
                         }
-                      }
-                    });
-
-                    const card = col.querySelector('.chart-card');
-                    const toggleFocus = () => {
-                      focusedChartKey = (focusedChartKey === s.key) ? '' : s.key;
-                      applyChartFocus();
-                    };
-                    if (card) {
-                      card.addEventListener('dblclick', toggleFocus);
+                      });
+                    } else {
+                      const chart = chartInstances[s.key];
+                      chart.data.labels = s.labels;
+                      chart.data.datasets = datasets;
+                      chart.options.plugins.legend.display = datasets.length > 1;
+                      chart.options.scales.x.min = xMin;
+                      chart.options.scales.x.max = xMax;
+                      chart.options.scales.x.afterBuildTicks = (axis) => {
+                        axis.ticks = customTicks.map((tick) => ({ value: tick }));
+                      };
+                      chart.options.scales.x.ticks.callback = (value) => formatWindowTick(value, snapshot.window || currentWindow);
+                      chart.options.scales.y.min = yMin;
+                      chart.options.scales.y.max = yMax;
+                      chart.options.scales.y.ticks = yStep ? { stepSize: yStep } : {};
+                      chart.update('none');
                     }
-                    canvas.addEventListener('dblclick', (event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      toggleFocus();
-                    });
                   });
                   applyChartFocus();
                 }
@@ -4798,24 +4836,43 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 const confirmForeignStation = document.getElementById('confirmForeignStation');
                 const stationUuid = {{ instrument_uuid | tojson }};
                 if (importForm && importFile && confirmForeignStation) {
-                  importForm.addEventListener('submit', async (event) => {
+                  importForm.dataset.sourceStationUuid = '';
+                  importForm.dataset.fileChecked = '0';
+
+                  importFile.addEventListener('change', async () => {
                     confirmForeignStation.value = '0';
                     const file = importFile.files && importFile.files[0];
+                    importForm.dataset.sourceStationUuid = '';
+                    importForm.dataset.fileChecked = file ? '0' : '1';
                     if (!file) return;
                     try {
                       const text = await file.text();
                       const payload = JSON.parse(text);
                       const sourceStationUuid = String((payload && payload.station_uuid) || '').trim();
-                      if (sourceStationUuid && sourceStationUuid !== stationUuid) {
-                        const ok = window.confirm(`This configuration was exported from station "${sourceStationUuid}" and will be imported into "${stationUuid}". Continue?`);
-                        if (!ok) {
-                          event.preventDefault();
-                          return;
-                        }
-                        confirmForeignStation.value = '1';
-                      }
+                      importForm.dataset.sourceStationUuid = sourceStationUuid;
                     } catch (_) {
-                      // Let server-side validation report JSON issues.
+                      importForm.dataset.sourceStationUuid = '';
+                    } finally {
+                      importForm.dataset.fileChecked = '1';
+                    }
+                  });
+
+                  importForm.addEventListener('submit', (event) => {
+                    const file = importFile.files && importFile.files[0];
+                    if (!file) return;
+                    if (importForm.dataset.fileChecked !== '1') {
+                      event.preventDefault();
+                      window.alert('Please wait for the JSON file to be checked, then submit again.');
+                      return;
+                    }
+                    const sourceStationUuid = String(importForm.dataset.sourceStationUuid || '').trim();
+                    if (sourceStationUuid && sourceStationUuid !== stationUuid) {
+                      const ok = window.confirm(`This configuration was exported from station "${sourceStationUuid}" and will be imported into "${stationUuid}". Continue?`);
+                      if (!ok) {
+                        event.preventDefault();
+                        return;
+                      }
+                      confirmForeignStation.value = '1';
                     }
                   });
                 }

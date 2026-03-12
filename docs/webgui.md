@@ -170,6 +170,7 @@ SMTP fallback behavior:
 - station users can upload per-station logo from station page
 - public station page shows app logo + station logo together
 - public station dashboard trend charts update in-place without full page reload
+- existing chart instances are reused and updated with fresh points and axes instead of being recreated on each polling cycle
 - public station dashboard trend window can be selected as:
   - last minute
   - 10 minutes
@@ -189,7 +190,7 @@ SMTP fallback behavior:
 - double-clicking again restores the normal multi-chart layout
 - pressing `Esc` also exits the focused chart view
 - the focused chart state can be opened directly with query string `focus=<chart_key>`
-- when a chart is focused, the page shows compact numeric widgets for the selected trend window:
+- when a chart is focused, the page shows compact numeric widgets horizontally below the chart for the selected trend window:
   - current
   - min
   - max
