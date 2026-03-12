@@ -12,7 +12,7 @@ Threaded MQTT collector for weather/sensor networks, aligned with `vantage-publi
 - Dry mode for safe runtime validation (`--dry`)
 - Web GUI for data download with authentication and access policies
 - Map-based station discovery on the home page
-- Data browsing per station with charts and tables
+- Data browsing per station with configurable charts and tables
 - Live station trend pages (auto-updating charts and latest table)
 - Public sensor network dashboard with auto-updating status and alarms
 - Per-station public trend-chart Y-axis configuration with controller/admin management
@@ -220,6 +220,7 @@ See:
 - `baseUrl` is used to compose externally visible links in email messages, including fast-login and password-reset URLs.
 - Public station dashboard trend-window choice is remembered in browser cookies.
 - Station dashboard trend interval choice is also remembered in browser cookies.
+- Station browser chart and table preferences are persisted per station and can be exported/imported as JSON.
 - The auth SQLite database also stores chart-control rights and per-station trend-chart axis settings used by the Public Station Dashboard.
 - Public station dashboard supports `focus=<chart_key>` in the query string to open a specific trend chart in focused full-screen mode.
 - Public station dashboard trend charts show the full date on the x-axis when the displayed day changes.

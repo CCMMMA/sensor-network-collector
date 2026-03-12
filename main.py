@@ -2133,6 +2133,60 @@ def build_station_browser_chart_model(rows, chart_config, units_map):
     return labels, datasets, y_axes
 
 
+def parse_station_browser_table_prefs(request_args, request_cookies, instrument_uuid: str, all_columns):
+    pref_cookie_name = f"station_browser_prefs_{safe_filename(instrument_uuid)}"
+    raw = str(request_args.get("browser_prefs", "") or "").strip()
+    payload = {}
+    if not raw:
+        raw = str(request_cookies.get(pref_cookie_name, "") or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except Exception:
+            payload = {}
+
+    table = payload.get("table") if isinstance(payload.get("table"), dict) else {}
+    page_size = str(table.get("page_size") or request_args.get("page_size") or "50").strip().lower()
+    if page_size not in ("50", "100", "250", "window"):
+        page_size = "50"
+
+    valid_cols = [c for c in all_columns if c]
+    visible = table.get("visible_columns")
+    if not isinstance(visible, list):
+        visible = valid_cols
+    visible_columns = [c for c in visible if c in valid_cols]
+    if not visible_columns:
+        visible_columns = valid_cols
+
+    return {
+        "page_size": page_size,
+        "visible_columns": visible_columns,
+    }
+
+
+def serialize_station_browser_prefs(chart_config, table_prefs):
+    return json.dumps(
+        {
+            "chart_config": chart_config,
+            "table": table_prefs,
+        },
+        separators=(",", ":"),
+    )
+
+
+def build_table_column_stats(rows, columns):
+    stats = []
+    for col in columns:
+        values = [_to_float(row.get(col)) for row in rows]
+        values = [v for v in values if v is not None]
+        if not values:
+            continue
+        stats.append({"column": col, "min": round(min(values), 6), "max": round(max(values), 6)})
+    return stats
+
+
 PUBLIC_METRIC_SPECS = [
     {"key": "temperature", "label": "Temperature", "aliases": ["TempOut", "temperature", "outside_temp", "temp"], "unit": "C"},
     {"key": "humidity", "label": "Humidity", "aliases": ["HumOut", "humidity", "hum"], "unit": "%"},
@@ -3354,12 +3408,27 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         numeric_cols = extract_numeric_series(rows, excluded=excluded)
 
         units_map = get_field_units(cfg)
+        browser_prefs_cookie_name = f"station_browser_prefs_{safe_filename(instrument_uuid)}"
         chart_cookie_name = f"station_chart_config_{safe_filename(instrument_uuid)}"
         chart_config_args = request.args
+        browser_prefs = {}
+        browser_prefs_raw = str(request.args.get("browser_prefs", "") or "").strip()
+        if not browser_prefs_raw:
+            browser_prefs_raw = str(request.cookies.get(browser_prefs_cookie_name, "") or "").strip()
+        if browser_prefs_raw:
+            try:
+                parsed_browser_prefs = json.loads(browser_prefs_raw)
+                if isinstance(parsed_browser_prefs, dict):
+                    browser_prefs = parsed_browser_prefs
+            except Exception:
+                browser_prefs = {}
         if not str(request.args.get("chart_config", "") or "").strip():
-            cookie_chart_config = request.cookies.get(chart_cookie_name, "")
-            if cookie_chart_config:
-                chart_config_args = {"chart_config": cookie_chart_config}
+            if isinstance(browser_prefs.get("chart_config"), dict):
+                chart_config_args = {"chart_config": json.dumps(browser_prefs.get("chart_config"))}
+            else:
+                cookie_chart_config = request.cookies.get(chart_cookie_name, "")
+                if cookie_chart_config:
+                    chart_config_args = {"chart_config": cookie_chart_config}
         chart_config = parse_station_browser_chart_config(chart_config_args, numeric_cols)
         chart_config_json = serialize_station_browser_chart_config(chart_config)
         chart_labels, chart_datasets, chart_y_axes = build_station_browser_chart_model(rows, chart_config, units_map)
@@ -3372,9 +3441,13 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 if value is not None
             ]
 
+        all_table_columns = list(rows[0].keys()) if rows else []
+        table_prefs = parse_station_browser_table_prefs(request.args, request.cookies, instrument_uuid, all_table_columns)
+        browser_prefs_json = serialize_station_browser_prefs(chart_config, table_prefs)
+
         page = max(1, int(request.args.get("page", "1") or "1"))
-        page_size = int(request.args.get("page_size", "50") or "50")
-        page_size = min(200, max(10, page_size))
+        page_size_pref = table_prefs["page_size"]
+        page_size = len(rows) if page_size_pref == "window" else int(page_size_pref)
         total_rows = len(rows)
         page_count = max(1, (total_rows + page_size - 1) // page_size)
         if page > page_count:
@@ -3382,13 +3455,17 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         start_idx = (page - 1) * page_size
         end_idx = start_idx + page_size
         table_rows = rows[start_idx:end_idx]
-        table_cols = list(table_rows[0].keys()) if table_rows else []
+        table_cols = [c for c in table_prefs["visible_columns"] if c in all_table_columns]
+        if not table_cols:
+            table_cols = all_table_columns
         table_headers = {
             c: f"{c} [{units_map.get(c, '-')}]"
             if c not in ("timestamp", "topic", "uuid", "name", "position", "latitude", "longitude", "lat", "lon", "lng")
             else c
             for c in table_cols
         }
+        visible_numeric_columns = [c for c in table_cols if c in numeric_cols]
+        table_column_stats = build_table_column_stats(rows, visible_numeric_columns)
 
         prev_anchor = shift_anchor(anchor, interval, -1).isoformat().replace("+00:00", "Z")
         next_anchor = shift_anchor(anchor, interval, 1).isoformat().replace("+00:00", "Z")
@@ -3431,12 +3508,12 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   </label>
                   <input type="hidden" name="anchor" value="{{ request.args.get('anchor','') }}"/>
                   <input type="hidden" name="chart_config" value="{{ chart_config_json }}"/>
-                  <input type="hidden" name="page_size" value="{{ page_size }}"/>
+                  <input type="hidden" name="browser_prefs" value="{{ browser_prefs_json }}"/>
                 </form>
                 <p>
-                  <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=prev_anchor, page_size=page_size, chart_config=chart_config_json, from_date=request.args.get('from_date',''), to_date=request.args.get('to_date','')) }}">&#8592; previous {{ interval_label }}</a>
+                  <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=prev_anchor, browser_prefs=browser_prefs_json, from_date=request.args.get('from_date',''), to_date=request.args.get('to_date','')) }}">&#8592; previous {{ interval_label }}</a>
                   |
-                  <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=next_anchor, page_size=page_size, chart_config=chart_config_json, from_date=request.args.get('from_date',''), to_date=request.args.get('to_date','')) }}">next {{ interval_label }} &#8594;</a>
+                  <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=next_anchor, browser_prefs=browser_prefs_json, from_date=request.args.get('from_date',''), to_date=request.args.get('to_date','')) }}">next {{ interval_label }} &#8594;</a>
                 </p>
                 <p>Showing data in window: {{ win_start }} to {{ win_end }} UTC</p>
               </div>
@@ -3473,11 +3550,11 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     <input type="hidden" name="anchor" value="{{ request.args.get('anchor','') }}"/>
                     <input type="hidden" name="from_date" value="{{ request.args.get('from_date','') }}"/>
                     <input type="hidden" name="to_date" value="{{ request.args.get('to_date','') }}"/>
-                    <input type="hidden" name="page_size" value="{{ page_size }}"/>
+                    <input type="hidden" name="browser_prefs" id="browserPrefsInput" value="{{ browser_prefs_json }}"/>
                     <input type="hidden" name="chart_config" id="chartConfigInput" value="{{ chart_config_json }}"/>
                     <div class="d-flex flex-wrap gap-2 mb-3">
-                      <button class="btn btn-outline-secondary btn-sm" type="button" id="chartExportBtn">Export chart prefs</button>
-                      <label class="btn btn-outline-secondary btn-sm mb-0" for="chartImportFile">Import chart prefs</label>
+                      <button class="btn btn-outline-secondary btn-sm" type="button" id="chartExportBtn">Export browser prefs</button>
+                      <label class="btn btn-outline-secondary btn-sm mb-0" for="chartImportFile">Import browser prefs</label>
                       <input id="chartImportFile" type="file" accept="application/json,.json" hidden>
                     </div>
                     <div class="row g-3 align-items-start">
@@ -3522,14 +3599,47 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
               <div class="panel">
                 <h2>Data table</h2>
+                <form method="get" id="tablePrefsForm" class="mb-3">
+                  <input type="hidden" name="interval" value="{{ interval }}"/>
+                  <input type="hidden" name="anchor" value="{{ request.args.get('anchor','') }}"/>
+                  <input type="hidden" name="from_date" value="{{ request.args.get('from_date','') }}"/>
+                  <input type="hidden" name="to_date" value="{{ request.args.get('to_date','') }}"/>
+                  <input type="hidden" name="browser_prefs" id="tableBrowserPrefsInput" value="{{ browser_prefs_json }}"/>
+                  <div class="row g-3 align-items-start">
+                    <div class="col-12 col-md-3">
+                      <label class="form-label form-label-sm">Rows per page</label>
+                      <select class="form-select form-select-sm" id="tablePageSize">
+                        <option value="50" {% if page_size_pref == '50' %}selected{% endif %}>50</option>
+                        <option value="100" {% if page_size_pref == '100' %}selected{% endif %}>100</option>
+                        <option value="250" {% if page_size_pref == '250' %}selected{% endif %}>250</option>
+                        <option value="window" {% if page_size_pref == 'window' %}selected{% endif %}>Trend window</option>
+                      </select>
+                    </div>
+                    <div class="col-12 col-md-9">
+                      <label class="form-label form-label-sm">Visible columns</label>
+                      <div id="tableColumnPicker" class="border rounded p-2 d-flex flex-wrap gap-2"></div>
+                    </div>
+                  </div>
+                </form>
+                {% if table_column_stats %}
+                  <div class="d-flex flex-wrap gap-2 mb-2">
+                    {% for stat in table_column_stats %}
+                      <div class="border rounded px-2 py-1 bg-light">
+                        <div class="fw-semibold small">{{ stat.column }}</div>
+                        <div class="small text-muted">min {{ stat.min }}</div>
+                        <div class="small text-muted">max {{ stat.max }}</div>
+                      </div>
+                    {% endfor %}
+                  </div>
+                {% endif %}
                 <p>Rows {{ start_idx + 1 if total_rows else 0 }}-{{ end_idx if end_idx < total_rows else total_rows }} of {{ total_rows }}</p>
                 <p>
                   {% if page > 1 %}
-                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=request.args.get('anchor',''), from_date=request.args.get('from_date',''), to_date=request.args.get('to_date',''), page=page-1, page_size=page_size, chart_config=chart_config_json) }}">&#8592; prev page</a>
+                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=request.args.get('anchor',''), from_date=request.args.get('from_date',''), to_date=request.args.get('to_date',''), page=page-1, browser_prefs=browser_prefs_json) }}">&#8592; prev page</a>
                   {% endif %}
                   {% if page < page_count %}
                     {% if page > 1 %}|{% endif %}
-                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=request.args.get('anchor',''), from_date=request.args.get('from_date',''), to_date=request.args.get('to_date',''), page=page+1, page_size=page_size, chart_config=chart_config_json) }}">next page &#8594;</a>
+                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=request.args.get('anchor',''), from_date=request.args.get('from_date',''), to_date=request.args.get('to_date',''), page=page+1, browser_prefs=browser_prefs_json) }}">next page &#8594;</a>
                   {% endif %}
                 </p>
                 <div class="table-wrap">
@@ -3551,9 +3661,12 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 const datasets = {{ chart_datasets | tojson }};
                 const yAxes = {{ chart_y_axes | tojson }};
                 const chartConfigState = {{ chart_config | tojson }};
+                const tablePrefsState = {{ table_prefs | tojson }};
                 const unitsMap = {{ units_map | tojson }};
                 const allNumericCols = {{ numeric_cols | tojson }};
+                const allTableColumns = {{ all_table_columns | tojson }};
                 const chartConfigCookieName = {{ chart_cookie_name | tojson }};
+                const browserPrefsCookieName = {{ browser_prefs_cookie_name | tojson }};
                 const defaultChartColors = {{ default_chart_colors | tojson }};
                 const numericSeriesValues = {{ numeric_series_values | tojson }};
                 let autoSubmitTimer = null;
@@ -3591,6 +3704,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   const leftConfigEl = document.getElementById('leftConfig');
                   const rightConfigEl = document.getElementById('rightConfig');
                   const chartConfigInput = document.getElementById('chartConfigInput');
+                  const browserPrefsInput = document.getElementById('browserPrefsInput');
                   const chartImportFile = document.getElementById('chartImportFile');
                   const chartExportBtn = document.getElementById('chartExportBtn');
 
@@ -3659,8 +3773,11 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   }
 
                   function syncChartConfigInput() {
-                    if (!chartConfigInput) return;
+                    if (!chartConfigInput || !browserPrefsInput) return;
                     chartConfigInput.value = JSON.stringify(chartConfigState);
+                    const payload = { chart_config: chartConfigState, table: tablePrefsState };
+                    browserPrefsInput.value = JSON.stringify(payload);
+                    document.cookie = `${browserPrefsCookieName}=${encodeURIComponent(browserPrefsInput.value)}; path=/; max-age=31536000; samesite=lax`;
                     document.cookie = `${chartConfigCookieName}=${encodeURIComponent(chartConfigInput.value)}; path=/; max-age=31536000; samesite=lax`;
                   }
 
@@ -3776,6 +3893,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                         instrument_uuid: {{ instrument_uuid | tojson }},
                         exported_at: new Date().toISOString(),
                         chart_config: chartConfigState,
+                        table: tablePrefsState,
                       };
                       const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
                       const url = URL.createObjectURL(blob);
@@ -3799,6 +3917,10 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                         }
                         chartConfigState.left = Array.isArray(payload.chart_config.left) ? payload.chart_config.left : [];
                         chartConfigState.right = Array.isArray(payload.chart_config.right) ? payload.chart_config.right : [];
+                        if (payload.table && typeof payload.table === 'object') {
+                          tablePrefsState.page_size = ['50','100','250','window'].includes(String(payload.table.page_size)) ? String(payload.table.page_size) : tablePrefsState.page_size;
+                          tablePrefsState.visible_columns = Array.isArray(payload.table.visible_columns) ? payload.table.visible_columns : tablePrefsState.visible_columns;
+                        }
                         renderChartSelector();
                         scheduleAutoSubmit();
                       } catch (_) {
@@ -3811,14 +3933,56 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
                   renderChartSelector();
                 }
+                const tablePrefsForm = document.getElementById('tablePrefsForm');
+                if (tablePrefsForm) {
+                  const picker = document.getElementById('tableColumnPicker');
+                  const pageSizeSel = document.getElementById('tablePageSize');
+                  const tableBrowserPrefsInput = document.getElementById('tableBrowserPrefsInput');
+
+                  function syncTablePrefsInput() {
+                    const payload = { chart_config: chartConfigState, table: tablePrefsState };
+                    if (tableBrowserPrefsInput) tableBrowserPrefsInput.value = JSON.stringify(payload);
+                    document.cookie = `${browserPrefsCookieName}=${encodeURIComponent(JSON.stringify(payload))}; path=/; max-age=31536000; samesite=lax`;
+                  }
+
+                  function renderColumnPicker() {
+                    if (!picker) return;
+                    const visible = new Set(tablePrefsState.visible_columns || []);
+                    picker.innerHTML = allTableColumns
+                      .map((col) => `
+                        <label class="form-check form-check-inline mb-0">
+                          <input class="form-check-input table-col-toggle" type="checkbox" value="${col}" ${visible.has(col) ? 'checked' : ''}>
+                          <span class="form-check-label">${col}</span>
+                        </label>
+                      `).join('');
+                  }
+
+                  pageSizeSel?.addEventListener('change', () => {
+                    tablePrefsState.page_size = pageSizeSel.value;
+                    syncTablePrefsInput();
+                    tablePrefsForm.requestSubmit();
+                  });
+
+                  picker?.addEventListener('change', (event) => {
+                    const target = event.target;
+                    if (!(target instanceof HTMLInputElement) || !target.classList.contains('table-col-toggle')) return;
+                    const checked = Array.from(picker.querySelectorAll('.table-col-toggle:checked')).map((el) => el.value);
+                    tablePrefsState.visible_columns = checked.length ? checked : Array.from(picker.querySelectorAll('.table-col-toggle')).map((el) => el.value);
+                    syncTablePrefsInput();
+                    tablePrefsForm.requestSubmit();
+                  });
+
+                  renderColumnPicker();
+                  syncTablePrefsInput();
+                }
                 const intervalSel = document.getElementById('intervalSelect');
                 const intervalForm = document.getElementById('intervalForm');
                 if (intervalSel && intervalForm) {
                   intervalSel.addEventListener('change', () => {
                     document.cookie = `station_trend_window=${encodeURIComponent(intervalSel.value)}; path=/; max-age=31536000; samesite=lax`;
-                    const cfgField = intervalForm.querySelector('input[name="chart_config"]');
-                    const chartConfigInput = document.getElementById('chartConfigInput');
-                    if (cfgField && chartConfigInput) cfgField.value = chartConfigInput.value;
+                    const prefsField = intervalForm.querySelector('input[name="browser_prefs"]');
+                    const browserPrefsInput = document.getElementById('browserPrefsInput');
+                    if (prefsField && browserPrefsInput) prefsField.value = browserPrefsInput.value;
                     intervalForm.submit();
                   });
                 }
@@ -3844,6 +4008,10 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             chart_config=chart_config,
             chart_config_json=chart_config_json,
             chart_cookie_name=chart_cookie_name,
+            browser_prefs_cookie_name=browser_prefs_cookie_name,
+            browser_prefs_json=browser_prefs_json,
+            table_prefs=table_prefs,
+            page_size_pref=page_size_pref,
             selected_fields=selected_fields,
             chart_labels=chart_labels,
             chart_datasets=chart_datasets,
@@ -3852,6 +4020,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             numeric_series_values=numeric_series_values,
             table_rows=table_rows,
             table_cols=table_cols,
+            all_table_columns=all_table_columns,
+            table_column_stats=table_column_stats,
             table_headers=table_headers,
             units_map=units_map,
             page=page,

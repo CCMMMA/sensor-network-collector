@@ -53,6 +53,53 @@ Chart setup rights are separate from download/browse rights.
 
 This is used for the Public Station Dashboard trend charts only.
 
+## Station browser chart and table preferences
+
+The authenticated station browser page `/station/<uuid>` has its own user-side browsing preferences.
+
+Chart section:
+
+- available parameters in the center
+- selected left-axis parameters on the left
+- selected right-axis parameters on the right
+- each selected parameter can define:
+  - chart type (`line` or `bar`)
+  - color
+  - `y_min`
+  - `y_max`
+  - `y_step`
+- each selected parameter has an `Auto range` action that computes `y_min`, `y_max`, and `y_step` from the parameter time series in the currently selected trend window
+- chart updates automatically when parameters are moved or visualization options are changed
+
+Table section:
+
+- rows per page can be selected as:
+  - `50`
+  - `100`
+  - `250`
+  - `Trend window`
+- `Trend window` shows all rows in the current trend window
+- users can hide/show columns
+- when numeric columns are selected for display, the table section shows minimum and maximum values for those visible columns
+
+Persistence:
+
+- station browser preferences are persisted per station
+- the same preference object stores:
+  - chart selection and left/right assignment
+  - chart type
+  - chart color
+  - chart `y_min`
+  - chart `y_max`
+  - chart `y_step`
+  - table page size
+  - visible columns
+
+Import/export:
+
+- station browser preferences can be exported/imported as JSON from the chart section
+- the JSON file includes both chart preferences and table preferences
+
 ## Public station chart axis settings
 
 The Public Station Dashboard supports per-station Y-axis configuration for each trend chart.
