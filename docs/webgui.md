@@ -79,8 +79,14 @@ Table section:
   - `250`
   - `Trend window`
 - `Trend window` shows all rows in the current trend window
-- users can hide/show columns
-- when numeric columns are selected for display, the table section shows minimum and maximum values for those visible columns
+- each table header embeds its own checkbox for show/hide control
+- when a column is hidden, its header collapses to checkbox width and the full title remains available as tooltip
+- the table section includes a `Statistics` area for visible numeric parameters in the current trend window
+- each statistics card shows:
+  - minimum and the timestamp when it occurred
+  - maximum and the timestamp when it occurred
+  - average
+  - standard deviation
 
 Persistence:
 

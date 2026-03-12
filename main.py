@@ -11,6 +11,7 @@ import secrets
 import signal
 import sqlite3
 import smtplib
+import statistics
 import sys
 import tempfile
 import threading
@@ -2232,11 +2233,31 @@ def serialize_station_browser_prefs(chart_config, table_prefs):
 def build_table_column_stats(rows, columns):
     stats = []
     for col in columns:
-        values = [_to_float(row.get(col)) for row in rows]
-        values = [v for v in values if v is not None]
+        samples = []
+        for row in rows:
+            value = _to_float(row.get(col))
+            if value is None:
+                continue
+            timestamp = str(row.get("timestamp") or "")
+            samples.append({"value": value, "timestamp": timestamp})
+        values = [sample["value"] for sample in samples]
         if not values:
             continue
-        stats.append({"column": col, "min": round(min(values), 6), "max": round(max(values), 6)})
+        min_sample = min(samples, key=lambda sample: sample["value"])
+        max_sample = max(samples, key=lambda sample: sample["value"])
+        avg = statistics.fmean(values)
+        stddev = statistics.pstdev(values) if len(values) > 1 else 0.0
+        stats.append(
+            {
+                "column": col,
+                "min": round(min_sample["value"], 6),
+                "min_at": min_sample["timestamp"],
+                "max": round(max_sample["value"], 6),
+                "max_at": max_sample["timestamp"],
+                "avg": round(avg, 6),
+                "stddev": round(stddev, 6),
+            }
+        )
     return stats
 
 
@@ -3515,10 +3536,11 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             c: f"{c} [{units_map.get(c, '-')}]"
             if c not in ("timestamp", "topic", "uuid", "name", "position", "latitude", "longitude", "lat", "lon", "lng")
             else c
-            for c in table_cols
+            for c in all_table_columns
         }
         visible_numeric_columns = [c for c in table_cols if c in numeric_cols]
         table_column_stats = build_table_column_stats(rows, visible_numeric_columns)
+        visible_column_set = set(table_cols)
 
         prev_anchor = shift_anchor(anchor, interval, -1).isoformat().replace("+00:00", "Z")
         next_anchor = shift_anchor(anchor, interval, 1).isoformat().replace("+00:00", "Z")
@@ -3539,6 +3561,14 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 .table-wrap { max-height: 420px; overflow: auto; border: 1px solid #ddd; }
                 .panel { border: 1px solid #ddd; padding: 12px; margin-bottom: 12px; border-radius: 8px; }
                 .chart-config-card { background: #fafafa; }
+                .table-col-header { display: flex; align-items: center; gap: 6px; min-width: 0; }
+                .table-col-title { display: inline-block; white-space: nowrap; }
+                .collapsed-column { width: 32px; min-width: 32px; max-width: 32px; padding-left: 4px; padding-right: 4px; }
+                .collapsed-column .table-col-header { justify-content: center; }
+                .collapsed-column .table-col-title { display: none; }
+                .collapsed-cell { width: 32px; min-width: 32px; max-width: 32px; padding: 0; }
+                .stats-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+                .stats-card { border: 1px solid #ddd; border-radius: 8px; padding: 10px; background: #fafafa; }
               </style>
             </head>
             <body class="container-fluid py-3">
@@ -3668,23 +3698,32 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                         <option value="window" {% if page_size_pref == 'window' %}selected{% endif %}>Trend window</option>
                       </select>
                     </div>
-                    <div class="col-12 col-md-9">
-                      <label class="form-label form-label-sm">Visible columns</label>
-                      <div id="tableColumnPicker" class="border rounded p-2 d-flex flex-wrap gap-2"></div>
-                    </div>
                   </div>
                 </form>
-                {% if table_column_stats %}
-                  <div class="d-flex flex-wrap gap-2 mb-2">
-                    {% for stat in table_column_stats %}
-                      <div class="border rounded px-2 py-1 bg-light">
-                        <div class="fw-semibold small">{{ stat.column }}</div>
-                        <div class="small text-muted">min {{ stat.min }}</div>
-                        <div class="small text-muted">max {{ stat.max }}</div>
-                      </div>
-                    {% endfor %}
-                  </div>
-                {% endif %}
+                <div class="mb-3">
+                  <h3 class="h5">Statistics</h3>
+                  {% if table_column_stats %}
+                    <div class="stats-grid">
+                      {% for stat in table_column_stats %}
+                        <div class="stats-card">
+                          <div class="fw-semibold">{{ stat.column }}{% if units_map.get(stat.column) %} [{{ units_map.get(stat.column) }}]{% endif %}</div>
+                          <div class="small text-muted">Minimum</div>
+                          <div>{{ stat.min }}</div>
+                          <div class="small text-muted mb-2">{{ stat.min_at or '-' }}</div>
+                          <div class="small text-muted">Maximum</div>
+                          <div>{{ stat.max }}</div>
+                          <div class="small text-muted mb-2">{{ stat.max_at or '-' }}</div>
+                          <div class="small text-muted">Average</div>
+                          <div class="mb-2">{{ stat.avg }}</div>
+                          <div class="small text-muted">Standard deviation</div>
+                          <div>{{ stat.stddev }}</div>
+                        </div>
+                      {% endfor %}
+                    </div>
+                  {% else %}
+                    <p class="text-muted mb-0">No numeric parameters available in the selected trend window.</p>
+                  {% endif %}
+                </div>
                 <p>Rows {{ start_idx + 1 if total_rows else 0 }}-{{ end_idx if end_idx < total_rows else total_rows }} of {{ total_rows }}</p>
                 <p>
                   {% if page > 1 %}
@@ -3698,11 +3737,29 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 <div class="table-wrap">
                   <table class="table table-sm table-striped table-bordered">
                     <thead>
-                      <tr>{% for c in table_cols %}<th>{{ table_headers[c] }}</th>{% endfor %}</tr>
+                      <tr>
+                        {% for c in all_table_columns %}
+                          <th class="{% if c not in visible_column_set %}collapsed-column{% endif %}" title="{{ table_headers[c] }}">
+                            <label class="table-col-header mb-0">
+                              <input class="form-check-input table-col-toggle" type="checkbox" value="{{ c }}" {% if c in visible_column_set %}checked{% endif %}>
+                              <span class="table-col-title">{{ table_headers[c] }}</span>
+                            </label>
+                          </th>
+                        {% endfor %}
+                      </tr>
                     </thead>
                     <tbody>
                       {% for r in table_rows %}
-                        <tr>{% for c in table_cols %}<td>{{ r.get(c, '') }}</td>{% endfor %}</tr>
+                        <tr>
+                          {% for c in all_table_columns %}
+                            <td class="{% if c not in visible_column_set %}collapsed-cell{% endif %}">{% if c in visible_column_set %}{{ r.get(c, '') }}{% endif %}</td>
+                          {% endfor %}
+                        </tr>
+                      {% endfor %}
+                      {% if not table_rows %}
+                        <tr>
+                          <td colspan="{{ all_table_columns|length if all_table_columns else 1 }}" class="text-center text-muted">No rows in the selected trend window.</td>
+                        </tr>
                       {% endfor %}
                     </tbody>
                   </table>
@@ -3988,26 +4045,14 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 }
                 const tablePrefsForm = document.getElementById('tablePrefsForm');
                 if (tablePrefsForm) {
-                  const picker = document.getElementById('tableColumnPicker');
                   const pageSizeSel = document.getElementById('tablePageSize');
                   const tableBrowserPrefsInput = document.getElementById('tableBrowserPrefsInput');
+                  const tableWrap = document.querySelector('.table-wrap');
 
                   function syncTablePrefsInput() {
                     const payload = { chart_config: chartConfigState, table: tablePrefsState };
                     if (tableBrowserPrefsInput) tableBrowserPrefsInput.value = JSON.stringify(payload);
                     document.cookie = `${browserPrefsCookieName}=${encodeURIComponent(JSON.stringify(payload))}; path=/; max-age=31536000; samesite=lax`;
-                  }
-
-                  function renderColumnPicker() {
-                    if (!picker) return;
-                    const visible = new Set(tablePrefsState.visible_columns || []);
-                    picker.innerHTML = allTableColumns
-                      .map((col) => `
-                        <label class="form-check form-check-inline mb-0">
-                          <input class="form-check-input table-col-toggle" type="checkbox" value="${col}" ${visible.has(col) ? 'checked' : ''}>
-                          <span class="form-check-label">${col}</span>
-                        </label>
-                      `).join('');
                   }
 
                   pageSizeSel?.addEventListener('change', () => {
@@ -4016,16 +4061,16 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     tablePrefsForm.requestSubmit();
                   });
 
-                  picker?.addEventListener('change', (event) => {
+                  tableWrap?.addEventListener('change', (event) => {
                     const target = event.target;
                     if (!(target instanceof HTMLInputElement) || !target.classList.contains('table-col-toggle')) return;
-                    const checked = Array.from(picker.querySelectorAll('.table-col-toggle:checked')).map((el) => el.value);
-                    tablePrefsState.visible_columns = checked.length ? checked : Array.from(picker.querySelectorAll('.table-col-toggle')).map((el) => el.value);
+                    const allToggles = Array.from(document.querySelectorAll('.table-col-toggle'));
+                    const checked = allToggles.filter((el) => el.checked).map((el) => el.value);
+                    tablePrefsState.visible_columns = checked.length ? checked : allToggles.map((el) => el.value);
                     syncTablePrefsInput();
                     tablePrefsForm.requestSubmit();
                   });
 
-                  renderColumnPicker();
                   syncTablePrefsInput();
                 }
                 const intervalSel = document.getElementById('intervalSelect');
@@ -4074,6 +4119,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             table_rows=table_rows,
             table_cols=table_cols,
             all_table_columns=all_table_columns,
+            visible_column_set=visible_column_set,
             table_column_stats=table_column_stats,
             table_headers=table_headers,
             units_map=units_map,

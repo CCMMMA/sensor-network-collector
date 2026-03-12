@@ -13,6 +13,7 @@ Threaded MQTT collector for weather/sensor networks, aligned with `vantage-publi
 - Web GUI for data download with authentication and access policies
 - Map-based station discovery on the home page
 - Data browsing per station with configurable charts and tables
+- Station browser table supports per-column header toggles and window statistics
 - Live station trend pages (auto-updating charts and latest table)
 - Public sensor network dashboard with auto-updating status and alarms
 - Per-station public trend-chart Y-axis configuration with controller/admin management
