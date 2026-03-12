@@ -194,7 +194,7 @@ SMTP fallback behavior:
 - in focused mode the chart title shows the parameter name followed by the selected trend window
 - in focused mode the top of the chart view shows:
   - web app logo
-  - station name centered
+  - station name centered, without UUID
   - station logo
 - when a chart is focused, the page shows compact numeric widgets horizontally below the chart for the selected trend window:
   - current
