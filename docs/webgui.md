@@ -191,6 +191,7 @@ SMTP fallback behavior:
 - double-clicking again restores the normal multi-chart layout
 - pressing `Esc` also exits the focused chart view
 - the focused chart state can be opened directly with query string `focus=<chart_key>`
+- in focused mode the chart title shows the parameter name followed by the selected trend window
 - in focused mode the top of the chart view shows:
   - web app logo
   - station name centered

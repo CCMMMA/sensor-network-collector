@@ -19,13 +19,16 @@
 - Keep changes focused and minimal.
 - Prefer small, reviewable commits.
 - Do not commit secrets, credentials, or environment-specific values.
+- Automatically update every affected document when code changes modify behavior, configuration, routes, APIs, data flow, UI/UX, deployment, storage, or integration semantics.
+- Always review whether `README.md`, `docs/*.md`, sample configuration files, and other user-facing documentation are affected by the code change, and update them in the same work item.
+- Do not leave documentation updates as an optional follow-up when the code modification changes anything user-visible or operator-visible.
 - Update `README.md` when behavior or configuration changes.
 - Keep `docs/*.md` aligned with current behavior for Web GUI, Signal K, storage, and deployment flows.
 
 ## Validation
 - For each change, at minimum:
   - Ensure `python main.py --config config.json` starts without syntax/runtime import errors.
-  - Refresh Markdown docs when user-visible behavior, URLs, units, or configuration semantics change.
+  - Refresh all affected Markdown and sample-configuration documents when user-visible behavior, URLs, units, configuration semantics, workflows, or operational guidance change.
   - Verify dependency updates are reflected in `requirements.txt`.
 
 ## File/Scope Conventions

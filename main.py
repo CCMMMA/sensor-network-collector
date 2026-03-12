@@ -3534,7 +3534,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 .fullscreen-branding-logo-left { justify-content: flex-start; }
                 .fullscreen-branding-logo-right { justify-content: flex-end; }
                 .fullscreen-branding img { max-height: 38px; max-width: 100%; object-fit: contain; }
-                .fullscreen-station-name { font-weight: 700; font-size: 1rem; text-align: center; }
+                .fullscreen-station-name { font-weight: 700; font-size: 1.35rem; text-align: center; line-height: 1.15; }
                 .chart-card .fullscreen-stats { display: none; }
                 .chart-card.fullscreen .fullscreen-stats {
                   display: grid;
@@ -3694,6 +3694,11 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   const d = new Date(value);
                   if (Number.isNaN(d.getTime())) return '';
                   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                }
+
+                function windowLabel(windowCode) {
+                  const options = new Map({{ window_options | tojson }});
+                  return options.get(windowCode) || windowCode || '';
                 }
 
                 function formatWindowTickWithDayChange(value, windowCode, index, ticks) {
@@ -3928,6 +3933,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     }
 
                     col.querySelector('.chart-title').textContent = s.label;
+                    const titleEl = col.querySelector('.chart-title');
+                    titleEl.textContent = `${s.label} - ${windowLabel(snapshot.window || currentWindow)}`;
                     col.querySelector('.chart-unit').textContent = s.unit || '';
                     col.querySelector('.fullscreen-station-name').textContent = snapshot.station_name || snapshot.instrument_uuid;
                     col.querySelector('.fullscreen-stats').innerHTML = renderStats(s.stats, s.unit || '');
