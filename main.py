@@ -2024,11 +2024,14 @@ def parse_station_browser_chart_config(request_args, numeric_cols):
             chart_type = "bar" if str(item.get("type") or "").strip().lower() == "bar" else "line"
             y_min = _to_float(item.get("min"))
             y_max = _to_float(item.get("max"))
+            y_step = _to_float(item.get("step"))
             if y_min is not None and y_max is not None and y_max <= y_min:
                 y_min = None
                 y_max = None
+            if y_step is not None and y_step <= 0:
+                y_step = None
             color = normalize_chart_color(item.get("color"), DEFAULT_CHART_COLORS[color_index % len(DEFAULT_CHART_COLORS)])
-            out[side].append({"field": field, "type": chart_type, "min": y_min, "max": y_max, "color": color})
+            out[side].append({"field": field, "type": chart_type, "min": y_min, "max": y_max, "step": y_step, "color": color})
             seen.add(field)
             color_index += 1
 
@@ -2041,6 +2044,7 @@ def parse_station_browser_chart_config(request_args, numeric_cols):
                     "type": "line",
                     "min": None,
                     "max": None,
+                    "step": None,
                     "color": DEFAULT_CHART_COLORS[idx % len(DEFAULT_CHART_COLORS)],
                 }
             )
@@ -2053,6 +2057,7 @@ def parse_station_browser_chart_config(request_args, numeric_cols):
                 "type": "line",
                 "min": None,
                 "max": None,
+                "step": None,
                 "color": DEFAULT_CHART_COLORS[0],
             }
         )
@@ -2074,6 +2079,8 @@ def serialize_station_browser_chart_config(chart_config):
                 entry["min"] = float(item["min"])
             if item.get("max") is not None:
                 entry["max"] = float(item["max"])
+            if item.get("step") is not None:
+                entry["step"] = float(item["step"])
             entry["color"] = normalize_chart_color(item.get("color"), DEFAULT_CHART_COLORS[len(clean[side]) % len(DEFAULT_CHART_COLORS)])
             clean[side].append(entry)
     return json.dumps(clean, separators=(",", ":"))
@@ -2119,6 +2126,8 @@ def build_station_browser_chart_model(rows, chart_config, units_map):
                 axis_cfg["min"] = float(item["min"])
             if item.get("max") is not None:
                 axis_cfg["max"] = float(item["max"])
+            if item.get("step") is not None:
+                axis_cfg["ticks"] = {"stepSize": float(item["step"])}
             y_axes[axis_id] = axis_cfg
 
     return labels, datasets, y_axes
@@ -3355,6 +3364,13 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         chart_config_json = serialize_station_browser_chart_config(chart_config)
         chart_labels, chart_datasets, chart_y_axes = build_station_browser_chart_model(rows, chart_config, units_map)
         selected_fields = [item["field"] for side in ("left", "right") for item in chart_config.get(side, [])]
+        numeric_series_values = {}
+        for field in numeric_cols:
+            numeric_series_values[field] = [
+                value
+                for value in (_to_float(row.get(field)) for row in rows)
+                if value is not None
+            ]
 
         page = max(1, int(request.args.get("page", "1") or "1"))
         page_size = int(request.args.get("page_size", "50") or "50")
@@ -3459,6 +3475,11 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     <input type="hidden" name="to_date" value="{{ request.args.get('to_date','') }}"/>
                     <input type="hidden" name="page_size" value="{{ page_size }}"/>
                     <input type="hidden" name="chart_config" id="chartConfigInput" value="{{ chart_config_json }}"/>
+                    <div class="d-flex flex-wrap gap-2 mb-3">
+                      <button class="btn btn-outline-secondary btn-sm" type="button" id="chartExportBtn">Export chart prefs</button>
+                      <label class="btn btn-outline-secondary btn-sm mb-0" for="chartImportFile">Import chart prefs</label>
+                      <input id="chartImportFile" type="file" accept="application/json,.json" hidden>
+                    </div>
                     <div class="row g-3 align-items-start">
                       <div class="col-12 col-xl-4">
                         <div class="border rounded p-2 h-100">
@@ -3493,9 +3514,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                         </div>
                       </div>
                     </div>
-                    <div class="mt-3">
-                      <button class="btn btn-primary btn-sm" type="submit">Update chart</button>
-                    </div>
+                    <noscript><div class="mt-3"><button class="btn btn-primary btn-sm" type="submit">Update chart</button></div></noscript>
                   </form>
                   <canvas id="chart" height="110"></canvas>
                 {% endif %}
@@ -3536,6 +3555,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 const allNumericCols = {{ numeric_cols | tojson }};
                 const chartConfigCookieName = {{ chart_cookie_name | tojson }};
                 const defaultChartColors = {{ default_chart_colors | tojson }};
+                const numericSeriesValues = {{ numeric_series_values | tojson }};
+                let autoSubmitTimer = null;
                 if (labels.length > 0 && datasets.length > 0 && document.getElementById('chart')) {
                   new Chart(document.getElementById('chart'), {
                     type: 'bar',
@@ -3570,6 +3591,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   const leftConfigEl = document.getElementById('leftConfig');
                   const rightConfigEl = document.getElementById('rightConfig');
                   const chartConfigInput = document.getElementById('chartConfigInput');
+                  const chartImportFile = document.getElementById('chartImportFile');
+                  const chartExportBtn = document.getElementById('chartExportBtn');
 
                   const selectedFieldSet = () => new Set([
                     ...chartConfigState.left.map((item) => item.field),
@@ -3623,6 +3646,13 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                             <label class="form-label form-label-sm mb-1">Y max</label>
                             <input class="form-control form-control-sm chart-max" data-side="${side}" data-index="${idx}" type="number" step="any" value="${item.max ?? ''}">
                           </div>
+                          <div class="col-12 col-md-3">
+                            <label class="form-label form-label-sm mb-1">Y step</label>
+                            <input class="form-control form-control-sm chart-step" data-side="${side}" data-index="${idx}" type="number" step="any" min="0.000001" value="${item.step ?? ''}">
+                          </div>
+                          <div class="col-12 col-md-3 d-flex align-items-end">
+                            <button class="btn btn-outline-secondary btn-sm w-100 chart-auto-range" data-side="${side}" data-index="${idx}" type="button">Auto range</button>
+                          </div>
                         </div>
                       </div>
                     `).join('');
@@ -3632,6 +3662,14 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     if (!chartConfigInput) return;
                     chartConfigInput.value = JSON.stringify(chartConfigState);
                     document.cookie = `${chartConfigCookieName}=${encodeURIComponent(chartConfigInput.value)}; path=/; max-age=31536000; samesite=lax`;
+                  }
+
+                  function scheduleAutoSubmit() {
+                    syncChartConfigInput();
+                    if (autoSubmitTimer) {
+                      window.clearTimeout(autoSubmitTimer);
+                    }
+                    autoSubmitTimer = window.setTimeout(() => chartForm.requestSubmit(), 150);
                   }
 
                   function renderChartSelector() {
@@ -3652,9 +3690,10 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                         ...chartConfigState.right.map((item) => item.color)
                       ]);
                       const nextColor = defaultChartColors.find((color) => !usedColors.has(color)) || defaultChartColors[0];
-                      chartConfigState[side].push({ field: opt.value, type: 'line', min: null, max: null, color: nextColor });
+                      chartConfigState[side].push({ field: opt.value, type: 'line', min: null, max: null, step: null, color: nextColor });
                     });
                     renderChartSelector();
+                    scheduleAutoSubmit();
                   }
 
                   function removeFrom(side, selectEl) {
@@ -3662,6 +3701,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     const selected = new Set(Array.from(selectEl.selectedOptions).map((o) => o.value));
                     chartConfigState[side] = chartConfigState[side].filter((item) => !selected.has(item.field));
                     renderChartSelector();
+                    scheduleAutoSubmit();
                   }
 
                   document.getElementById('addLeftBtn')?.addEventListener('click', () => moveAvailableTo('left'));
@@ -3684,11 +3724,91 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                       item.min = target.value === '' ? null : Number(target.value);
                     } else if (target.classList.contains('chart-max')) {
                       item.max = target.value === '' ? null : Number(target.value);
+                    } else if (target.classList.contains('chart-step')) {
+                      item.step = target.value === '' ? null : Number(target.value);
                     }
-                    syncChartConfigInput();
+                    scheduleAutoSubmit();
+                  });
+
+                  chartForm.addEventListener('click', (event) => {
+                    const target = event.target;
+                    if (!(target instanceof HTMLElement) || !target.classList.contains('chart-auto-range')) return;
+                    const side = target.dataset.side;
+                    const index = Number(target.dataset.index);
+                    if (!side || !Number.isInteger(index) || !chartConfigState[side] || !chartConfigState[side][index]) return;
+                    const item = chartConfigState[side][index];
+                    const values = (numericSeriesValues[item.field] || []).map(Number).filter((v) => Number.isFinite(v));
+                    if (!values.length) return;
+                    let lo = Math.min(...values);
+                    let hi = Math.max(...values);
+                    if (lo === hi) {
+                      const pad = Math.max(1.0, Math.abs(lo) * 0.15);
+                      lo -= pad;
+                      hi += pad;
+                    } else {
+                      const pad = (hi - lo) * 0.15;
+                      lo -= pad;
+                      hi += pad;
+                    }
+                    const span = Math.max(hi - lo, 1e-9);
+                    const roughStep = span / 6;
+                    const exponent = Math.floor(Math.log10(roughStep));
+                    const fraction = roughStep / (10 ** exponent);
+                    let niceFraction = 1;
+                    if (fraction <= 1) niceFraction = 1;
+                    else if (fraction <= 2) niceFraction = 2;
+                    else if (fraction <= 5) niceFraction = 5;
+                    else niceFraction = 10;
+                    const step = niceFraction * (10 ** exponent);
+                    item.min = Number((Math.floor(lo / step) * step).toFixed(6));
+                    item.max = Number((Math.ceil(hi / step) * step).toFixed(6));
+                    item.step = Number(step.toFixed(6));
+                    renderChartSelector();
+                    scheduleAutoSubmit();
                   });
 
                   chartForm.addEventListener('submit', () => syncChartConfigInput());
+
+                  if (chartExportBtn) {
+                    chartExportBtn.addEventListener('click', () => {
+                      syncChartConfigInput();
+                      const payload = {
+                        instrument_uuid: {{ instrument_uuid | tojson }},
+                        exported_at: new Date().toISOString(),
+                        chart_config: chartConfigState,
+                      };
+                      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `${({{ instrument_uuid | tojson }} || 'station')}_chart_preferences.json`;
+                      a.click();
+                      URL.revokeObjectURL(url);
+                    });
+                  }
+
+                  if (chartImportFile) {
+                    chartImportFile.addEventListener('change', async () => {
+                      const file = chartImportFile.files && chartImportFile.files[0];
+                      if (!file) return;
+                      try {
+                        const payload = JSON.parse(await file.text());
+                        if (!payload || typeof payload.chart_config !== 'object') {
+                          window.alert('Invalid chart preferences JSON file.');
+                          return;
+                        }
+                        chartConfigState.left = Array.isArray(payload.chart_config.left) ? payload.chart_config.left : [];
+                        chartConfigState.right = Array.isArray(payload.chart_config.right) ? payload.chart_config.right : [];
+                        renderChartSelector();
+                        scheduleAutoSubmit();
+                      } catch (_) {
+                        window.alert('Invalid chart preferences JSON file.');
+                      } finally {
+                        chartImportFile.value = '';
+                      }
+                    });
+                  }
+
                   renderChartSelector();
                 }
                 const intervalSel = document.getElementById('intervalSelect');
@@ -3697,6 +3817,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   intervalSel.addEventListener('change', () => {
                     document.cookie = `station_trend_window=${encodeURIComponent(intervalSel.value)}; path=/; max-age=31536000; samesite=lax`;
                     const cfgField = intervalForm.querySelector('input[name="chart_config"]');
+                    const chartConfigInput = document.getElementById('chartConfigInput');
                     if (cfgField && chartConfigInput) cfgField.value = chartConfigInput.value;
                     intervalForm.submit();
                   });
@@ -3728,6 +3849,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             chart_datasets=chart_datasets,
             chart_y_axes=chart_y_axes,
             default_chart_colors=DEFAULT_CHART_COLORS,
+            numeric_series_values=numeric_series_values,
             table_rows=table_rows,
             table_cols=table_cols,
             table_headers=table_headers,
