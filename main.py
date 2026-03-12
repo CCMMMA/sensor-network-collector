@@ -1967,6 +1967,163 @@ def extract_numeric_series(rows, excluded=None):
     return sorted(numeric_keys)
 
 
+DEFAULT_CHART_COLORS = [
+    "#0b57d0",
+    "#1f9d55",
+    "#d95f02",
+    "#7b1fa2",
+    "#c2185b",
+    "#00838f",
+    "#5d4037",
+    "#455a64",
+]
+
+
+def normalize_chart_color(value, fallback="#0b57d0"):
+    raw = str(value or "").strip()
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", raw):
+        return raw.lower()
+    return fallback
+
+
+def hex_to_rgba(hex_color: str, alpha: float):
+    color = normalize_chart_color(hex_color)
+    r = int(color[1:3], 16)
+    g = int(color[3:5], 16)
+    b = int(color[5:7], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def parse_station_browser_chart_config(request_args, numeric_cols):
+    numeric_cols = list(numeric_cols or [])
+    numeric_set = set(numeric_cols)
+    out = {"left": [], "right": []}
+    seen = set()
+
+    raw = str(request_args.get("chart_config", "") or "").strip()
+    payload = {}
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except Exception:
+            payload = {}
+
+    color_index = 0
+    for side in ("left", "right"):
+        items = payload.get(side)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            field = str(item.get("field") or "").strip()
+            if field not in numeric_set or field in seen:
+                continue
+            chart_type = "bar" if str(item.get("type") or "").strip().lower() == "bar" else "line"
+            y_min = _to_float(item.get("min"))
+            y_max = _to_float(item.get("max"))
+            if y_min is not None and y_max is not None and y_max <= y_min:
+                y_min = None
+                y_max = None
+            color = normalize_chart_color(item.get("color"), DEFAULT_CHART_COLORS[color_index % len(DEFAULT_CHART_COLORS)])
+            out[side].append({"field": field, "type": chart_type, "min": y_min, "max": y_max, "color": color})
+            seen.add(field)
+            color_index += 1
+
+    legacy_selected = [f for f in request_args.getlist("field") if f in numeric_set and f not in seen]
+    if not out["left"] and not out["right"] and legacy_selected:
+        for idx, field in enumerate(legacy_selected):
+            out["left"].append(
+                {
+                    "field": field,
+                    "type": "line",
+                    "min": None,
+                    "max": None,
+                    "color": DEFAULT_CHART_COLORS[idx % len(DEFAULT_CHART_COLORS)],
+                }
+            )
+            seen.add(field)
+
+    if not out["left"] and not out["right"] and numeric_cols:
+        out["left"].append(
+            {
+                "field": numeric_cols[0],
+                "type": "line",
+                "min": None,
+                "max": None,
+                "color": DEFAULT_CHART_COLORS[0],
+            }
+        )
+
+    return out
+
+
+def serialize_station_browser_chart_config(chart_config):
+    clean = {"left": [], "right": []}
+    for side in ("left", "right"):
+        for item in chart_config.get(side, []):
+            if not isinstance(item, dict):
+                continue
+            field = str(item.get("field") or "").strip()
+            if not field:
+                continue
+            entry = {"field": field, "type": "bar" if item.get("type") == "bar" else "line"}
+            if item.get("min") is not None:
+                entry["min"] = float(item["min"])
+            if item.get("max") is not None:
+                entry["max"] = float(item["max"])
+            entry["color"] = normalize_chart_color(item.get("color"), DEFAULT_CHART_COLORS[len(clean[side]) % len(DEFAULT_CHART_COLORS)])
+            clean[side].append(entry)
+    return json.dumps(clean, separators=(",", ":"))
+
+
+def build_station_browser_chart_model(rows, chart_config, units_map):
+    labels = [str(row.get("timestamp") or "") for row in rows]
+    datasets = []
+    y_axes = {}
+
+    for side in ("left", "right"):
+        side_items = chart_config.get(side, [])
+        for idx, item in enumerate(side_items):
+            field = item["field"]
+            axis_id = f"{side}_{idx}"
+            unit = units_map.get(field, "")
+            label = f"{field} [{unit or '-'}]"
+            data = []
+            for row in rows:
+                value = _to_float(row.get(field))
+                data.append(None if value is None else round(value, 6))
+            datasets.append(
+                {
+                    "field": field,
+                    "label": label,
+                    "data": data,
+                    "unit": unit,
+                    "type": "bar" if item.get("type") == "bar" else "line",
+                    "yAxisID": axis_id,
+                    "axisSide": side,
+                    "color": normalize_chart_color(item.get("color"), DEFAULT_CHART_COLORS[len(datasets) % len(DEFAULT_CHART_COLORS)]),
+                }
+            )
+            axis_cfg = {
+                "type": "linear",
+                "display": True,
+                "position": side,
+                "title": {"display": True, "text": label},
+                "grid": {"drawOnChartArea": side == "left" and idx == 0},
+                "offset": idx > 0,
+            }
+            if item.get("min") is not None:
+                axis_cfg["min"] = float(item["min"])
+            if item.get("max") is not None:
+                axis_cfg["max"] = float(item["max"])
+            y_axes[axis_id] = axis_cfg
+
+    return labels, datasets, y_axes
+
+
 PUBLIC_METRIC_SPECS = [
     {"key": "temperature", "label": "Temperature", "aliases": ["TempOut", "temperature", "outside_temp", "temp"], "unit": "C"},
     {"key": "humidity", "label": "Humidity", "aliases": ["HumOut", "humidity", "hum"], "unit": "%"},
@@ -3187,33 +3344,17 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         excluded = {"timestamp", "topic", "uuid", "position", "latitude", "longitude", "lat", "lon", "lng"}
         numeric_cols = extract_numeric_series(rows, excluded=excluded)
 
-        selected_fields = [f for f in request.args.getlist("field") if f in numeric_cols]
-        if not selected_fields and numeric_cols:
-            selected_fields = [numeric_cols[0]]
-
         units_map = get_field_units(cfg)
-
-        chart_labels = []
-        chart_datasets = []
-        for field in selected_fields:
-            d_labels = []
-            d_values = []
-            for row in rows:
-                y = _to_float(row.get(field))
-                if y is None:
-                    continue
-                d_labels.append(row.get("timestamp") or "")
-                d_values.append(y)
-            if len(d_labels) > len(chart_labels):
-                chart_labels = d_labels
-            chart_datasets.append(
-                {
-                    "field": field,
-                    "label": f"{field} [{units_map.get(field, '-')}]",
-                    "data": d_values,
-                    "unit": units_map.get(field, ""),
-                }
-            )
+        chart_cookie_name = f"station_chart_config_{safe_filename(instrument_uuid)}"
+        chart_config_args = request.args
+        if not str(request.args.get("chart_config", "") or "").strip():
+            cookie_chart_config = request.cookies.get(chart_cookie_name, "")
+            if cookie_chart_config:
+                chart_config_args = {"chart_config": cookie_chart_config}
+        chart_config = parse_station_browser_chart_config(chart_config_args, numeric_cols)
+        chart_config_json = serialize_station_browser_chart_config(chart_config)
+        chart_labels, chart_datasets, chart_y_axes = build_station_browser_chart_model(rows, chart_config, units_map)
+        selected_fields = [item["field"] for side in ("left", "right") for item in chart_config.get(side, [])]
 
         page = max(1, int(request.args.get("page", "1") or "1"))
         page_size = int(request.args.get("page_size", "50") or "50")
@@ -3251,6 +3392,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 th { position: sticky; top: 0; background: #f8f8f8; }
                 .table-wrap { max-height: 420px; overflow: auto; border: 1px solid #ddd; }
                 .panel { border: 1px solid #ddd; padding: 12px; margin-bottom: 12px; border-radius: 8px; }
+                .chart-config-card { background: #fafafa; }
               </style>
             </head>
             <body class="container-fluid py-3">
@@ -3272,13 +3414,13 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     </select>
                   </label>
                   <input type="hidden" name="anchor" value="{{ request.args.get('anchor','') }}"/>
-                  {% for f in selected_fields %}<input type="hidden" name="field" value="{{ f }}"/>{% endfor %}
+                  <input type="hidden" name="chart_config" value="{{ chart_config_json }}"/>
                   <input type="hidden" name="page_size" value="{{ page_size }}"/>
                 </form>
                 <p>
-                  <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=prev_anchor, page_size=page_size, field=selected_fields) }}">&#8592; previous {{ interval_label }}</a>
+                  <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=prev_anchor, page_size=page_size, chart_config=chart_config_json, from_date=request.args.get('from_date',''), to_date=request.args.get('to_date','')) }}">&#8592; previous {{ interval_label }}</a>
                   |
-                  <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=next_anchor, page_size=page_size, field=selected_fields) }}">next {{ interval_label }} &#8594;</a>
+                  <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=next_anchor, page_size=page_size, chart_config=chart_config_json, from_date=request.args.get('from_date',''), to_date=request.args.get('to_date','')) }}">next {{ interval_label }} &#8594;</a>
                 </p>
                 <p>Showing data in window: {{ win_start }} to {{ win_end }} UTC</p>
               </div>
@@ -3316,16 +3458,44 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     <input type="hidden" name="from_date" value="{{ request.args.get('from_date','') }}"/>
                     <input type="hidden" name="to_date" value="{{ request.args.get('to_date','') }}"/>
                     <input type="hidden" name="page_size" value="{{ page_size }}"/>
-                    <fieldset>
-                      <legend>Variables</legend>
-                      {% for c in numeric_cols %}
-                        <label style="display:inline-block; margin-right:10px;">
-                          <input type="checkbox" name="field" value="{{ c }}" {% if c in selected_fields %}checked{% endif %}>
-                          {{ c }} [{{ units_map.get(c,'-') }}]
-                        </label>
-                      {% endfor %}
-                    </fieldset>
-                    <noscript><button class="btn btn-secondary btn-sm" type="submit">Update</button></noscript>
+                    <input type="hidden" name="chart_config" id="chartConfigInput" value="{{ chart_config_json }}"/>
+                    <div class="row g-3 align-items-start">
+                      <div class="col-12 col-xl-4">
+                        <div class="border rounded p-2 h-100">
+                          <div class="fw-semibold mb-2">Left Axis</div>
+                          <select id="leftSelected" class="form-select" size="9" multiple></select>
+                          <div id="leftConfig" class="mt-2"></div>
+                        </div>
+                      </div>
+                      <div class="col-12 col-xl-1 d-flex flex-xl-column justify-content-center align-items-stretch gap-2">
+                        <button class="btn btn-outline-primary btn-sm" type="button" id="addLeftBtn" title="Add to left axis">&larr;&larr;</button>
+                        <button class="btn btn-outline-secondary btn-sm" type="button" id="removeLeftBtn" title="Remove from left axis">&rarr;&rarr;</button>
+                      </div>
+                      <div class="col-12 col-xl-2">
+                        <div class="border rounded p-2 h-100">
+                          <div class="fw-semibold mb-2">Available Parameters</div>
+                          <select id="availableFields" class="form-select" size="12" multiple>
+                            {% for c in numeric_cols %}
+                              <option value="{{ c }}">{{ c }} [{{ units_map.get(c,'-') }}]</option>
+                            {% endfor %}
+                          </select>
+                        </div>
+                      </div>
+                      <div class="col-12 col-xl-1 d-flex flex-xl-column justify-content-center align-items-stretch gap-2">
+                        <button class="btn btn-outline-primary btn-sm" type="button" id="addRightBtn" title="Add to right axis">&rarr;&rarr;</button>
+                        <button class="btn btn-outline-secondary btn-sm" type="button" id="removeRightBtn" title="Remove from right axis">&larr;&larr;</button>
+                      </div>
+                      <div class="col-12 col-xl-4">
+                        <div class="border rounded p-2 h-100">
+                          <div class="fw-semibold mb-2 text-xl-end">Right Axis</div>
+                          <select id="rightSelected" class="form-select" size="9" multiple></select>
+                          <div id="rightConfig" class="mt-2"></div>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="mt-3">
+                      <button class="btn btn-primary btn-sm" type="submit">Update chart</button>
+                    </div>
                   </form>
                   <canvas id="chart" height="110"></canvas>
                 {% endif %}
@@ -3336,11 +3506,11 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 <p>Rows {{ start_idx + 1 if total_rows else 0 }}-{{ end_idx if end_idx < total_rows else total_rows }} of {{ total_rows }}</p>
                 <p>
                   {% if page > 1 %}
-                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=request.args.get('anchor',''), from_date=request.args.get('from_date',''), to_date=request.args.get('to_date',''), page=page-1, page_size=page_size, field=selected_fields) }}">&#8592; prev page</a>
+                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=request.args.get('anchor',''), from_date=request.args.get('from_date',''), to_date=request.args.get('to_date',''), page=page-1, page_size=page_size, chart_config=chart_config_json) }}">&#8592; prev page</a>
                   {% endif %}
                   {% if page < page_count %}
                     {% if page > 1 %}|{% endif %}
-                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=request.args.get('anchor',''), from_date=request.args.get('from_date',''), to_date=request.args.get('to_date',''), page=page+1, page_size=page_size, field=selected_fields) }}">next page &#8594;</a>
+                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=request.args.get('anchor',''), from_date=request.args.get('from_date',''), to_date=request.args.get('to_date',''), page=page+1, page_size=page_size, chart_config=chart_config_json) }}">next page &#8594;</a>
                   {% endif %}
                 </p>
                 <div class="table-wrap">
@@ -3360,32 +3530,33 @@ def create_web_app(cfg: dict, access_store: AccessStore):
               <script>
                 const labels = {{ chart_labels | tojson }};
                 const datasets = {{ chart_datasets | tojson }};
+                const yAxes = {{ chart_y_axes | tojson }};
+                const chartConfigState = {{ chart_config | tojson }};
+                const unitsMap = {{ units_map | tojson }};
+                const allNumericCols = {{ numeric_cols | tojson }};
+                const chartConfigCookieName = {{ chart_cookie_name | tojson }};
+                const defaultChartColors = {{ default_chart_colors | tojson }};
                 if (labels.length > 0 && datasets.length > 0 && document.getElementById('chart')) {
                   new Chart(document.getElementById('chart'), {
-                    type: 'line',
+                    type: 'bar',
                     data: {
                       labels,
                       datasets: datasets.map((d, idx) => ({
+                        type: d.type || 'line',
                         label: d.label,
                         data: d.data,
-                        borderColor: ['#0b57d0','#1f9d55','#d95f02','#7b1fa2','#c2185b'][idx % 5],
+                        borderColor: d.color || defaultChartColors[idx % defaultChartColors.length],
+                        backgroundColor: d.color ? `${d.color}40` : ['rgba(11,87,208,0.25)','rgba(31,157,85,0.25)','rgba(217,95,2,0.25)','rgba(123,31,162,0.25)','rgba(194,24,91,0.25)'][idx % 5],
                         pointRadius: 0,
-                        tension: 0.2
+                        tension: 0.2,
+                        yAxisID: d.yAxisID
                       }))
                     },
                     options: {
                       responsive: true,
                       scales: {
                         x: { display: true, title: { display: true, text: 'timestamp' } },
-                        y: {
-                          display: true,
-                          title: {
-                            display: true,
-                            text: (new Set(datasets.map(d => d.unit || '-')).size === 1)
-                              ? `value [${datasets[0].unit || '-'}]`
-                              : 'value [mixed units]'
-                          }
-                        }
+                        ...yAxes
                       }
                     }
                   });
@@ -3393,15 +3564,140 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
                 const chartForm = document.getElementById('chartForm');
                 if (chartForm) {
-                  chartForm.querySelectorAll('input[type="checkbox"]').forEach((el) => {
-                    el.addEventListener('change', () => chartForm.submit());
+                  const availableSel = document.getElementById('availableFields');
+                  const leftSel = document.getElementById('leftSelected');
+                  const rightSel = document.getElementById('rightSelected');
+                  const leftConfigEl = document.getElementById('leftConfig');
+                  const rightConfigEl = document.getElementById('rightConfig');
+                  const chartConfigInput = document.getElementById('chartConfigInput');
+
+                  const selectedFieldSet = () => new Set([
+                    ...chartConfigState.left.map((item) => item.field),
+                    ...chartConfigState.right.map((item) => item.field)
+                  ]);
+
+                  function fieldLabel(field) {
+                    return `${field} [${unitsMap[field] || '-'}]`;
+                  }
+
+                  function renderSelectOptions(selectEl, fields) {
+                    if (!selectEl) return;
+                    const prev = new Set(Array.from(selectEl.selectedOptions).map((o) => o.value));
+                    selectEl.innerHTML = '';
+                    fields.forEach((field) => {
+                      const opt = document.createElement('option');
+                      opt.value = field;
+                      opt.textContent = fieldLabel(field);
+                      if (prev.has(field)) opt.selected = true;
+                      selectEl.appendChild(opt);
+                    });
+                  }
+
+                  function renderAxisConfig(side, targetEl) {
+                    if (!targetEl) return;
+                    const items = chartConfigState[side] || [];
+                    if (!items.length) {
+                      targetEl.innerHTML = '<div class="text-muted small">No parameters selected for this axis.</div>';
+                      return;
+                    }
+                    targetEl.innerHTML = items.map((item, idx) => `
+                      <div class="border rounded p-2 mb-2 chart-config-card">
+                        <div class="fw-semibold small mb-2">${fieldLabel(item.field)}</div>
+                        <div class="row g-2">
+                          <div class="col-12 col-md-3">
+                            <label class="form-label form-label-sm mb-1">Chart</label>
+                            <select class="form-select form-select-sm chart-type" data-side="${side}" data-index="${idx}">
+                              <option value="line" ${item.type === 'line' ? 'selected' : ''}>line</option>
+                              <option value="bar" ${item.type === 'bar' ? 'selected' : ''}>bar</option>
+                            </select>
+                          </div>
+                          <div class="col-12 col-md-3">
+                            <label class="form-label form-label-sm mb-1">Color</label>
+                            <input class="form-control form-control-sm chart-color" data-side="${side}" data-index="${idx}" type="color" value="${item.color || defaultChartColors[0]}">
+                          </div>
+                          <div class="col-12 col-md-3">
+                            <label class="form-label form-label-sm mb-1">Y min</label>
+                            <input class="form-control form-control-sm chart-min" data-side="${side}" data-index="${idx}" type="number" step="any" value="${item.min ?? ''}">
+                          </div>
+                          <div class="col-12 col-md-3">
+                            <label class="form-label form-label-sm mb-1">Y max</label>
+                            <input class="form-control form-control-sm chart-max" data-side="${side}" data-index="${idx}" type="number" step="any" value="${item.max ?? ''}">
+                          </div>
+                        </div>
+                      </div>
+                    `).join('');
+                  }
+
+                  function syncChartConfigInput() {
+                    if (!chartConfigInput) return;
+                    chartConfigInput.value = JSON.stringify(chartConfigState);
+                    document.cookie = `${chartConfigCookieName}=${encodeURIComponent(chartConfigInput.value)}; path=/; max-age=31536000; samesite=lax`;
+                  }
+
+                  function renderChartSelector() {
+                    const selected = selectedFieldSet();
+                    renderSelectOptions(availableSel, allNumericCols.filter((field) => !selected.has(field)));
+                    renderSelectOptions(leftSel, chartConfigState.left.map((item) => item.field));
+                    renderSelectOptions(rightSel, chartConfigState.right.map((item) => item.field));
+                    renderAxisConfig('left', leftConfigEl);
+                    renderAxisConfig('right', rightConfigEl);
+                    syncChartConfigInput();
+                  }
+
+                  function moveAvailableTo(side) {
+                    if (!availableSel) return;
+                    Array.from(availableSel.selectedOptions).forEach((opt) => {
+                      const usedColors = new Set([
+                        ...chartConfigState.left.map((item) => item.color),
+                        ...chartConfigState.right.map((item) => item.color)
+                      ]);
+                      const nextColor = defaultChartColors.find((color) => !usedColors.has(color)) || defaultChartColors[0];
+                      chartConfigState[side].push({ field: opt.value, type: 'line', min: null, max: null, color: nextColor });
+                    });
+                    renderChartSelector();
+                  }
+
+                  function removeFrom(side, selectEl) {
+                    if (!selectEl) return;
+                    const selected = new Set(Array.from(selectEl.selectedOptions).map((o) => o.value));
+                    chartConfigState[side] = chartConfigState[side].filter((item) => !selected.has(item.field));
+                    renderChartSelector();
+                  }
+
+                  document.getElementById('addLeftBtn')?.addEventListener('click', () => moveAvailableTo('left'));
+                  document.getElementById('addRightBtn')?.addEventListener('click', () => moveAvailableTo('right'));
+                  document.getElementById('removeLeftBtn')?.addEventListener('click', () => removeFrom('left', leftSel));
+                  document.getElementById('removeRightBtn')?.addEventListener('click', () => removeFrom('right', rightSel));
+
+                  chartForm.addEventListener('change', (event) => {
+                    const target = event.target;
+                    if (!(target instanceof HTMLElement)) return;
+                    const side = target.dataset.side;
+                    const index = Number(target.dataset.index);
+                    if (!side || !Number.isInteger(index) || !chartConfigState[side] || !chartConfigState[side][index]) return;
+                    const item = chartConfigState[side][index];
+                    if (target.classList.contains('chart-type')) {
+                      item.type = target.value === 'bar' ? 'bar' : 'line';
+                    } else if (target.classList.contains('chart-color')) {
+                      item.color = target.value || defaultChartColors[0];
+                    } else if (target.classList.contains('chart-min')) {
+                      item.min = target.value === '' ? null : Number(target.value);
+                    } else if (target.classList.contains('chart-max')) {
+                      item.max = target.value === '' ? null : Number(target.value);
+                    }
+                    syncChartConfigInput();
                   });
+
+                  chartForm.addEventListener('submit', () => syncChartConfigInput());
+                  renderChartSelector();
                 }
                 const intervalSel = document.getElementById('intervalSelect');
                 const intervalForm = document.getElementById('intervalForm');
                 if (intervalSel && intervalForm) {
                   intervalSel.addEventListener('change', () => {
                     document.cookie = `station_trend_window=${encodeURIComponent(intervalSel.value)}; path=/; max-age=31536000; samesite=lax`;
+                    const cfgField = intervalForm.querySelector('input[name="chart_config"]');
+                    if (cfgField && chartConfigInput) cfgField.value = chartConfigInput.value;
                     intervalForm.submit();
                   });
                 }
@@ -3424,9 +3720,14 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             next_anchor=next_anchor,
             rows=rows,
             numeric_cols=numeric_cols,
+            chart_config=chart_config,
+            chart_config_json=chart_config_json,
+            chart_cookie_name=chart_cookie_name,
             selected_fields=selected_fields,
             chart_labels=chart_labels,
             chart_datasets=chart_datasets,
+            chart_y_axes=chart_y_axes,
+            default_chart_colors=DEFAULT_CHART_COLORS,
             table_rows=table_rows,
             table_cols=table_cols,
             table_headers=table_headers,
