@@ -2345,6 +2345,18 @@ def _aqi_status(value):
     return {"level": "bad", "label": "Bad conditions", "color": "#dc3545"}
 
 
+def _build_series_stats(values, label: str = ""):
+    clean = [float(v) for v in values if v is not None]
+    if not clean:
+        return None
+    return {
+        "label": label,
+        "current": round(clean[-1], 3),
+        "min": round(min(clean), 3),
+        "max": round(max(clean), 3),
+    }
+
+
 def build_public_station_snapshot(
     storage_root: str,
     instrument_uuid: str,
@@ -2447,6 +2459,7 @@ def build_public_station_snapshot(
                     "labels": labels,
                     "values": values,
                     "points": points,
+                    "stats": _build_series_stats(values, resolved_spec["label"]),
                 }
             )
 
@@ -2481,6 +2494,9 @@ def build_public_station_snapshot(
     if pm_datasets:
         pm_spec = chart_specs.get("particulate_matter", {"axis": {"auto": True, "floor_zero": True}})
         y_min, y_max, y_step = _calc_axis_settings(pm_all_values, pm_spec.get("axis"))
+        dataset_stats = []
+        for dataset in pm_datasets:
+            dataset_stats.append(_build_series_stats(dataset.get("values") or [], dataset.get("label", "")))
         series.append(
             {
                 "key": "particulate_matter",
@@ -2491,6 +2507,7 @@ def build_public_station_snapshot(
                 "y_step": y_step,
                 "labels": pm_labels,
                 "datasets": pm_datasets,
+                "stats": [item for item in dataset_stats if item],
             }
         )
 
@@ -3451,6 +3468,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         can_browse_download = bool(user) and station_is_accessible(user, instrument_uuid)
         can_control = bool(user) and station_is_controllable(user, instrument_uuid)
         selected_window = request_preference_cookie(request, "window", "public_trend_window", normalize_public_window, "hour")
+        selected_focus = str(request.args.get("focus", "") or "").strip()
         snapshot = build_public_station_snapshot(
             storage_root,
             instrument_uuid,
@@ -3479,7 +3497,35 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 .metric-unit { font-size: .72rem; margin-left: .2rem; }
                 #chartsWrap { flex: 1 1 auto; min-height: 0; overflow: visible; }
                 .chart-card { height: 170px; }
+                .chart-card .card-body { height: 100%; display: flex; flex-direction: column; }
                 .chart-card canvas { height: 112px !important; }
+                .chart-card.fullscreen {
+                  position: fixed;
+                  inset: 10px;
+                  z-index: 2000;
+                  height: auto;
+                  border: 2px solid rgba(13,110,253,.18);
+                  box-shadow: 0 1rem 3rem rgba(0,0,0,.25);
+                }
+                .chart-card.fullscreen canvas { height: calc(100vh - 220px) !important; }
+                .chart-card .fullscreen-stats { display: none; }
+                .chart-card.fullscreen .fullscreen-stats {
+                  display: flex;
+                  flex-wrap: wrap;
+                  gap: .5rem;
+                  margin-bottom: .5rem;
+                }
+                .chart-card.fullscreen .fullscreen-hint { display: none; }
+                .chart-card .fullscreen-hint { font-size: .72rem; color: #6c757d; }
+                .stat-chip {
+                  min-width: 110px;
+                  border: 1px solid #dee2e6;
+                  border-radius: .5rem;
+                  padding: .35rem .5rem;
+                  background: #fff;
+                }
+                .stat-chip-label { font-size: .72rem; color: #6c757d; }
+                .stat-chip-value { font-weight: 700; line-height: 1.1; }
                 .aqi-card { min-height: 94px; }
                 .aqi-stack { display: flex; gap: .45rem; align-items: center; }
                 .aqi-lights { display: flex; flex-direction: column-reverse; gap: .35rem; }
@@ -3489,6 +3535,10 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 .aqi-light.warning.active { background: #ffc107; }
                 .aqi-light.bad.active { background: #dc3545; }
                 .aqi-status-value { font-size: 1.4rem; line-height: 1; font-weight: 700; }
+                body.chart-focus-active #cards,
+                body.chart-focus-active #aqiStatus,
+                body.chart-focus-active #charts > div:not(.focus-host) { display: none !important; }
+                body.chart-focus-active #charts > div.focus-host { display: block !important; width: 100%; }
               </style>
             </head>
             <body class="bg-light">
@@ -3534,6 +3584,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 let currentWindow = {{ selected_window | tojson }};
                 const chartInstances = {};
                 const windowSelect = document.getElementById('windowSelect');
+                let focusedChartKey = {{ selected_focus | tojson }};
                 const colors = ['#0d6efd', '#20c997', '#fd7e14', '#6f42c1', '#dc3545', '#198754', '#6c757d'];
                 const SECOND_MS = 1000;
                 const MINUTE_MS = 60 * SECOND_MS;
@@ -3665,13 +3716,56 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   chartsEl.innerHTML = '';
 
                   const series = snapshot.series || [];
+                  const knownKeys = new Set(series.map((item) => item.key));
+                  if (focusedChartKey && !knownKeys.has(focusedChartKey)) {
+                    focusedChartKey = '';
+                  }
                   const xMin = snapshot.window_start ? Date.parse(snapshot.window_start) : undefined;
                   const xMax = snapshot.window_end ? Date.parse(snapshot.window_end) : undefined;
                   const customTicks = buildWindowTicks(snapshot.window || currentWindow, xMin, xMax);
+                  const renderStats = (stats, unit) => {
+                    const items = Array.isArray(stats) ? stats.filter(Boolean) : (stats ? [stats] : []);
+                    if (!items.length) {
+                      return '<div class="text-muted small">No numeric data available for the selected window.</div>';
+                    }
+                    return items.map((item) => `
+                      <div class="stat-chip">
+                        <div class="fw-semibold small">${item.label || ''}</div>
+                        <div class="stat-chip-label">current</div>
+                        <div class="stat-chip-value">${item.current}${unit ? ` ${unit}` : ''}</div>
+                        <div class="stat-chip-label mt-1">min</div>
+                        <div class="stat-chip-value">${item.min}${unit ? ` ${unit}` : ''}</div>
+                        <div class="stat-chip-label mt-1">max</div>
+                        <div class="stat-chip-value">${item.max}${unit ? ` ${unit}` : ''}</div>
+                      </div>
+                    `).join('');
+                  };
+                  const syncFocusUrl = () => {
+                    const url = new URL(window.location.href);
+                    if (focusedChartKey) {
+                      url.searchParams.set('focus', focusedChartKey);
+                    } else {
+                      url.searchParams.delete('focus');
+                    }
+                    window.history.replaceState({}, '', url.toString());
+                  };
+                  const applyChartFocus = () => {
+                    document.body.classList.toggle('chart-focus-active', Boolean(focusedChartKey));
+                    Array.from(chartsEl.children).forEach((col) => {
+                      const isFocused = focusedChartKey && col.dataset.chartKey === focusedChartKey;
+                      col.classList.toggle('focus-host', Boolean(isFocused));
+                      const card = col.querySelector('.chart-card');
+                      if (card) {
+                        card.classList.toggle('fullscreen', Boolean(isFocused));
+                      }
+                    });
+                    syncFocusUrl();
+                  };
                   series.forEach((s, idx) => {
                     const id = `chart_${s.key}`;
                     const col = document.createElement('div');
                     col.className = 'col-12 col-md-6 col-xl-4';
+                    col.dataset.chartKey = s.key;
                     col.innerHTML = `
                       <div class="card chart-card shadow-sm">
                         <div class="card-body">
@@ -3679,6 +3773,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                             <h2 class="h6 mb-1">${s.label}</h2>
                             <span class="text-muted small">${s.unit || ''}</span>
                           </div>
+                          <div class="fullscreen-stats">${renderStats(s.stats, s.unit || '')}</div>
+                          <div class="fullscreen-hint mb-1">Double-click to focus this chart.</div>
                           <canvas id="${id}" height="110"></canvas>
                         </div>
                       </div>
@@ -3751,7 +3847,22 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                         }
                       }
                     });
+
+                    const card = col.querySelector('.chart-card');
+                    const toggleFocus = () => {
+                      focusedChartKey = (focusedChartKey === s.key) ? '' : s.key;
+                      applyChartFocus();
+                    };
+                    if (card) {
+                      card.addEventListener('dblclick', toggleFocus);
+                    }
+                    canvas.addEventListener('dblclick', (event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      toggleFocus();
+                    });
                   });
+                  applyChartFocus();
                 }
 
                 function applySnapshot(snapshot) {
@@ -3794,6 +3905,21 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     pollSnapshot(true);
                   });
                 }
+                window.addEventListener('keydown', (event) => {
+                  if (event.key === 'Escape' && focusedChartKey) {
+                    focusedChartKey = '';
+                    const chartsEl = document.getElementById('charts');
+                    document.body.classList.remove('chart-focus-active');
+                    Array.from(chartsEl.children).forEach((col) => {
+                      col.classList.remove('focus-host');
+                      const card = col.querySelector('.chart-card');
+                      if (card) card.classList.remove('fullscreen');
+                    });
+                    const url = new URL(window.location.href);
+                    url.searchParams.delete('focus');
+                    window.history.replaceState({}, '', url.toString());
+                  }
+                });
                 setInterval(pollSnapshot, 5000);
               </script>
               </div>
@@ -3806,6 +3932,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             app_logo_url=logo_url(app_logo_path),
             station_logo_url=station_logo_url,
             selected_window=selected_window,
+            selected_focus=selected_focus,
             window_options=PUBLIC_TREND_WINDOWS,
         )
 
@@ -4611,12 +4738,13 @@ def create_web_app(cfg: dict, access_store: AccessStore):
               <div class="card mb-3"><div class="card-body">
                 <div class="d-flex flex-wrap gap-2 align-items-center">
                   <a class="btn btn-outline-primary btn-sm" href="{{ url_for('station_chart_settings_export', instrument_uuid=instrument_uuid) }}">Export JSON</a>
-                  <form method="post" action="{{ url_for('station_chart_settings_import', instrument_uuid=instrument_uuid) }}" enctype="multipart/form-data" class="d-flex gap-2 align-items-center">
-                    <input class="form-control form-control-sm" type="file" name="settings_file" accept="application/json,.json" required>
+                  <form id="chartSettingsImportForm" method="post" action="{{ url_for('station_chart_settings_import', instrument_uuid=instrument_uuid) }}" enctype="multipart/form-data" class="d-flex gap-2 align-items-center">
+                    <input id="chartSettingsImportFile" class="form-control form-control-sm" type="file" name="settings_file" accept="application/json,.json" required>
+                    <input type="hidden" name="confirm_foreign_station" id="confirmForeignStation" value="0">
                     <button class="btn btn-outline-secondary btn-sm" type="submit">Import JSON</button>
                   </form>
                 </div>
-                <p class="text-muted small mt-2 mb-0">Leave a field empty to keep automatic axis sizing for that chart. Saved values are stored in the auth database and immediately applied to the public station dashboard.</p>
+                <p class="text-muted small mt-2 mb-0">Leave a field empty to keep automatic axis sizing for that chart. Saved values are stored in the auth database and immediately applied to the public station dashboard. If the imported JSON belongs to another station, the UI asks for confirmation before applying it here.</p>
               </div></div>
 
               <form method="post">
@@ -4664,6 +4792,34 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 </div>
                 <button class="btn btn-primary" type="submit">Save settings</button>
               </form>
+              <script>
+                const importForm = document.getElementById('chartSettingsImportForm');
+                const importFile = document.getElementById('chartSettingsImportFile');
+                const confirmForeignStation = document.getElementById('confirmForeignStation');
+                const stationUuid = {{ instrument_uuid | tojson }};
+                if (importForm && importFile && confirmForeignStation) {
+                  importForm.addEventListener('submit', async (event) => {
+                    confirmForeignStation.value = '0';
+                    const file = importFile.files && importFile.files[0];
+                    if (!file) return;
+                    try {
+                      const text = await file.text();
+                      const payload = JSON.parse(text);
+                      const sourceStationUuid = String((payload && payload.station_uuid) || '').trim();
+                      if (sourceStationUuid && sourceStationUuid !== stationUuid) {
+                        const ok = window.confirm(`This configuration was exported from station "${sourceStationUuid}" and will be imported into "${stationUuid}". Continue?`);
+                        if (!ok) {
+                          event.preventDefault();
+                          return;
+                        }
+                        confirmForeignStation.value = '1';
+                      }
+                    } catch (_) {
+                      // Let server-side validation report JSON issues.
+                    }
+                  });
+                }
+              </script>
             </body>
             </html>
             """,
@@ -4715,7 +4871,14 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             payload = json.load(upload.stream)
             payload_station_uuid = str(payload.get("station_uuid") or "").strip()
             if payload_station_uuid and payload_station_uuid != instrument_uuid:
-                abort(400, f"JSON file belongs to station {payload_station_uuid}, not {instrument_uuid}")
+                if not parse_boolish(request.form.get("confirm_foreign_station", "0"), False):
+                    abort(
+                        400,
+                        (
+                            f"JSON file belongs to station {payload_station_uuid}. "
+                            "Confirm import from another station in the web form and retry."
+                        ),
+                    )
             normalized = parse_station_chart_settings_payload(payload)
             access_store.replace_station_chart_settings(instrument_uuid, normalized, user["username"])
         except ValueError as e:

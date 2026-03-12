@@ -17,6 +17,7 @@ Threaded MQTT collector for weather/sensor networks, aligned with `vantage-publi
 - Public sensor network dashboard with auto-updating status and alarms
 - Per-station public trend-chart Y-axis configuration with controller/admin management
 - JSON export/import for station trend-chart setup
+- Public station trend charts support full-screen focus and per-window min/max/current widgets
 - Watchdog anomaly detection with persisted anomaly log (SQLite)
 - SMTP notifications (welcome, registration, alarms with fast-login link)
   - if `smtpHost` is not configured, emails are skipped
@@ -220,6 +221,7 @@ See:
 - Public station dashboard trend-window choice is remembered in browser cookies.
 - Station dashboard trend interval choice is also remembered in browser cookies.
 - The auth SQLite database also stores chart-control rights and per-station trend-chart axis settings used by the Public Station Dashboard.
+- Public station dashboard supports `focus=<chart_key>` in the query string to open a specific trend chart in focused full-screen mode.
 
 ## Security notes
 

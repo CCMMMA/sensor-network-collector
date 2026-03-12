@@ -129,7 +129,10 @@ Import rules:
 - unknown chart keys are ignored
 - `y_step` must be positive
 - if both `y_min` and `y_max` are provided, `y_max` must be greater than `y_min`
-- if `station_uuid` is present in the JSON, it must match the station being edited
+- if `station_uuid` is present in the JSON and differs from the current station, the web UI prompts the user for confirmation before importing it into the current station
+- the server accepts a cross-station import only when that explicit confirmation flag is sent from the form
+
+This allows reusing the same chart setup across stations while still protecting against accidental imports into the wrong station.
 
 ## User lifecycle and emails
 
@@ -182,6 +185,15 @@ SMTP fallback behavior:
 - when a public dashboard trend window is changed, trend chart x-axis is recomputed to match the selected time window
 - public station dashboard trend chart Y-axis settings are loaded per station from the auth SQLite DB
 - Y-axis step size is applied directly to chart ticks when configured
+- double-clicking a trend chart toggles a focused full-screen view for that chart
+- double-clicking again restores the normal multi-chart layout
+- pressing `Esc` also exits the focused chart view
+- the focused chart state can be opened directly with query string `focus=<chart_key>`
+- when a chart is focused, the page shows compact numeric widgets for the selected trend window:
+  - current
+  - min
+  - max
+- multi-series charts display one set of min/max/current values per sub-series
 
 ## Admin dashboard behavior
 
