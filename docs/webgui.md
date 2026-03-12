@@ -24,6 +24,9 @@ Set:
 - `/change-password`
 - `/fast-login?token=...`
 - `/station/<uuid>` station browser + chart + download
+- `/station/<uuid>/chart-settings` station trend-chart Y-axis settings
+- `/station/<uuid>/chart-settings/export`
+- `/station/<uuid>/chart-settings/import`
 - `/public/station/<uuid>` public station dashboard
 - `/admin` admin console
 - `/admin/dashboard` admin-only network dashboard
@@ -39,6 +42,94 @@ Per station policy:
 - admins always allowed
 
 Server-side permission checks are enforced for station browsing and downloads.
+
+## Chart control rights
+
+Chart setup rights are separate from download/browse rights.
+
+- admins can edit trend-chart settings for every station
+- non-admin users can edit a station chart setup only if they have explicit chart-control rights for that station
+- chart-control rights are assigned from `/admin`
+
+This is used for the Public Station Dashboard trend charts only.
+
+## Public station chart axis settings
+
+The Public Station Dashboard supports per-station Y-axis configuration for each trend chart.
+
+Available settings per chart:
+
+- `y_min`
+- `y_max`
+- `y_step`
+
+Behavior:
+
+- when all three values are empty, the dashboard computes a best-fit automatic axis range and interval
+- when one or more values are set, the saved values override the automatic Y-axis calculation for that station/chart
+- `y_step` controls the chart tick interval on the Y-axis
+- saved settings are read from the auth SQLite database and applied to the public dashboard without requiring configuration-file changes
+
+Management flow:
+
+- open `/station/<uuid>/chart-settings`
+- edit values for one or more charts
+- leave fields empty to keep automatic sizing
+- save changes
+
+The page also shows:
+
+- current effective Y-axis range used by the dashboard
+- current effective Y-axis step
+- last update timestamp and user who changed the setting
+
+## Import and export of chart settings
+
+Each station chart setup can be exported/imported as JSON.
+
+Routes:
+
+- export: `/station/<uuid>/chart-settings/export`
+- import: `/station/<uuid>/chart-settings/import`
+
+Use cases:
+
+- copy the same chart policy between environments
+- back up a station dashboard setup
+- version-control station chart settings outside the SQLite database
+
+JSON payload structure:
+
+```json
+{
+  "station_uuid": "it.uniparthenope.meteo.ws1",
+  "exported_at": "2026-03-12T12:00:00Z",
+  "series": {
+    "temperature": {
+      "label": "Temperature Trend",
+      "unit": "C",
+      "y_min": 0,
+      "y_max": 40,
+      "y_step": 5
+    },
+    "humidity": {
+      "label": "Humidity Trend",
+      "unit": "%",
+      "y_min": 0,
+      "y_max": 100,
+      "y_step": 10
+    }
+  }
+}
+```
+
+Import rules:
+
+- the file must contain a `series` object
+- unknown chart keys are ignored
+- `y_step` must be positive
+- if both `y_min` and `y_max` are provided, `y_max` must be greater than `y_min`
+- if `station_uuid` is present in the JSON, it must match the station being edited
 
 ## User lifecycle and emails
 
@@ -89,6 +180,8 @@ SMTP fallback behavior:
 - public station dashboard remembers selected trend window in a browser cookie
 - station dashboard also remembers selected trend interval in a browser cookie
 - when a public dashboard trend window is changed, trend chart x-axis is recomputed to match the selected time window
+- public station dashboard trend chart Y-axis settings are loaded per station from the auth SQLite DB
+- Y-axis step size is applied directly to chart ticks when configured
 
 ## Admin dashboard behavior
 
@@ -97,6 +190,20 @@ Admin dashboard groups fields by domain (Atmosphere/Wind/Rain/AQ/etc.) and highl
 Connectivity alarms are based on dynamic threshold:
 
 - station marked failing when latest data age > `2 * usual update interval`
+
+## SQLite auth DB contents
+
+The auth database now stores:
+
+- users
+- account requests
+- station download policies
+- per-user restricted station access
+- per-user station chart-control rights
+- login and password-reset tokens
+- anomalies and anomaly silence windows
+- station logos
+- per-station public chart settings
 
 ## Security recommendations
 

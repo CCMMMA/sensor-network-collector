@@ -783,6 +783,12 @@ class AccessStore:
                             PRIMARY KEY (username, instrument_uuid)
                         );
 
+                        CREATE TABLE IF NOT EXISTS user_station_controls (
+                            username TEXT NOT NULL,
+                            station_uuid TEXT NOT NULL,
+                            PRIMARY KEY (username, station_uuid)
+                        );
+
                         CREATE TABLE IF NOT EXISTS login_tokens (
                             token TEXT PRIMARY KEY,
                             username TEXT NOT NULL,
@@ -825,6 +831,17 @@ class AccessStore:
                             logo_path TEXT NOT NULL,
                             uploaded_by TEXT NOT NULL,
                             uploaded_at TEXT NOT NULL
+                        );
+
+                        CREATE TABLE IF NOT EXISTS station_chart_settings (
+                            station_uuid TEXT NOT NULL,
+                            series_key TEXT NOT NULL,
+                            y_min REAL,
+                            y_max REAL,
+                            y_step REAL,
+                            updated_at TEXT NOT NULL,
+                            updated_by TEXT NOT NULL,
+                            PRIMARY KEY (station_uuid, series_key)
                         );
 
                         CREATE TABLE IF NOT EXISTS write_probe (
@@ -1114,6 +1131,46 @@ class AccessStore:
                 (username,),
             ).fetchall()
             return [r["instrument_uuid"] for r in rows]
+
+    def set_user_station_control(self, username: str, station_uuid: str, allow: bool):
+        username = username.strip()
+        station_uuid = station_uuid.strip()
+        if not username or not station_uuid:
+            return False, "Username and station UUID are required"
+
+        with self._lock:
+            with self._connect() as con:
+                user_exists = con.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+                if not user_exists:
+                    return False, "User not found"
+
+                if allow:
+                    con.execute(
+                        "INSERT OR IGNORE INTO user_station_controls(username,station_uuid) VALUES(?,?)",
+                        (username, station_uuid),
+                    )
+                else:
+                    con.execute(
+                        "DELETE FROM user_station_controls WHERE username = ? AND station_uuid = ?",
+                        (username, station_uuid),
+                    )
+        return True, "Control rights updated"
+
+    def get_user_control_stations(self, username: str):
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT station_uuid FROM user_station_controls WHERE username = ? ORDER BY station_uuid",
+                (username,),
+            ).fetchall()
+            return [r["station_uuid"] for r in rows]
+
+    def can_control_station(self, user, station_uuid: str):
+        if user is None:
+            return False
+        if user.get("role") == "admin":
+            return True
+        allowed = set(self.get_user_control_stations(user["username"]))
+        return station_uuid in allowed
 
     def can_download(self, user, instrument_uuid: str):
         policy = self.get_policy(instrument_uuid)
@@ -1429,6 +1486,62 @@ class AccessStore:
                 (station_uuid,),
             ).fetchone()
             return dict(row) if row else None
+
+    def get_station_chart_settings(self, station_uuid: str):
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT station_uuid,series_key,y_min,y_max,y_step,updated_at,updated_by
+                FROM station_chart_settings
+                WHERE station_uuid = ?
+                ORDER BY series_key
+                """,
+                (station_uuid,),
+            ).fetchall()
+            return {
+                row["series_key"]: {
+                    "series_key": row["series_key"],
+                    "y_min": row["y_min"],
+                    "y_max": row["y_max"],
+                    "y_step": row["y_step"],
+                    "updated_at": row["updated_at"],
+                    "updated_by": row["updated_by"],
+                }
+                for row in rows
+            }
+
+    def replace_station_chart_settings(self, station_uuid: str, settings_map: dict, updated_by: str):
+        station_uuid = station_uuid.strip()
+        now = now_utc_iso()
+        normalized = []
+        for series_key, raw in (settings_map or {}).items():
+            if not series_key:
+                continue
+            item = raw or {}
+            normalized.append(
+                (
+                    station_uuid,
+                    str(series_key).strip(),
+                    item.get("y_min"),
+                    item.get("y_max"),
+                    item.get("y_step"),
+                    now,
+                    updated_by,
+                )
+            )
+
+        with self._lock:
+            with self._connect() as con:
+                con.execute("DELETE FROM station_chart_settings WHERE station_uuid = ?", (station_uuid,))
+                if normalized:
+                    con.executemany(
+                        """
+                        INSERT INTO station_chart_settings(station_uuid, series_key, y_min, y_max, y_step, updated_at, updated_by)
+                        VALUES(?,?,?,?,?,?,?)
+                        """,
+                        normalized,
+                    )
+        return True
 
 
 def collect_instruments(storage_root: str):
@@ -1921,6 +2034,15 @@ PUBLIC_SERIES_SPECS = [
     },
 ]
 
+PUBLIC_EXTRA_CHART_SPECS = [
+    {
+        "key": "particulate_matter",
+        "label": "Particulate Matter",
+        "unit": "ug/m3",
+        "axis": {"auto": True, "floor_zero": True},
+    },
+]
+
 
 def _first_numeric_for_aliases(row: dict, aliases):
     for alias in aliases:
@@ -1939,25 +2061,50 @@ def _first_numeric_for_aliases(row: dict, aliases):
     return None
 
 
-def _calc_axis_range(values, axis_spec=None):
+def _coerce_axis_value(value):
+    if value in ("", None):
+        return None
+    return _to_float(value)
+
+
+def _nice_axis_step(raw_step: float):
+    if raw_step <= 0:
+        return 1.0
+    exponent = math.floor(math.log10(raw_step))
+    fraction = raw_step / (10 ** exponent)
+    if fraction <= 1:
+        nice_fraction = 1
+    elif fraction <= 2:
+        nice_fraction = 2
+    elif fraction <= 5:
+        nice_fraction = 5
+    else:
+        nice_fraction = 10
+    return nice_fraction * (10 ** exponent)
+
+
+def _calc_axis_settings(values, axis_spec=None):
     axis_spec = axis_spec or {}
-    if "min" in axis_spec or "max" in axis_spec:
-        return axis_spec.get("min"), axis_spec.get("max")
+    explicit_min = _coerce_axis_value(axis_spec.get("min")) if "min" in axis_spec else None
+    explicit_max = _coerce_axis_value(axis_spec.get("max")) if "max" in axis_spec else None
+    explicit_step = _coerce_axis_value(axis_spec.get("step")) if "step" in axis_spec else None
+    auto = bool(axis_spec.get("auto"))
 
-    if not axis_spec.get("auto"):
-        return None, None
+    if not values and explicit_min is None and explicit_max is None:
+        return None, None, explicit_step
 
-    if not values:
-        return None, None
-
-    lo = min(values)
-    hi = max(values)
+    if values:
+        lo = min(values)
+        hi = max(values)
+    else:
+        lo = explicit_min if explicit_min is not None else 0.0
+        hi = explicit_max if explicit_max is not None else lo + 1.0
 
     if lo == hi:
         pad = max(1.0, abs(lo) * 0.15)
         lo -= pad
         hi += pad
-    else:
+    elif auto or explicit_min is None or explicit_max is None:
         pad = (hi - lo) * 0.15
         lo -= pad
         hi += pad
@@ -1965,7 +2112,137 @@ def _calc_axis_range(values, axis_spec=None):
     if axis_spec.get("floor_zero"):
         lo = max(0.0, lo)
 
-    return round(lo, 3), round(hi, 3)
+    if explicit_step is not None and explicit_step > 0:
+        step = explicit_step
+    else:
+        span = max(hi - lo, 1e-9)
+        target_ticks = max(3, int(axis_spec.get("ticks") or 6))
+        step = _nice_axis_step(span / target_ticks)
+
+    if explicit_min is not None:
+        y_min = explicit_min
+    else:
+        y_min = math.floor(lo / step) * step
+        if axis_spec.get("floor_zero"):
+            y_min = max(0.0, y_min)
+
+    if explicit_max is not None:
+        y_max = explicit_max
+    else:
+        y_max = math.ceil(hi / step) * step
+
+    if y_min == y_max:
+        y_max = y_min + step
+
+    return round(y_min, 6), round(y_max, 6), round(step, 6)
+
+
+def get_chart_setting_catalog():
+    out = []
+    for spec in PUBLIC_SERIES_SPECS + PUBLIC_EXTRA_CHART_SPECS:
+        out.append(
+            {
+                "key": spec["key"],
+                "label": spec["label"],
+                "unit": spec.get("unit", ""),
+                "axis": dict(spec.get("axis") or {}),
+            }
+        )
+    return out
+
+
+def resolve_station_chart_specs(access_store: AccessStore, instrument_uuid: str):
+    overrides = access_store.get_station_chart_settings(instrument_uuid) if access_store else {}
+    resolved = []
+    for spec in get_chart_setting_catalog():
+        merged_axis = dict(spec.get("axis") or {})
+        override = overrides.get(spec["key"]) or {}
+        if override.get("y_min") is not None:
+            merged_axis["min"] = float(override["y_min"])
+        if override.get("y_max") is not None:
+            merged_axis["max"] = float(override["y_max"])
+        if override.get("y_step") is not None:
+            merged_axis["step"] = float(override["y_step"])
+        resolved.append(
+            {
+                "key": spec["key"],
+                "label": spec["label"],
+                "unit": spec.get("unit", ""),
+                "axis": merged_axis,
+                "saved": {
+                    "y_min": override.get("y_min"),
+                    "y_max": override.get("y_max"),
+                    "y_step": override.get("y_step"),
+                    "updated_at": override.get("updated_at"),
+                    "updated_by": override.get("updated_by"),
+                },
+            }
+        )
+    return resolved
+
+
+def normalize_station_chart_settings_map(raw_settings):
+    valid_keys = {spec["key"] for spec in get_chart_setting_catalog()}
+    out = {}
+    for series_key, raw in (raw_settings or {}).items():
+        key = str(series_key or "").strip()
+        if not key or key not in valid_keys:
+            continue
+        item = raw or {}
+        y_min = _coerce_axis_value(item.get("y_min"))
+        y_max = _coerce_axis_value(item.get("y_max"))
+        y_step = _coerce_axis_value(item.get("y_step"))
+        if y_step is not None and y_step <= 0:
+            raise ValueError(f"Invalid y_step for {key}")
+        if y_min is not None and y_max is not None and y_max <= y_min:
+            raise ValueError(f"y_max must be greater than y_min for {key}")
+        if y_min is None and y_max is None and y_step is None:
+            continue
+        out[key] = {
+            "y_min": y_min,
+            "y_max": y_max,
+            "y_step": y_step,
+        }
+    return out
+
+
+def export_station_chart_settings_payload(access_store: AccessStore, station_uuid: str):
+    saved = access_store.get_station_chart_settings(station_uuid) if access_store else {}
+    series = {}
+    for spec in get_chart_setting_catalog():
+        item = saved.get(spec["key"]) or {}
+        series[spec["key"]] = {
+            "label": spec["label"],
+            "unit": spec.get("unit", ""),
+            "y_min": item.get("y_min"),
+            "y_max": item.get("y_max"),
+            "y_step": item.get("y_step"),
+            "updated_at": item.get("updated_at"),
+            "updated_by": item.get("updated_by"),
+        }
+    return {
+        "station_uuid": station_uuid,
+        "exported_at": now_utc_iso(),
+        "series": series,
+    }
+
+
+def parse_station_chart_settings_payload(payload: dict):
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid JSON payload")
+    raw_series = payload.get("series")
+    if not isinstance(raw_series, dict):
+        raise ValueError("Missing 'series' object")
+    normalized_input = {}
+    for series_key, raw in raw_series.items():
+        if not isinstance(raw, dict):
+            continue
+        normalized_input[series_key] = {
+            "y_min": raw.get("y_min"),
+            "y_max": raw.get("y_max"),
+            "y_step": raw.get("y_step"),
+        }
+    return normalize_station_chart_settings_map(normalized_input)
 
 
 def _influx_range_start_for_window(window: str):
@@ -2068,9 +2345,17 @@ def _aqi_status(value):
     return {"level": "bad", "label": "Bad conditions", "color": "#dc3545"}
 
 
-def build_public_station_snapshot(storage_root: str, instrument_uuid: str, window: str = "hour", max_points: int = 240, cfg: dict = None):
+def build_public_station_snapshot(
+    storage_root: str,
+    instrument_uuid: str,
+    window: str = "hour",
+    max_points: int = 240,
+    cfg: dict = None,
+    access_store: AccessStore = None,
+):
     window = normalize_public_window(window)
     cfg = cfg or runtime.get("config") or {}
+    access_store = access_store or runtime.get("access_store")
     preview = get_station_preview(storage_root, instrument_uuid)
     latest_hint = parse_iso_ts(preview.get("last_timestamp") or "") or utc_now()
     storage_window_start = interval_start(latest_hint, window)
@@ -2132,8 +2417,11 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, windo
 
     aqi_status = _aqi_status(_first_numeric_for_aliases(latest_row, ["aqi_val", "AQI", "CurrentAQI", "aqi"]))
 
+    chart_specs = {spec["key"]: spec for spec in resolve_station_chart_specs(access_store, instrument_uuid)}
+
     series = []
     for spec in PUBLIC_SERIES_SPECS:
+        resolved_spec = chart_specs.get(spec["key"], spec)
         labels = []
         values = []
         points = []
@@ -2147,14 +2435,15 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, windo
             values.append(rounded)
             points.append({"x": iso_ts, "y": rounded})
         if values:
-            y_min, y_max = _calc_axis_range(values, spec.get("axis"))
+            y_min, y_max, y_step = _calc_axis_settings(values, resolved_spec.get("axis"))
             series.append(
                 {
                     "key": spec["key"],
-                    "label": spec["label"],
-                    "unit": spec["unit"],
+                    "label": resolved_spec["label"],
+                    "unit": resolved_spec["unit"],
                     "y_min": y_min,
                     "y_max": y_max,
+                    "y_step": y_step,
                     "labels": labels,
                     "values": values,
                     "points": points,
@@ -2190,14 +2479,16 @@ def build_public_station_snapshot(storage_root: str, instrument_uuid: str, windo
             pm_datasets.append({"label": item["label"], "values": values, "points": points})
 
     if pm_datasets:
-        y_min, y_max = _calc_axis_range(pm_all_values, {"auto": True, "floor_zero": True})
+        pm_spec = chart_specs.get("particulate_matter", {"axis": {"auto": True, "floor_zero": True}})
+        y_min, y_max, y_step = _calc_axis_settings(pm_all_values, pm_spec.get("axis"))
         series.append(
             {
                 "key": "particulate_matter",
-                "label": "Particulate Matter",
-                "unit": "ug/m3",
+                "label": pm_spec.get("label", "Particulate Matter"),
+                "unit": pm_spec.get("unit", "ug/m3"),
                 "y_min": y_min,
                 "y_max": y_max,
+                "y_step": y_step,
                 "labels": pm_labels,
                 "datasets": pm_datasets,
             }
@@ -2553,6 +2844,7 @@ def write_influx_with_type_conflict_retries(write_api, cfg: dict, record: dict, 
 def create_web_app(cfg: dict, access_store: AccessStore):
     app = Flask(__name__)
     app.secret_key = cfg["web_session_secret"] or secrets.token_hex(32)
+    runtime["access_store"] = access_store
 
     if not cfg["web_session_secret"]:
         logger.warning("webSessionSecret not set; using ephemeral secret (sessions reset on restart)")
@@ -2588,6 +2880,9 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
     def station_is_accessible(user, instrument_uuid: str):
         return access_store.can_download(user, instrument_uuid)
+
+    def station_is_controllable(user, instrument_uuid: str):
+        return access_store.can_control_station(user, instrument_uuid)
 
     def logo_url(path: str):
         if not path:
@@ -2790,6 +3085,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
         preview = get_station_preview(storage_root, instrument_uuid)
         station_name = preview.get("name") or instrument_uuid
+        can_control = station_is_controllable(user, instrument_uuid)
         station_logo_row = access_store.get_station_logo(instrument_uuid)
         station_logo_url = None
         if station_logo_row:
@@ -2964,6 +3260,10 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   <label>To <input type="date" name="to_date" value="{{ request.args.get('to_date','') }}"></label>
                   <button class="btn btn-primary btn-sm" type="submit">Download ZIP</button>
                 </form>
+                {% if can_control %}
+                <hr/>
+                <p class="mb-2"><a class="btn btn-outline-primary btn-sm" href="{{ url_for('station_chart_settings', instrument_uuid=instrument_uuid) }}">Trend chart axis settings</a></p>
+                {% endif %}
                 {% if user %}
                 <hr/>
                 <h3 class="h6">Station logo</h3>
@@ -3081,6 +3381,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             instrument_uuid=instrument_uuid,
             station_name=station_name,
             user=user,
+            can_control=can_control,
             app_logo_url=logo_url(app_logo_path),
             station_logo_url=station_logo_url,
             interval=interval,
@@ -3148,8 +3449,15 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
         user = current_user()
         can_browse_download = bool(user) and station_is_accessible(user, instrument_uuid)
+        can_control = bool(user) and station_is_controllable(user, instrument_uuid)
         selected_window = request_preference_cookie(request, "window", "public_trend_window", normalize_public_window, "hour")
-        snapshot = build_public_station_snapshot(storage_root, instrument_uuid, window=selected_window, cfg=cfg)
+        snapshot = build_public_station_snapshot(
+            storage_root,
+            instrument_uuid,
+            window=selected_window,
+            cfg=cfg,
+            access_store=access_store,
+        )
         station_logo_row = access_store.get_station_logo(instrument_uuid)
         station_logo_url = None
         if station_logo_row:
@@ -3205,6 +3513,9 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   </div>
                   <div class="small text-muted">Last update</div>
                   <div class="fw-semibold" id="lastUpdate">{{ snapshot.last_timestamp or "-" }}</div>
+                  {% if can_control %}
+                    <a class="btn btn-sm btn-outline-secondary mt-2" href="{{ url_for('station_chart_settings', instrument_uuid=snapshot.instrument_uuid) }}">Trend chart axis settings</a>
+                  {% endif %}
                   {% if can_browse_download %}
                     <a class="btn btn-sm btn-primary mt-2" href="{{ url_for('browse_station', instrument_uuid=snapshot.instrument_uuid) }}">Browse & Download Data</a>
                   {% endif %}
@@ -3379,6 +3690,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
                     const yMin = (s.y_min !== null && s.y_min !== undefined) ? s.y_min : undefined;
                     const yMax = (s.y_max !== null && s.y_max !== undefined) ? s.y_max : undefined;
+                    const yStep = (s.y_step !== null && s.y_step !== undefined) ? s.y_step : undefined;
                     const styleDataset = (dataset, color) => {
                       const pointCount = Array.isArray(dataset.data) ? dataset.data.length : 0;
                       const sparse = pointCount <= 2;
@@ -3430,7 +3742,12 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                               }
                             }
                           },
-                          y: { beginAtZero: false, min: yMin, max: yMax }
+                          y: {
+                            beginAtZero: false,
+                            min: yMin,
+                            max: yMax,
+                            ticks: yStep ? { stepSize: yStep } : {}
+                          }
                         }
                       }
                     });
@@ -3485,6 +3802,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             """,
             snapshot=snapshot,
             can_browse_download=can_browse_download,
+            can_control=can_control,
             app_logo_url=logo_url(app_logo_path),
             station_logo_url=station_logo_url,
             selected_window=selected_window,
@@ -3499,7 +3817,13 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             abort(404, "Station not found")
 
         window = normalize_public_window(request.args.get("window", "hour"))
-        snapshot = build_public_station_snapshot(storage_root, instrument_uuid, window=window, cfg=cfg)
+        snapshot = build_public_station_snapshot(
+            storage_root,
+            instrument_uuid,
+            window=window,
+            cfg=cfg,
+            access_store=access_store,
+        )
         since = request.args.get("since", "")
         force = parse_boolish(request.args.get("force", "0"), False)
         changed = bool(snapshot.get("last_timestamp")) and snapshot.get("last_timestamp") != since
@@ -3856,6 +4180,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         pending_requests = access_store.list_account_requests(status="pending")
 
         user_access = {u["username"]: access_store.get_user_instruments(u["username"]) for u in users}
+        user_controls = {u["username"]: access_store.get_user_control_stations(u["username"]) for u in users}
 
         return render_template_string(
             """
@@ -3916,6 +4241,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     <option value="restricted" {% if policies[inst]=='restricted' %}selected{% endif %}>restricted (assigned users only)</option>
                   </select></div>
                   <div class="col-md-2"><button class="btn btn-primary btn-sm" type="submit">Save</button></div>
+                  <div class="col-md-1"><a class="btn btn-outline-secondary btn-sm" href="{{ url_for('station_chart_settings', instrument_uuid=inst) }}">Charts</a></div>
                 </form>
               {% endfor %}
             {% else %}
@@ -3927,6 +4253,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
               <div class="card mb-2"><div class="card-body">
                 <b>{{ u.username }}</b> role={{ u.role }} active={{ u.active }}<br/>
                 currently allowed: {{ user_access[u.username] }} | force_password_change={{ u.force_password_change }}
+                <br/>chart control rights: {{ user_controls[u.username] }}
                 <form method="post" action="{{ url_for('admin_set_user_access') }}" class="row g-2 mt-1">
                   <input type="hidden" name="username" value="{{ u.username }}">
                   <div class="col-md-5"><input class="form-control" name="instrument_uuid" placeholder="Instrument UUID"></div>
@@ -3935,6 +4262,15 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     <option value="0">revoke</option>
                   </select></div>
                   <div class="col-md-2"><button class="btn btn-secondary btn-sm" type="submit">Apply</button></div>
+                </form>
+                <form method="post" action="{{ url_for('admin_set_user_control') }}" class="row g-2 mt-1">
+                  <input type="hidden" name="username" value="{{ u.username }}">
+                  <div class="col-md-5"><input class="form-control" name="station_uuid" placeholder="Station UUID for chart control"></div>
+                  <div class="col-md-3"><select class="form-select" name="allow">
+                    <option value="1">grant control</option>
+                    <option value="0">revoke control</option>
+                  </select></div>
+                  <div class="col-md-2"><button class="btn btn-outline-secondary btn-sm" type="submit">Apply</button></div>
                 </form>
                 <form method="post" action="{{ url_for('admin_force_password') }}" class="mt-1">
                   <input type="hidden" name="username" value="{{ u.username }}">
@@ -3950,6 +4286,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             users=users,
             pending_requests=pending_requests,
             user_access=user_access,
+            user_controls=user_controls,
         )
 
     @app.route("/admin/dashboard")
@@ -4215,6 +4552,178 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         access_store.set_anomaly_silence(station_uuid, anomaly_type, user["username"], hours)
         return redirect(url_for("anomalies_log"))
 
+    @app.route("/station/<path:instrument_uuid>/chart-settings", methods=["GET", "POST"])
+    def station_chart_settings(instrument_uuid: str):
+        user = require_login()
+        if not isinstance(user, dict):
+            return user
+
+        storage_root = storage_root_or_404()
+        instruments = set(available_instruments(storage_root))
+        if instrument_uuid not in instruments:
+            abort(404, "Station not found")
+        if not station_is_controllable(user, instrument_uuid):
+            abort(403)
+
+        msg = ""
+        err = ""
+        if request.method == "POST":
+            raw_settings = {}
+            for spec in get_chart_setting_catalog():
+                raw_settings[spec["key"]] = {
+                    "y_min": request.form.get(f"y_min__{spec['key']}", ""),
+                    "y_max": request.form.get(f"y_max__{spec['key']}", ""),
+                    "y_step": request.form.get(f"y_step__{spec['key']}", ""),
+                }
+            try:
+                normalized = normalize_station_chart_settings_map(raw_settings)
+                access_store.replace_station_chart_settings(instrument_uuid, normalized, user["username"])
+                msg = "Trend chart settings saved"
+            except ValueError as e:
+                err = str(e)
+
+        preview = get_station_preview(storage_root, instrument_uuid)
+        snapshot = build_public_station_snapshot(
+            storage_root,
+            instrument_uuid,
+            window="hour",
+            max_points=120,
+            cfg=cfg,
+            access_store=access_store,
+        )
+        effective_series = {item["key"]: item for item in snapshot.get("series", [])}
+        chart_specs = resolve_station_chart_specs(access_store, instrument_uuid)
+        return render_template_string(
+            """
+            <html>
+            <head>
+              <title>Trend chart axis settings - {{ station_name }}</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+              <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+            </head>
+            <body class="container py-4">
+              <p><a href="{{ url_for('index') }}">Home</a> | <a href="{{ url_for('public_station', instrument_uuid=instrument_uuid) }}">Public dashboard</a> | <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid) }}">Browse station</a></p>
+              <h1 class="h4">Trend chart axis settings</h1>
+              <p class="text-muted">{{ station_name }} ({{ instrument_uuid }})</p>
+              {% if msg %}<div class="alert alert-success">{{ msg }}</div>{% endif %}
+              {% if err %}<div class="alert alert-danger">{{ err }}</div>{% endif %}
+
+              <div class="card mb-3"><div class="card-body">
+                <div class="d-flex flex-wrap gap-2 align-items-center">
+                  <a class="btn btn-outline-primary btn-sm" href="{{ url_for('station_chart_settings_export', instrument_uuid=instrument_uuid) }}">Export JSON</a>
+                  <form method="post" action="{{ url_for('station_chart_settings_import', instrument_uuid=instrument_uuid) }}" enctype="multipart/form-data" class="d-flex gap-2 align-items-center">
+                    <input class="form-control form-control-sm" type="file" name="settings_file" accept="application/json,.json" required>
+                    <button class="btn btn-outline-secondary btn-sm" type="submit">Import JSON</button>
+                  </form>
+                </div>
+                <p class="text-muted small mt-2 mb-0">Leave a field empty to keep automatic axis sizing for that chart. Saved values are stored in the auth database and immediately applied to the public station dashboard.</p>
+              </div></div>
+
+              <form method="post">
+                <div class="table-responsive">
+                  <table class="table table-sm table-bordered align-middle">
+                    <thead>
+                      <tr>
+                        <th>Chart</th>
+                        <th>Unit</th>
+                        <th>Saved y_min</th>
+                        <th>Saved y_max</th>
+                        <th>Saved step</th>
+                        <th>Effective range</th>
+                        <th>Updated</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {% for spec in chart_specs %}
+                        {% set effective = effective_series.get(spec.key, {}) %}
+                        <tr>
+                          <td><b>{{ spec.label }}</b><br><span class="text-muted small">{{ spec.key }}</span></td>
+                          <td>{{ spec.unit or '-' }}</td>
+                          <td><input class="form-control form-control-sm" type="number" step="any" name="y_min__{{ spec.key }}" value="{{ '' if spec.saved.y_min is none else spec.saved.y_min }}"></td>
+                          <td><input class="form-control form-control-sm" type="number" step="any" name="y_max__{{ spec.key }}" value="{{ '' if spec.saved.y_max is none else spec.saved.y_max }}"></td>
+                          <td><input class="form-control form-control-sm" type="number" step="any" min="0.000001" name="y_step__{{ spec.key }}" value="{{ '' if spec.saved.y_step is none else spec.saved.y_step }}"></td>
+                          <td>
+                            {% if effective %}
+                              {{ effective.y_min }} .. {{ effective.y_max }}
+                              {% if effective.y_step is not none %}<br><span class="text-muted small">step={{ effective.y_step }}</span>{% endif %}
+                            {% else %}
+                              <span class="text-muted">No recent data</span>
+                            {% endif %}
+                          </td>
+                          <td>
+                            {% if spec.saved.updated_at %}
+                              {{ spec.saved.updated_at }}<br><span class="text-muted small">{{ spec.saved.updated_by }}</span>
+                            {% else %}
+                              <span class="text-muted">default</span>
+                            {% endif %}
+                          </td>
+                        </tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
+                </div>
+                <button class="btn btn-primary" type="submit">Save settings</button>
+              </form>
+            </body>
+            </html>
+            """,
+            instrument_uuid=instrument_uuid,
+            station_name=preview.get("name") or instrument_uuid,
+            chart_specs=chart_specs,
+            effective_series=effective_series,
+            msg=msg,
+            err=err,
+        )
+
+    @app.route("/station/<path:instrument_uuid>/chart-settings/export")
+    def station_chart_settings_export(instrument_uuid: str):
+        user = require_login()
+        if not isinstance(user, dict):
+            return user
+        storage_root = storage_root_or_404()
+        instruments = set(available_instruments(storage_root))
+        if instrument_uuid not in instruments:
+            abort(404, "Station not found")
+        if not station_is_controllable(user, instrument_uuid):
+            abort(403)
+
+        payload = export_station_chart_settings_payload(access_store, instrument_uuid)
+        response = app.response_class(
+            response=json.dumps(payload, indent=2, sort_keys=True),
+            status=200,
+            mimetype="application/json",
+        )
+        response.headers["Content-Disposition"] = f"attachment; filename={safe_filename(instrument_uuid)}_chart_settings.json"
+        return response
+
+    @app.route("/station/<path:instrument_uuid>/chart-settings/import", methods=["POST"])
+    def station_chart_settings_import(instrument_uuid: str):
+        user = require_login()
+        if not isinstance(user, dict):
+            return user
+        storage_root = storage_root_or_404()
+        instruments = set(available_instruments(storage_root))
+        if instrument_uuid not in instruments:
+            abort(404, "Station not found")
+        if not station_is_controllable(user, instrument_uuid):
+            abort(403)
+
+        upload = request.files.get("settings_file")
+        if upload is None or not upload.filename:
+            abort(400, "Missing JSON file")
+        try:
+            payload = json.load(upload.stream)
+            payload_station_uuid = str(payload.get("station_uuid") or "").strip()
+            if payload_station_uuid and payload_station_uuid != instrument_uuid:
+                abort(400, f"JSON file belongs to station {payload_station_uuid}, not {instrument_uuid}")
+            normalized = parse_station_chart_settings_payload(payload)
+            access_store.replace_station_chart_settings(instrument_uuid, normalized, user["username"])
+        except ValueError as e:
+            abort(400, str(e))
+        except json.JSONDecodeError:
+            abort(400, "Invalid JSON file")
+        return redirect(url_for("station_chart_settings", instrument_uuid=instrument_uuid))
+
     @app.route("/admin/create-user", methods=["POST"])
     def admin_create_user():
         admin_user = require_admin()
@@ -4301,6 +4810,21 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             abort(400, msg)
         return redirect(url_for("admin"))
 
+    @app.route("/admin/user-control", methods=["POST"])
+    def admin_set_user_control():
+        admin_user = require_admin()
+        if not isinstance(admin_user, dict):
+            return admin_user
+
+        username = request.form.get("username", "")
+        station_uuid = request.form.get("station_uuid", "")
+        allow = parse_boolish(request.form.get("allow", "1"), True)
+
+        ok, msg = access_store.set_user_station_control(username, station_uuid, allow)
+        if not ok:
+            abort(400, msg)
+        return redirect(url_for("admin"))
+
     @app.route("/admin/force-password", methods=["POST"])
     def admin_force_password():
         admin_user = require_admin()
@@ -4323,6 +4847,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 runtime = {
     "config": {},
     "influx_client": None,
+    "access_store": None,
     "write_api": None,
     "signalk_client": None,
     "signalk_access_manager": None,

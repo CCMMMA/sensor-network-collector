@@ -15,6 +15,8 @@ Threaded MQTT collector for weather/sensor networks, aligned with `vantage-publi
 - Data browsing per station with charts and tables
 - Live station trend pages (auto-updating charts and latest table)
 - Public sensor network dashboard with auto-updating status and alarms
+- Per-station public trend-chart Y-axis configuration with controller/admin management
+- JSON export/import for station trend-chart setup
 - Watchdog anomaly detection with persisted anomaly log (SQLite)
 - SMTP notifications (welcome, registration, alarms with fast-login link)
   - if `smtpHost` is not configured, emails are skipped
@@ -101,11 +103,12 @@ Components:
 5. optional Flask web GUI:
   - SQLite auth/policy store
   - anomaly store + silence state
+  - station chart settings + chart-control rights
   - watchdog notifications
   - access-controlled downloads
   - live station trend pages
   - public network dashboard
-  - public station dashboard with selectable trend windows persisted in cookies
+  - public station dashboard with selectable trend windows persisted in cookies and per-station Y-axis settings
   - account emails + fast-login links
   - branding (app logo + station logo)
 
@@ -127,6 +130,8 @@ CSV sink (pathStorage)
     -> auto-updating chart/table in browser
   -> public dashboard API (optional)
     -> auto-updating network status and alarms
+  -> station chart settings store (optional)
+    -> per-station y-axis min/max/step overrides + JSON import/export
   -> watchdog/anomaly detector (optional)
     -> anomaly DB log + notification emails + silence window
 ```
@@ -214,6 +219,7 @@ See:
 - `baseUrl` is used to compose externally visible links in email messages, including fast-login and password-reset URLs.
 - Public station dashboard trend-window choice is remembered in browser cookies.
 - Station dashboard trend interval choice is also remembered in browser cookies.
+- The auth SQLite database also stores chart-control rights and per-station trend-chart axis settings used by the Public Station Dashboard.
 
 ## Security notes
 

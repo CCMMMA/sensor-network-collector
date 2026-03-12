@@ -140,7 +140,7 @@ Signal K value normalization:
 
 - `httpEnabled`, `httpHost`, `httpPort`
 - `baseUrl`: public URL used in email links
-- `authDbPath`: SQLite file for users/policies/anomalies
+- `authDbPath`: SQLite file for users/policies/anomalies/chart settings/control rights
 - `webSessionSecret`: required strong random secret
 - `adminUser`, `adminPassword`
 - `webAppLogo`: optional absolute path to app logo image
@@ -165,6 +165,16 @@ Example:
 
 - fast-login links in welcome, approval, and anomaly emails
 - password-reset links from the forgot-password flow
+
+`authDbPath` stores:
+
+- user accounts and account requests
+- station access policies
+- restricted per-user station assignments
+- per-user station chart-control rights
+- anomaly log and silence windows
+- station logos
+- per-station Public Station Dashboard trend-chart axis settings
 
 ### SMTP and notifications
 
