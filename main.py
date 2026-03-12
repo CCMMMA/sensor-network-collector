@@ -2038,6 +2038,21 @@ def parse_station_browser_chart_config(request_args, numeric_cols):
     out = {"left": [], "right": []}
     seen = set()
 
+    def _getlist(args, key: str):
+        if hasattr(args, "getlist"):
+            try:
+                return list(args.getlist(key))
+            except Exception:
+                return []
+        if not isinstance(args, dict):
+            return []
+        value = args.get(key)
+        if isinstance(value, list):
+            return value
+        if value is None:
+            return []
+        return [value]
+
     raw = str(request_args.get("chart_config", "") or "").strip()
     payload = {}
     if raw:
@@ -2073,7 +2088,7 @@ def parse_station_browser_chart_config(request_args, numeric_cols):
             seen.add(field)
             color_index += 1
 
-    legacy_selected = [f for f in request_args.getlist("field") if f in numeric_set and f not in seen]
+    legacy_selected = [f for f in _getlist(request_args, "field") if f in numeric_set and f not in seen]
     if not out["left"] and not out["right"] and legacy_selected:
         for idx, field in enumerate(legacy_selected):
             out["left"].append(
