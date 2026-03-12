@@ -3174,6 +3174,13 @@ def create_web_app(cfg: dict, access_store: AccessStore):
     if not cfg["web_session_secret"]:
         logger.warning("webSessionSecret not set; using ephemeral secret (sessions reset on restart)")
 
+    def current_request_target() -> str:
+        target = request.full_path or request.path or url_for("index")
+        return target[:-1] if target.endswith("?") else target
+
+    def redirect_to_login(message: str):
+        return redirect(url_for("login", next=current_request_target(), err=message))
+
     def current_user():
         username = session.get("username")
         if not username:
@@ -3183,7 +3190,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
     def require_admin():
         user = current_user()
         if not user:
-            return redirect(url_for("login", next=request.path))
+            return redirect_to_login("Please log in to access this page.")
         if user.get("role") != "admin":
             abort(403)
         return user
@@ -3191,7 +3198,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
     def require_login():
         user = current_user()
         if not user:
-            return redirect(url_for("login", next=request.path))
+            return redirect_to_login("Please log in to continue.")
         return user
 
     def storage_root_or_404():
@@ -3760,7 +3767,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                         <tr>
                           <td colspan="{{ all_table_columns|length if all_table_columns else 1 }}" class="text-center text-muted">No rows in the selected trend window.</td>
                         </tr>
-                      {% endfor %}
+                      {% endif %}
                     </tbody>
                   </table>
                 </div>
@@ -4787,7 +4794,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
-        err = ""
+        err = str(request.args.get("err", "") or "").strip()
         if request.method == "POST":
             username = request.form.get("username", "").strip()
             password = request.form.get("password", "")

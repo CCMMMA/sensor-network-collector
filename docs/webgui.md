@@ -43,6 +43,8 @@ Per station policy:
 
 Server-side permission checks are enforced for station browsing and downloads.
 
+If an unauthenticated user opens a protected page, the web app redirects to `/login` and shows an alert explaining that authentication is required. The original destination is preserved in `next=...` and is reopened after successful login.
+
 ## Chart control rights
 
 Chart setup rights are separate from download/browse rights.
