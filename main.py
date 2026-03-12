@@ -14,6 +14,7 @@ import smtplib
 import sys
 import tempfile
 import threading
+import time
 import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -542,6 +543,10 @@ def resolve_instrument_uuid(topic: str, data: dict, tags: dict) -> str:
 # ----------------------------
 # Signal K / CSV sinks
 # ----------------------------
+class SignalKPublishRetryLater(RuntimeError):
+    """Raised when Signal K publishing is temporarily suspended after a connection failure."""
+
+
 class SignalKWebsocketPublisher:
     """Best-effort Signal K stream publisher over websocket."""
 
@@ -550,6 +555,11 @@ class SignalKWebsocketPublisher:
         self.token = str(token or "").strip()
         self.timeout = float(timeout)
         self._ws = None
+        self._retry_base_sec = 5.0
+        self._retry_max_sec = 300.0
+        self._retry_delay_sec = self._retry_base_sec
+        self._next_retry_at = 0.0
+        self._last_error_summary = ""
 
     def _build_url(self) -> str:
         if not self.token:
@@ -557,9 +567,34 @@ class SignalKWebsocketPublisher:
         sep = "&" if "?" in self.server_url else "?"
         return f"{self.server_url}{sep}token={self.token}"
 
+    def _format_error(self, exc: Exception) -> str:
+        return " ".join(str(exc).split()) or exc.__class__.__name__
+
+    def _raise_if_retry_deferred(self):
+        now = time.monotonic()
+        if now >= self._next_retry_at:
+            return
+        wait_sec = max(1, int(math.ceil(self._next_retry_at - now)))
+        detail = self._last_error_summary or "previous websocket failure"
+        raise SignalKPublishRetryLater(f"{detail}; retrying in {wait_sec}s")
+
+    def _register_failure(self, exc: Exception) -> str:
+        summary = self._format_error(exc)
+        delay = max(self._retry_base_sec, self._retry_delay_sec)
+        self._last_error_summary = summary
+        self._next_retry_at = time.monotonic() + delay
+        self._retry_delay_sec = min(self._retry_max_sec, delay * 2.0)
+        return f"{summary}; retrying in {int(math.ceil(delay))}s"
+
+    def _reset_retry_state(self):
+        self._retry_delay_sec = self._retry_base_sec
+        self._next_retry_at = 0.0
+        self._last_error_summary = ""
+
     def _connect(self):
         if self._ws is not None:
             return
+        self._raise_if_retry_deferred()
         try:
             from websocket import create_connection  # type: ignore
         except ImportError as e:
@@ -567,14 +602,17 @@ class SignalKWebsocketPublisher:
                 "Missing dependency websocket-client. Install with: python3 -m pip install websocket-client"
             ) from e
         self._ws = create_connection(self._build_url(), timeout=self.timeout)
+        self._reset_retry_state()
 
     def publish(self, packet_json: str):
         try:
             self._connect()
             self._ws.send(packet_json)
-        except Exception:
-            self.close()
+        except SignalKPublishRetryLater:
             raise
+        except Exception as exc:
+            self.close()
+            raise SignalKPublishRetryLater(self._register_failure(exc)) from None
 
     def check_connection(self):
         self._connect()
@@ -5939,7 +5977,7 @@ def on_message(client, userdata, message):
                     len(delta["updates"][0]["values"]),
                 )
             except Exception as e:
-                logger.exception("Signal K publish failed for topic=%s: %s", topic, e)
+                logger.warning("Signal K publish failed for topic=%s: %s", topic, e)
                 msg = str(e).lower()
                 if any(x in msg for x in ("401", "403", "unauthoriz", "forbidden", "token")):
                     manager = runtime.get("signalk_access_manager")

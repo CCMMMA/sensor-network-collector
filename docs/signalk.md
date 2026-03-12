@@ -4,6 +4,8 @@
 
 - collector publishes deltas over websocket to Signal K stream endpoint
 - default endpoint format: `ws://host:3000/signalk/v1/stream`
+- temporary websocket gateway/upstream failures such as `502 Bad Gateway` trigger bounded reconnect backoff instead of reconnecting on every MQTT message
+- during backoff, local CSV and InfluxDB sinks continue normally and Signal K publish failures are logged as concise warnings without full traceback spam
 
 ## Context mapping
 

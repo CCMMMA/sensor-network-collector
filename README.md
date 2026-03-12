@@ -7,7 +7,7 @@ Threaded MQTT collector for weather/sensor networks, aligned with `vantage-publi
 - MQTT subscriber with auto-reconnect
 - Multiple output sinks:
   - InfluxDB
-  - Signal K websocket deltas
+  - Signal K websocket deltas with retry backoff on transient gateway failures
   - hourly CSV storage
 - Dry mode for safe runtime validation (`--dry`)
 - Web GUI for data download with authentication and access policies
