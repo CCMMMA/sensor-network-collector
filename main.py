@@ -1756,12 +1756,15 @@ def get_field_units(cfg: dict):
     out = dict(DEFAULT_FIELD_UNITS)
     path_map = cfg.get("signalk_path_map", {})
     for key, entry in (path_map.items() if isinstance(path_map, dict) else []):
+        key_str = str(key)
+        if key_str in DEFAULT_FIELD_UNITS:
+            continue
         if isinstance(entry, dict):
             meta = entry.get("meta")
             if isinstance(meta, dict):
                 units = meta.get("units")
                 if isinstance(units, str) and units.strip():
-                    out[str(key)] = units.strip()
+                    out[key_str] = units.strip()
     return out
 
 
@@ -3515,12 +3518,11 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         chart_labels, chart_datasets, chart_y_axes = build_station_browser_chart_model(rows, chart_config, units_map)
         selected_fields = [item["field"] for side in ("left", "right") for item in chart_config.get(side, [])]
         numeric_series_values = {}
+        numeric_series_aligned = {}
         for field in numeric_cols:
-            numeric_series_values[field] = [
-                value
-                for value in (_to_float(row.get(field)) for row in rows)
-                if value is not None
-            ]
+            aligned_values = [_to_float(row.get(field)) for row in rows]
+            numeric_series_aligned[field] = aligned_values
+            numeric_series_values[field] = [value for value in aligned_values if value is not None]
 
         all_table_columns = list(rows[0].keys()) if rows else []
         table_prefs = parse_station_browser_table_prefs(request.args, request.cookies, instrument_uuid, all_table_columns)
@@ -3707,41 +3709,18 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     </div>
                   </div>
                 </form>
-                <div class="mb-3">
-                  <h3 class="h5">Statistics</h3>
-                  {% if table_column_stats %}
-                    <div class="stats-grid">
-                      {% for stat in table_column_stats %}
-                        <div class="stats-card">
-                          <div class="fw-semibold">{{ stat.column }}{% if units_map.get(stat.column) %} [{{ units_map.get(stat.column) }}]{% endif %}</div>
-                          <div class="small text-muted">Minimum</div>
-                          <div>{{ stat.min }}</div>
-                          <div class="small text-muted mb-2">{{ stat.min_at or '-' }}</div>
-                          <div class="small text-muted">Maximum</div>
-                          <div>{{ stat.max }}</div>
-                          <div class="small text-muted mb-2">{{ stat.max_at or '-' }}</div>
-                          <div class="small text-muted">Average</div>
-                          <div class="mb-2">{{ stat.avg }}</div>
-                          <div class="small text-muted">Standard deviation</div>
-                          <div>{{ stat.stddev }}</div>
-                        </div>
-                      {% endfor %}
-                    </div>
-                  {% else %}
-                    <p class="text-muted mb-0">No numeric parameters available in the selected trend window.</p>
-                  {% endif %}
-                </div>
+                <div id="dataTableSection">
                 <p>Rows {{ start_idx + 1 if total_rows else 0 }}-{{ end_idx if end_idx < total_rows else total_rows }} of {{ total_rows }}</p>
-                <p>
+                <p id="tablePager">
                   {% if page > 1 %}
-                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=request.args.get('anchor',''), from_date=request.args.get('from_date',''), to_date=request.args.get('to_date',''), page=page-1, browser_prefs=browser_prefs_json) }}">&#8592; prev page</a>
+                    <a class="table-page-link" href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=request.args.get('anchor',''), from_date=request.args.get('from_date',''), to_date=request.args.get('to_date',''), page=page-1, browser_prefs=browser_prefs_json) }}">&#8592; prev page</a>
                   {% endif %}
                   {% if page < page_count %}
                     {% if page > 1 %}|{% endif %}
-                    <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=request.args.get('anchor',''), from_date=request.args.get('from_date',''), to_date=request.args.get('to_date',''), page=page+1, browser_prefs=browser_prefs_json) }}">next page &#8594;</a>
+                    <a class="table-page-link" href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=request.args.get('anchor',''), from_date=request.args.get('from_date',''), to_date=request.args.get('to_date',''), page=page+1, browser_prefs=browser_prefs_json) }}">next page &#8594;</a>
                   {% endif %}
                 </p>
-                <div class="table-wrap">
+                <div class="table-wrap" id="tableWrap">
                   <table class="table table-sm table-striped table-bordered">
                     <thead>
                       <tr>
@@ -3771,6 +3750,31 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     </tbody>
                   </table>
                 </div>
+                </div>
+                <div class="mb-3 mt-3" id="statisticsSection">
+                  <h3 class="h5">Statistics</h3>
+                  {% if table_column_stats %}
+                    <div class="stats-grid">
+                      {% for stat in table_column_stats %}
+                        <div class="stats-card">
+                          <div class="fw-semibold">{{ stat.column }}{% if units_map.get(stat.column) %} [{{ units_map.get(stat.column) }}]{% endif %}</div>
+                          <div class="small text-muted">Minimum</div>
+                          <div>{{ stat.min }}</div>
+                          <div class="small text-muted mb-2">{{ stat.min_at or '-' }}</div>
+                          <div class="small text-muted">Maximum</div>
+                          <div>{{ stat.max }}</div>
+                          <div class="small text-muted mb-2">{{ stat.max_at or '-' }}</div>
+                          <div class="small text-muted">Average</div>
+                          <div class="mb-2">{{ stat.avg }}</div>
+                          <div class="small text-muted">Standard deviation</div>
+                          <div>{{ stat.stddev }}</div>
+                        </div>
+                      {% endfor %}
+                    </div>
+                  {% else %}
+                    <p class="text-muted mb-0">No numeric parameters available in the selected trend window.</p>
+                  {% endif %}
+                </div>
               </div>
 
               <script>
@@ -3786,31 +3790,75 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 const browserPrefsCookieName = {{ browser_prefs_cookie_name | tojson }};
                 const defaultChartColors = {{ default_chart_colors | tojson }};
                 const numericSeriesValues = {{ numeric_series_values | tojson }};
-                let autoSubmitTimer = null;
-                if (labels.length > 0 && datasets.length > 0 && document.getElementById('chart')) {
-                  new Chart(document.getElementById('chart'), {
-                    type: 'bar',
-                    data: {
-                      labels,
-                      datasets: datasets.map((d, idx) => ({
-                        type: d.type || 'line',
-                        label: d.label,
-                        data: d.data,
-                        borderColor: d.color || defaultChartColors[idx % defaultChartColors.length],
-                        backgroundColor: d.color ? `${d.color}40` : ['rgba(11,87,208,0.25)','rgba(31,157,85,0.25)','rgba(217,95,2,0.25)','rgba(123,31,162,0.25)','rgba(194,24,91,0.25)'][idx % 5],
+                const numericSeriesAligned = {{ numeric_series_aligned | tojson }};
+                const chartCanvas = document.getElementById('chart');
+                let stationChart = null;
+                const chartFillPalette = ['rgba(11,87,208,0.25)','rgba(31,157,85,0.25)','rgba(217,95,2,0.25)','rgba(123,31,162,0.25)','rgba(194,24,91,0.25)'];
+
+                function buildStationChartModel() {
+                  const builtDatasets = [];
+                  const builtAxes = {
+                    x: { display: true, title: { display: true, text: 'timestamp' } }
+                  };
+                  ['left', 'right'].forEach((side) => {
+                    (chartConfigState[side] || []).forEach((item, idx) => {
+                      const field = item.field;
+                      const axisId = `${side}_${idx}`;
+                      const unit = unitsMap[field] || '';
+                      const label = `${field} [${unit || '-'}]`;
+                      const color = item.color || defaultChartColors[builtDatasets.length % defaultChartColors.length];
+                      builtDatasets.push({
+                        type: item.type === 'bar' ? 'bar' : 'line',
+                        label,
+                        data: (numericSeriesAligned[field] || []).map((value) => value == null ? null : Number(value)),
+                        borderColor: color,
+                        backgroundColor: item.type === 'bar' ? `${color}40` : chartFillPalette[builtDatasets.length % chartFillPalette.length],
                         pointRadius: 0,
-                        tension: 0.2,
-                        yAxisID: d.yAxisID
-                      }))
-                    },
-                    options: {
-                      responsive: true,
-                      scales: {
-                        x: { display: true, title: { display: true, text: 'timestamp' } },
-                        ...yAxes
-                      }
-                    }
+                        tension: item.type === 'bar' ? 0 : 0.2,
+                        yAxisID: axisId
+                      });
+                      const axisCfg = {
+                        type: 'linear',
+                        display: true,
+                        position: side,
+                        title: { display: true, text: label },
+                        grid: { drawOnChartArea: side === 'left' && idx === 0 },
+                        offset: idx > 0
+                      };
+                      if (item.min !== null && item.min !== undefined && Number.isFinite(Number(item.min))) axisCfg.min = Number(item.min);
+                      if (item.max !== null && item.max !== undefined && Number.isFinite(Number(item.max))) axisCfg.max = Number(item.max);
+                      if (item.step !== null && item.step !== undefined && Number(item.step) > 0) axisCfg.ticks = { stepSize: Number(item.step) };
+                      builtAxes[axisId] = axisCfg;
+                    });
                   });
+                  return { datasets: builtDatasets, axes: builtAxes };
+                }
+
+                function syncChartUrl() {
+                  const url = new URL(window.location.href);
+                  const payload = { chart_config: chartConfigState, table: tablePrefsState };
+                  url.searchParams.set('chart_config', JSON.stringify(chartConfigState));
+                  url.searchParams.set('browser_prefs', JSON.stringify(payload));
+                  url.searchParams.delete('page');
+                  window.history.replaceState({}, '', url.toString());
+                }
+
+                function renderStationChart() {
+                  if (!chartCanvas) return;
+                  const model = buildStationChartModel();
+                  if (!stationChart) {
+                    if (!model.datasets.length) return;
+                    stationChart = new Chart(chartCanvas, {
+                      type: 'bar',
+                      data: { labels, datasets: model.datasets },
+                      options: { responsive: true, scales: model.axes }
+                    });
+                    return;
+                  }
+                  stationChart.data.labels = labels;
+                  stationChart.data.datasets = model.datasets;
+                  stationChart.options.scales = model.axes;
+                  stationChart.update('none');
                 }
 
                 const chartForm = document.getElementById('chartForm');
@@ -3896,14 +3944,12 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     browserPrefsInput.value = JSON.stringify(payload);
                     document.cookie = `${browserPrefsCookieName}=${encodeURIComponent(browserPrefsInput.value)}; path=/; max-age=31536000; samesite=lax`;
                     document.cookie = `${chartConfigCookieName}=${encodeURIComponent(chartConfigInput.value)}; path=/; max-age=31536000; samesite=lax`;
+                    syncChartUrl();
                   }
 
-                  function scheduleAutoSubmit() {
+                  function scheduleChartRefresh() {
                     syncChartConfigInput();
-                    if (autoSubmitTimer) {
-                      window.clearTimeout(autoSubmitTimer);
-                    }
-                    autoSubmitTimer = window.setTimeout(() => chartForm.requestSubmit(), 150);
+                    renderStationChart();
                   }
 
                   function renderChartSelector() {
@@ -3927,7 +3973,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                       chartConfigState[side].push({ field: opt.value, type: 'line', min: null, max: null, step: null, color: nextColor });
                     });
                     renderChartSelector();
-                    scheduleAutoSubmit();
+                    scheduleChartRefresh();
                   }
 
                   function removeFrom(side, selectEl) {
@@ -3935,7 +3981,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     const selected = new Set(Array.from(selectEl.selectedOptions).map((o) => o.value));
                     chartConfigState[side] = chartConfigState[side].filter((item) => !selected.has(item.field));
                     renderChartSelector();
-                    scheduleAutoSubmit();
+                    scheduleChartRefresh();
                   }
 
                   document.getElementById('addLeftBtn')?.addEventListener('click', () => moveAvailableTo('left'));
@@ -3961,7 +4007,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     } else if (target.classList.contains('chart-step')) {
                       item.step = target.value === '' ? null : Number(target.value);
                     }
-                    scheduleAutoSubmit();
+                    scheduleChartRefresh();
                   });
 
                   chartForm.addEventListener('click', (event) => {
@@ -3998,10 +4044,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     item.max = Number((Math.ceil(hi / step) * step).toFixed(6));
                     item.step = Number(step.toFixed(6));
                     renderChartSelector();
-                    scheduleAutoSubmit();
+                    scheduleChartRefresh();
                   });
-
-                  chartForm.addEventListener('submit', () => syncChartConfigInput());
 
                   if (chartExportBtn) {
                     chartExportBtn.addEventListener('click', () => {
@@ -4039,7 +4083,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                           tablePrefsState.visible_columns = Array.isArray(payload.table.visible_columns) ? payload.table.visible_columns : tablePrefsState.visible_columns;
                         }
                         renderChartSelector();
-                        scheduleAutoSubmit();
+                        scheduleChartRefresh();
                       } catch (_) {
                         window.alert('Invalid chart preferences JSON file.');
                       } finally {
@@ -4050,16 +4094,46 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
                   renderChartSelector();
                 }
+                renderStationChart();
                 const tablePrefsForm = document.getElementById('tablePrefsForm');
                 if (tablePrefsForm) {
                   const pageSizeSel = document.getElementById('tablePageSize');
                   const tableBrowserPrefsInput = document.getElementById('tableBrowserPrefsInput');
-                  const tableWrap = document.querySelector('.table-wrap');
+                  let tableWrap = document.getElementById('tableWrap');
+                  let dataTableSection = document.getElementById('dataTableSection');
+                  let statisticsSection = document.getElementById('statisticsSection');
 
                   function syncTablePrefsInput() {
                     const payload = { chart_config: chartConfigState, table: tablePrefsState };
                     if (tableBrowserPrefsInput) tableBrowserPrefsInput.value = JSON.stringify(payload);
                     document.cookie = `${browserPrefsCookieName}=${encodeURIComponent(JSON.stringify(payload))}; path=/; max-age=31536000; samesite=lax`;
+                  }
+
+                  function refreshTableRefs() {
+                    tableWrap = document.getElementById('tableWrap');
+                    dataTableSection = document.getElementById('dataTableSection');
+                    statisticsSection = document.getElementById('statisticsSection');
+                  }
+
+                  async function updateTableFromUrl(href) {
+                    try {
+                      const resp = await fetch(href, { cache: 'no-store' });
+                      if (!resp.ok) return;
+                      const html = await resp.text();
+                      const doc = new DOMParser().parseFromString(html, 'text/html');
+                      const nextDataTableSection = doc.getElementById('dataTableSection');
+                      const nextStatisticsSection = doc.getElementById('statisticsSection');
+                      if (!nextDataTableSection || !nextStatisticsSection || !dataTableSection || !statisticsSection) {
+                        window.location.href = href;
+                        return;
+                      }
+                      dataTableSection.replaceWith(nextDataTableSection);
+                      statisticsSection.replaceWith(nextStatisticsSection);
+                      window.history.replaceState({}, '', href);
+                      refreshTableRefs();
+                    } catch (_) {
+                      window.location.href = href;
+                    }
                   }
 
                   pageSizeSel?.addEventListener('change', () => {
@@ -4068,7 +4142,19 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     tablePrefsForm.requestSubmit();
                   });
 
-                  tableWrap?.addEventListener('change', (event) => {
+                  document.addEventListener('click', (event) => {
+                    const target = event.target;
+                    if (!(target instanceof HTMLElement)) return;
+                    const link = target.closest('.table-page-link');
+                    if (!(link instanceof HTMLAnchorElement)) return;
+                    event.preventDefault();
+                    syncTablePrefsInput();
+                    updateTableFromUrl(link.href);
+                  });
+
+                  document.addEventListener('change', (event) => {
+                    refreshTableRefs();
+                    if (!tableWrap || !tableWrap.contains(event.target)) return;
                     const target = event.target;
                     if (!(target instanceof HTMLInputElement) || !target.classList.contains('table-col-toggle')) return;
                     const allToggles = Array.from(document.querySelectorAll('.table-col-toggle'));
@@ -4123,6 +4209,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             chart_y_axes=chart_y_axes,
             default_chart_colors=DEFAULT_CHART_COLORS,
             numeric_series_values=numeric_series_values,
+            numeric_series_aligned=numeric_series_aligned,
             table_rows=table_rows,
             table_cols=table_cols,
             all_table_columns=all_table_columns,
@@ -4536,6 +4623,11 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                       if (card) {
                         card.classList.toggle('fullscreen', Boolean(isFocused));
                       }
+                      const titleEl = col.querySelector('.chart-title');
+                      if (titleEl) {
+                        const baseLabel = col.dataset.chartLabel || '';
+                        titleEl.textContent = isFocused ? `${baseLabel} - ${windowLabel(snapshot.window || currentWindow)}` : baseLabel;
+                      }
                     });
                     syncFocusUrl();
                   };
@@ -4631,9 +4723,9 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                       chartsEl.appendChild(col);
                     }
 
-                    col.querySelector('.chart-title').textContent = s.label;
+                    col.dataset.chartLabel = s.label;
                     const titleEl = col.querySelector('.chart-title');
-                    titleEl.textContent = `${s.label} - ${windowLabel(snapshot.window || currentWindow)}`;
+                    titleEl.textContent = s.label;
                     col.querySelector('.chart-unit').textContent = s.unit || '';
                     col.querySelector('.fullscreen-station-name').textContent = snapshot.station_name || snapshot.instrument_uuid;
                     col.querySelector('.fullscreen-stats').innerHTML = renderStats(s.stats, s.unit || '');
@@ -4672,7 +4764,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                               beginAtZero: false,
                               min: yMin,
                               max: yMax,
-                              ticks: yStep ? { stepSize: yStep } : {}
+                              ticks: yStep ? { stepSize: yStep } : {},
+                              title: { display: Boolean(s.unit), text: s.unit || '' }
                             }
                           }
                         }
@@ -4691,6 +4784,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                       chart.options.scales.y.min = yMin;
                       chart.options.scales.y.max = yMax;
                       chart.options.scales.y.ticks = yStep ? { stepSize: yStep } : {};
+                      chart.options.scales.y.title = { display: Boolean(s.unit), text: s.unit || '' };
                       chart.update('none');
                     }
                   });

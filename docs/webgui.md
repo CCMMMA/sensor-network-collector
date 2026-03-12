@@ -59,6 +59,8 @@ This is used for the Public Station Dashboard trend charts only.
 
 The authenticated station browser page `/station/<uuid>` has its own user-side browsing preferences.
 
+Units shown in the authenticated station browser follow the raw MQTT/storage field units, not the Signal K converted metadata units. For example, `WindDir` is shown as `deg` in the station browser even if Signal K metadata for the mapped path uses `rad`.
+
 Chart section:
 
 - available parameters in the center
@@ -71,7 +73,7 @@ Chart section:
   - `y_max`
   - `y_step`
 - each selected parameter has an `Auto range` action that computes `y_min`, `y_max`, and `y_step` from the parameter time series in the currently selected trend window
-- chart updates automatically when parameters are moved or visualization options are changed
+- chart updates automatically in place when parameters are moved or visualization options are changed, without reloading the full page
 
 Table section:
 
@@ -83,7 +85,8 @@ Table section:
 - `Trend window` shows all rows in the current trend window
 - each table header embeds its own checkbox for show/hide control
 - when a column is hidden, its header collapses to checkbox width and the full title remains available as tooltip
-- the table section includes a `Statistics` area for visible numeric parameters in the current trend window
+- prev/next page navigation updates the table and statistics in place without reloading the whole page
+- the `Statistics` area is shown after the `Data table` section and reflects the current visible numeric parameters in the current trend window
 - each statistics card shows:
   - minimum and the timestamp when it occurred
   - maximum and the timestamp when it occurred
@@ -226,6 +229,7 @@ SMTP fallback behavior:
 - public station page shows app logo + station logo together
 - public station dashboard trend charts update in-place without full page reload
 - existing chart instances are reused and updated with fresh points and axes instead of being recreated on each polling cycle
+- each public trend chart shows parameter units on the Y-axis
 - public station dashboard trend window can be selected as:
   - last minute
   - 10 minutes
@@ -246,6 +250,7 @@ SMTP fallback behavior:
 - double-clicking again restores the normal multi-chart layout
 - pressing `Esc` also exits the focused chart view
 - the focused chart state can be opened directly with query string `focus=<chart_key>`
+- the selected trend window is shown next to the chart title only while the chart is focused full screen
 - in focused mode the chart title shows the parameter name followed by the selected trend window
 - in focused mode the top of the chart view shows:
   - web app logo
