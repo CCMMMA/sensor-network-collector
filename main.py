@@ -2004,8 +2004,9 @@ from(bucket: {json.dumps(cfg["influxdb_bucket"])})
   |> range(start: {range_start})
   |> filter(fn: (r) => r._measurement == {json.dumps(cfg["influx_measurement"])} and r.uuid == {json.dumps(instrument_uuid)})
   |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-  |> sort(columns: ["_time"])
+  |> sort(columns: ["_time"], desc: true)
   |> limit(n: {int(max_points)})
+  |> sort(columns: ["_time"])
 """
     try:
         tables = influx_client.query_api().query(query=query, org=cfg["influxdb_org"])
@@ -2062,10 +2063,18 @@ def _aqi_status(value):
 def build_public_station_snapshot(storage_root: str, instrument_uuid: str, window: str = "hour", max_points: int = 240, cfg: dict = None):
     window = normalize_public_window(window)
     cfg = cfg or runtime.get("config") or {}
-    storage_rows = load_station_rows(storage_root, instrument_uuid, limit=2000)
+    preview = get_station_preview(storage_root, instrument_uuid)
+    latest_hint = parse_iso_ts(preview.get("last_timestamp") or "") or utc_now()
+    storage_window_start = interval_start(latest_hint, window)
+    storage_rows = load_station_rows(
+        storage_root,
+        instrument_uuid,
+        from_date=storage_window_start.date(),
+        to_date=latest_hint.date(),
+        limit=None,
+    )
     influx_rows = _query_influx_station_rows(cfg, instrument_uuid, window, max_points=max(600, max_points * 4))
     rows = _merge_station_rows(influx_rows, storage_rows)
-    preview = get_station_preview(storage_root, instrument_uuid)
 
     if not rows:
         return {
@@ -4364,6 +4373,25 @@ def build_signalk_access_manager(cfg: dict):
         logger=logger,
     )
 
+
+def init_influx_runtime(cfg: dict):
+    runtime["config"] = cfg
+    if not cfg.get("enable_influx") or cfg.get("dry"):
+        return None
+
+    influx_client = runtime.get("influx_client")
+    if influx_client is not None:
+        return influx_client
+
+    influx_client = InfluxDBClient(
+        url=cfg["influxdb_url"],
+        token=cfg["influxdb_token"],
+        org=cfg["influxdb_org"],
+    )
+    runtime["influx_client"] = influx_client
+    runtime["write_api"] = influx_client.write_api(write_options=SYNCHRONOUS)
+    return influx_client
+
 # ----------------------------
 # MQTT callbacks
 # ----------------------------
@@ -4553,13 +4581,7 @@ def main():
     runtime["config"] = cfg
 
     if cfg["enable_influx"] and not cfg["dry"]:
-        influx_client = InfluxDBClient(
-            url=cfg["influxdb_url"],
-            token=cfg["influxdb_token"],
-            org=cfg["influxdb_org"],
-        )
-        runtime["influx_client"] = influx_client
-        runtime["write_api"] = influx_client.write_api(write_options=SYNCHRONOUS)
+        init_influx_runtime(cfg)
         logger.info("InfluxDB output enabled")
     elif cfg["enable_influx"]:
         logger.info("InfluxDB output enabled in dry mode")

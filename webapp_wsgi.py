@@ -1,6 +1,6 @@
 import os
 
-from main import AccessStore, create_web_app, load_config
+from main import AccessStore, create_web_app, init_influx_runtime, load_config
 
 
 class _Args:
@@ -18,6 +18,8 @@ def create_app(config_path: str | None = None):
 
     if not cfg.get("enable_http"):
         raise RuntimeError("httpEnabled must be true for WSGI web deployment")
+
+    init_influx_runtime(cfg)
 
     access_store = AccessStore(cfg["auth_db_path"])
     access_store.ensure_admin(cfg["admin_user"], cfg["admin_password"])
