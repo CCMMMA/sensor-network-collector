@@ -12,7 +12,8 @@ This document describes production-grade Docker deployment for `sensor-network-c
 
 Container responsibilities:
 
-- run `python3 main.py --config /app/config.json`
+- run `python3 main.py --config /app/config.json` for MQTT ingest and sinks
+- run `gunicorn --bind 0.0.0.0:8080 webapp_wsgi:app` for the web GUI when deployed as a separate web service
 - write CSV storage and auth DB under mounted persistent volume
 - expose web GUI when `httpEnabled=true`
 
@@ -58,6 +59,18 @@ services:
   collector:
     build: .
     restart: unless-stopped
+    volumes:
+      - ./config.local.json:/app/config.json:ro
+      - ./data:/data
+
+  web:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - collector
+    command: ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:8080", "webapp_wsgi:app"]
+    environment:
+      COLLECTOR_CONFIG: /app/config.json
     ports:
       - "8080:8080"
     volumes:
@@ -84,6 +97,8 @@ Important:
 - Use a strong `webSessionSecret`.
 - Set strong `adminPassword`.
 - Set `baseUrl` to the public HTTPS URL used by browsers, so fast-login and password-reset email links are correct.
+- Keep `httpEnabled` set to `true` for the Gunicorn `web` service.
+- The `collector` service continues handling MQTT ingest and sinks; the `web` service serves the Flask UI through [`webapp_wsgi.py`](/Users/raffaelemontella/Documents/New project/sensor-network-collector/webapp_wsgi.py).
 - If email delivery is not needed, omit `smtpHost` and the application will skip email sending.
 - For plain unauthenticated relay inside trusted networks, you can omit `smtpPort`, `smtpUser`, and `smtpPass`; SMTP falls back to port `25`.
 
@@ -93,11 +108,17 @@ Important:
 docker compose up -d --build
 ```
 
+This starts:
+
+- `collector` for MQTT ingest, storage, InfluxDB, Signal K, and background tasks
+- `web` for the browser-facing GUI served by Gunicorn
+
 ## Verify health
 
 ```bash
 docker compose ps
 docker compose logs -f collector
+docker compose logs -f web
 ```
 
 ## Operational commands
@@ -111,7 +132,7 @@ docker compose down
 Restart:
 
 ```bash
-docker compose restart collector
+docker compose restart collector web
 ```
 
 Rollout after config/code updates:
@@ -144,7 +165,7 @@ tar -xzf sensor-network-collector-backup.tgz
 
 If exposed publicly, run behind Nginx/Caddy/Traefik with TLS.
 
-Forward only HTTP port from reverse proxy to container.
+Forward only the `web` HTTP port from reverse proxy to container.
 
 ## Security hardening checklist
 

@@ -1,5 +1,5 @@
 services:
-  sensor-network-collector:
+  collector:
     build:
       context: .
       dockerfile: Dockerfile
@@ -9,6 +9,20 @@ services:
     volumes:
       - ./config.json:/app/config.json
       - ./data:/data
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sensor-network-web
+    restart: unless-stopped
+    depends_on:
+      - collector
+    command: ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:8080", "webapp_wsgi:app"]
+    environment:
+      COLLECTOR_CONFIG: /app/config.json
+    volumes:
+      - ./config.json:/app/config.json
+      - ./data:/data
     ports:
       - "8080:8080"
-      - "1883:1883"

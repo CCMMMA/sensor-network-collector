@@ -187,7 +187,8 @@ Important:
 
 This Compose setup runs:
 
-- `collector`: MQTT collector + Flask web GUI
+- `collector`: MQTT collector + sinks/background tasks
+- `web`: Gunicorn serving `webapp_wsgi:app`
 - `nginx`: local reverse proxy listening on host port `8087`
 
 ```yaml
@@ -199,6 +200,21 @@ services:
     container_name: sensor-network-collector
     restart: unless-stopped
     command: ["python3", "main.py", "--config", "/app/config.json"]
+    volumes:
+      - ./config.prod.json:/app/config.json:ro
+      - ./data:/data
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sensor-network-web
+    restart: unless-stopped
+    depends_on:
+      - collector
+    command: ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:8080", "webapp_wsgi:app"]
+    environment:
+      COLLECTOR_CONFIG: /app/config.json
     expose:
       - "8080"
     volumes:
@@ -210,7 +226,7 @@ services:
     container_name: sensor-network-nginx
     restart: unless-stopped
     depends_on:
-      - collector
+      - web
     ports:
       - "8087:8087"
     volumes:
@@ -225,7 +241,7 @@ Notes:
 
 ### 4. Create `nginx/default.conf`
 
-This Nginx config listens on port `8087` and forwards requests to the collector on internal port `8080`:
+This Nginx config listens on port `8087` and forwards requests to the Gunicorn `web` service on internal port `8080`:
 
 ```nginx
 server {
@@ -235,7 +251,7 @@ server {
     client_max_body_size 25m;
 
     location / {
-        proxy_pass http://collector:8080;
+        proxy_pass http://web:8080;
         proxy_http_version 1.1;
 
         proxy_set_header Host $host;
@@ -267,6 +283,7 @@ Check status:
 ```bash
 docker compose ps
 docker compose logs -f collector
+docker compose logs -f web
 docker compose logs -f nginx
 ```
 
