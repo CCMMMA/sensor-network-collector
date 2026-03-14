@@ -220,6 +220,8 @@
   "httpPort": 8080,
   "baseUrl": "http://localhost:8080",
   "webAppLogo": "/tmp/sensor-network-collector/logo.png",
+  "webAppLink": "https://meteo.uniparthenope.it",
+  "webInfoLink": "",
   "authDbPath": "/tmp/sensor-network-collector/collector_auth.sqlite",
   "webSessionSecret": "replace-with-a-strong-random-secret",
   "adminUser": "admin",

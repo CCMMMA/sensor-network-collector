@@ -144,6 +144,8 @@ Signal K value normalization:
 - `webSessionSecret`: required strong random secret
 - `adminUser`, `adminPassword`
 - `webAppLogo`: optional absolute path to app logo image
+- `webAppLink`: optional external URL opened when the home-page logo is clicked
+- `webInfoLink`: optional external URL shown as `Info` before `Login` on the home page
 
 Example:
 
@@ -157,13 +159,16 @@ Example:
   "webSessionSecret": "replace-with-strong-secret",
   "adminUser": "admin",
   "adminPassword": "replace-with-strong-password",
-  "webAppLogo": "/data/branding/app-logo.png"
+  "webAppLogo": "/data/branding/app-logo.png",
+  "webAppLink": "https://meteo.uniparthenope.it",
+  "webInfoLink": "https://meteo.uniparthenope.it/info"
 }
 ```
 
 `baseUrl` is used for:
 
-- fast-login links in welcome, approval, and anomaly emails
+- fast-login links in welcome and anomaly emails
+- onboarding links sent after an admin approves an account request
 - password-reset links from the forgot-password flow
 
 `authDbPath` stores:
@@ -191,6 +196,7 @@ Behavior:
 - if `smtpUser` is set, SMTP login is attempted
 - `smtpUseTls` can still explicitly force TLS behavior; default logic follows the port/auth fallback
 - forgot-password and reset emails require both SMTP configuration and a correct `baseUrl`
+- account approval onboarding emails also require both SMTP configuration and a correct `baseUrl`
 
 Example:
 

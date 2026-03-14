@@ -21,6 +21,7 @@ Set:
 - `/forgot-password`
 - `/reset-password?token=...`
 - `/request-account`
+- `/request-account/complete?token=...`
 - `/change-password`
 - `/fast-login?token=...`
 - `/station/<uuid>` station browser + chart + download
@@ -73,6 +74,7 @@ Chart section:
   - `y_max`
   - `y_step`
 - each selected parameter has an `Auto range` action that computes `y_min`, `y_max`, and `y_step` from the parameter time series in the currently selected trend window
+- when a selected parameter has no explicit `y_min`, `y_max`, or `y_step`, the browser uses the same automatic range logic used by the Public Station Dashboard for the matching metric
 - chart updates automatically in place when parameters are moved or visualization options are changed, without reloading the full page
 
 Table section:
@@ -198,7 +200,7 @@ With SMTP enabled:
 
 - registration request confirmation email
 - welcome email when admin creates user
-- approval email when request is approved
+- account approval email with onboarding link when request is approved
 - password-reset email from forgot-password flow
 - anomaly warning emails to admins and station-related users
 
@@ -214,6 +216,30 @@ SMTP fallback behavior:
 - users can request a password reset from `/forgot-password`
 - reset links are delivered by email and open `/reset-password?token=...`
 - reset flow requires a valid `baseUrl` and working SMTP configuration
+- all new passwords must be strong:
+  - at least 12 characters
+  - at least one uppercase letter
+  - at least one lowercase letter
+  - at least one digit
+  - at least one special character
+
+## Account requests and onboarding
+
+The self-service account request flow is:
+
+1. requester opens `/request-account`
+2. requester submits only email and reason
+3. request is saved as pending and admins receive an email notification
+4. admin approves or rejects the request in `/admin`
+5. if approved, the requester receives a one-time onboarding link
+6. requester opens `/request-account/complete?token=...`
+7. requester chooses a unique username and a strong password
+
+Behavior details:
+
+- username availability is checked immediately from the browser
+- if a username already exists, the page shows an inline error and also blocks submission server-side
+- onboarding links are expiring, single-use tokens
 
 ## Anomaly log and silencing
 
@@ -225,6 +251,8 @@ SMTP fallback behavior:
 ## Branding and logos
 
 - `webAppLogo` sets global app logo
+- `webAppLink` can wrap the home-page logo with an external hyperlink
+- `webInfoLink` can add an `Info` link on the home page before `Login`
 - station users can upload per-station logo from station page
 - public station page shows app logo + station logo together
 - public station dashboard trend charts update in-place without full page reload
@@ -246,6 +274,10 @@ SMTP fallback behavior:
 - when the plotted range crosses a day boundary, the x-axis prints the full date at the tick where the day changes
 - public station dashboard trend chart Y-axis settings are loaded per station from the auth SQLite DB
 - Y-axis step size is applied directly to chart ticks when configured
+- public station dashboard includes a combined `Wind` trend chart with:
+  - wind direction as a line on the left Y-axis
+  - wind speed as bars on the right Y-axis
+  - axis ranges aligned with the dedicated wind direction and wind speed trend charts
 - double-clicking a trend chart toggles a focused full-screen view for that chart
 - double-clicking again restores the normal multi-chart layout
 - pressing `Esc` also exits the focused chart view

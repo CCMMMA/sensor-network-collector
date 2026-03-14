@@ -311,6 +311,8 @@ def load_config(path: str, args) -> dict:
             cfg_value(raw, ["adminPassword"], env_name="ADMIN_PASSWORD", default="admin") or "admin"
         ),
         "web_app_logo": str(cfg_value(raw, ["webAppLogo"], env_name="WEB_APP_LOGO", default="") or ""),
+        "web_app_link": str(cfg_value(raw, ["webAppLink"], env_name="WEB_APP_LINK", default="") or "").strip(),
+        "web_info_link": str(cfg_value(raw, ["webInfoLink"], env_name="WEB_INFO_LINK", default="") or "").strip(),
         "base_url": str(cfg_value(raw, ["baseUrl"], env_name="BASE_URL", default="") or "").strip(),
         "smtp_enabled": parse_boolish(cfg_value(raw, ["smtpEnabled"], env_name="SMTP_ENABLED", default=False), False),
         "smtp_host": str(cfg_value(raw, ["smtpHost"], env_name="SMTP_HOST", default="") or "").strip(),
@@ -844,6 +846,14 @@ class AccessStore:
                             used_at TEXT
                         );
 
+                        CREATE TABLE IF NOT EXISTS account_request_tokens (
+                            token TEXT PRIMARY KEY,
+                            request_id INTEGER NOT NULL,
+                            expires_at TEXT NOT NULL,
+                            created_at TEXT NOT NULL,
+                            used_at TEXT
+                        );
+
                         CREATE TABLE IF NOT EXISTS anomalies (
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
                             station_uuid TEXT NOT NULL,
@@ -892,6 +902,10 @@ class AccessStore:
                     # Backward-compatible migrations for existing DBs.
                     try:
                         con.execute("ALTER TABLE users ADD COLUMN force_password_change INTEGER NOT NULL DEFAULT 0")
+                    except sqlite3.OperationalError:
+                        pass
+                    try:
+                        con.execute("ALTER TABLE account_requests ADD COLUMN reviewed_at TEXT")
                     except sqlite3.OperationalError:
                         pass
             except sqlite3.OperationalError as e:
@@ -1001,6 +1015,11 @@ class AccessStore:
         username = username.strip()
         if not username:
             return False, "Username is required"
+        if self.get_user(username):
+            return False, "User already exists"
+        ok, password_msg = validate_password_strength(password)
+        if not ok:
+            return False, password_msg
         role = "admin" if role == "admin" else "user"
         with self._lock:
             try:
@@ -1020,24 +1039,26 @@ class AccessStore:
                     )
                 return False, f"Database error: {e}"
 
-    def create_account_request(self, username: str, password: str, email: str, message: str):
+    def username_exists(self, username: str):
         username = username.strip()
         if not username:
-            return False, "Username is required"
-        if not password:
-            return False, "Password is required"
+            return False
+        with self._connect() as con:
+            row = con.execute("SELECT 1 FROM users WHERE username = ? LIMIT 1", (username,)).fetchone()
+        return bool(row)
 
+    def create_account_request(self, email: str, message: str):
+        email = email.strip()
+        if not email:
+            return False, "Email is required"
         with self._lock:
             with self._connect() as con:
-                exists_user = con.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
-                if exists_user:
-                    return False, "Username already exists"
                 con.execute(
                     "INSERT INTO account_requests(username,email,password_hash,message,status,created_at,reviewed_by) VALUES(?,?,?,?,?,?,?)",
                     (
-                        username,
-                        email.strip(),
-                        generate_password_hash(password),
+                        "",
+                        email,
+                        "",
                         message.strip(),
                         "pending",
                         now_utc_iso(),
@@ -1047,7 +1068,7 @@ class AccessStore:
         return True, "Request submitted"
 
     def list_account_requests(self, status=None):
-        query = "SELECT id,username,email,message,status,created_at,reviewed_by FROM account_requests"
+        query = "SELECT id,username,email,message,status,created_at,reviewed_by,reviewed_at FROM account_requests"
         params = ()
         if status:
             query += " WHERE status = ?"
@@ -1068,24 +1089,11 @@ class AccessStore:
                     return False, "Request not found"
                 if req["status"] != "pending":
                     return False, f"Request already {req['status']}"
-
-                exists_user = con.execute("SELECT 1 FROM users WHERE username = ?", (req["username"],)).fetchone()
-                if exists_user:
-                    con.execute(
-                        "UPDATE account_requests SET status = 'approved', reviewed_by = ? WHERE id = ?",
-                        (admin_username, request_id),
-                    )
-                    return True, "Request marked approved (user already existed)"
-
                 con.execute(
-                    "INSERT INTO users(username,password_hash,email,role,active,created_at) VALUES(?,?,?,?,?,?)",
-                    (req["username"], req["password_hash"], req["email"], "user", 1, now_utc_iso()),
+                    "UPDATE account_requests SET status = 'approved', reviewed_by = ?, reviewed_at = ? WHERE id = ?",
+                    (admin_username, now_utc_iso(), request_id),
                 )
-                con.execute(
-                    "UPDATE account_requests SET status = 'approved', reviewed_by = ? WHERE id = ?",
-                    (admin_username, request_id),
-                )
-                return True, "Request approved and user created"
+                return True, "Request approved"
 
     def reject_request(self, request_id: int, admin_username: str):
         with self._lock:
@@ -1096,10 +1104,82 @@ class AccessStore:
                 if req["status"] != "pending":
                     return False, f"Request already {req['status']}"
                 con.execute(
-                    "UPDATE account_requests SET status = 'rejected', reviewed_by = ? WHERE id = ?",
-                    (admin_username, request_id),
+                    "UPDATE account_requests SET status = 'rejected', reviewed_by = ?, reviewed_at = ? WHERE id = ?",
+                    (admin_username, now_utc_iso(), request_id),
                 )
                 return True, "Request rejected"
+
+    def get_account_request(self, request_id: int):
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT id,username,email,message,status,created_at,reviewed_by,reviewed_at FROM account_requests WHERE id = ?",
+                (request_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_account_request_token(self, request_id: int, ttl_hours: int = 48):
+        token = secrets.token_urlsafe(32)
+        now = utc_now()
+        expires = now + timedelta(hours=max(1, ttl_hours))
+        with self._lock:
+            with self._connect() as con:
+                con.execute(
+                    "INSERT INTO account_request_tokens(token,request_id,expires_at,created_at,used_at) VALUES(?,?,?,?,NULL)",
+                    (
+                        token,
+                        int(request_id),
+                        expires.isoformat().replace("+00:00", "Z"),
+                        now.isoformat().replace("+00:00", "Z"),
+                    ),
+                )
+        return token
+
+    def get_account_request_for_token(self, token: str):
+        if not token:
+            return None
+        now = utc_now()
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT token,request_id,expires_at,used_at FROM account_request_tokens WHERE token = ?",
+                (token,),
+            ).fetchone()
+        if row is None or row["used_at"]:
+            return None
+        exp = parse_iso_ts(row["expires_at"])
+        if exp is None or exp < now:
+            return None
+        request_row = self.get_account_request(int(row["request_id"]))
+        if not request_row or request_row.get("status") != "approved":
+            return None
+        return request_row
+
+    def complete_account_request(self, token: str, username: str, password: str):
+        username = username.strip()
+        if not username:
+            return False, "Username is required"
+        if self.username_exists(username):
+            return False, "Username already exists"
+        ok, password_msg = validate_password_strength(password)
+        if not ok:
+            return False, password_msg
+        request_row = self.get_account_request_for_token(token)
+        if request_row is None:
+            return False, "Invalid or expired onboarding link"
+        with self._lock:
+            try:
+                with self._connect() as con:
+                    con.execute(
+                        "INSERT INTO users(username,password_hash,email,role,active,created_at) VALUES(?,?,?,?,?,?)",
+                        (username, generate_password_hash(password), request_row["email"], "user", 1, now_utc_iso()),
+                    )
+                    con.execute(
+                        "UPDATE account_requests SET username = ?, status = 'completed' WHERE id = ?",
+                        (username, int(request_row["id"])),
+                    )
+                    con.execute("UPDATE account_request_tokens SET used_at = ? WHERE token = ?", (now_utc_iso(), token))
+            except sqlite3.IntegrityError:
+                return False, "Username already exists"
+        return True, "Account created"
 
     def set_policy(self, instrument_uuid: str, policy: str, updated_by: str):
         if policy not in ("open", "account", "restricted"):
@@ -1821,6 +1901,23 @@ def safe_filename(name: str):
     return base[:180] or "file"
 
 
+def validate_password_strength(password: str):
+    if not isinstance(password, str) or not password:
+        return False, "Password is required"
+    if len(password) < 12:
+        return False, "Password must be at least 12 characters long"
+    checks = [
+        (r"[A-Z]", "one uppercase letter"),
+        (r"[a-z]", "one lowercase letter"),
+        (r"[0-9]", "one digit"),
+        (r"[^A-Za-z0-9]", "one special character"),
+    ]
+    missing = [label for pattern, label in checks if re.search(pattern, password) is None]
+    if missing:
+        return False, "Password must include " + ", ".join(missing)
+    return True, ""
+
+
 def shift_months(dt: datetime, months: int):
     y = dt.year + ((dt.month - 1 + months) // 12)
     m = ((dt.month - 1 + months) % 12) + 1
@@ -2143,7 +2240,18 @@ def serialize_station_browser_chart_config(chart_config):
     return json.dumps(clean, separators=(",", ":"))
 
 
-def build_station_browser_chart_model(rows, chart_config, units_map):
+def _match_chart_spec_for_field(field: str, resolved_specs):
+    field_l = str(field or "").strip().lower()
+    if not field_l:
+        return None
+    for spec in resolved_specs or []:
+        for alias in spec.get("aliases", []):
+            if str(alias or "").strip().lower() == field_l:
+                return spec
+    return None
+
+
+def build_station_browser_chart_model(rows, chart_config, units_map, resolved_specs=None):
     labels = [str(row.get("timestamp") or "") for row in rows]
     datasets = []
     y_axes = {}
@@ -2179,12 +2287,23 @@ def build_station_browser_chart_model(rows, chart_config, units_map):
                 "grid": {"drawOnChartArea": side == "left" and idx == 0},
                 "offset": idx > 0,
             }
-            if item.get("min") is not None:
-                axis_cfg["min"] = float(item["min"])
-            if item.get("max") is not None:
-                axis_cfg["max"] = float(item["max"])
-            if item.get("step") is not None:
-                axis_cfg["ticks"] = {"stepSize": float(item["step"])}
+            effective_min = item.get("min")
+            effective_max = item.get("max")
+            effective_step = item.get("step")
+            if effective_min is None and effective_max is None and effective_step is None:
+                spec = _match_chart_spec_for_field(field, resolved_specs)
+                if spec is not None:
+                    numeric_values = [value for value in data if value is not None]
+                    y_min, y_max, y_step = _calc_axis_settings(numeric_values, spec.get("axis"))
+                    effective_min = y_min
+                    effective_max = y_max
+                    effective_step = y_step
+            if effective_min is not None:
+                axis_cfg["min"] = float(effective_min)
+            if effective_max is not None:
+                axis_cfg["max"] = float(effective_max)
+            if effective_step is not None:
+                axis_cfg["ticks"] = {"stepSize": float(effective_step)}
             y_axes[axis_id] = axis_cfg
 
     return labels, datasets, y_axes
@@ -2442,6 +2561,7 @@ def get_chart_setting_catalog():
                 "key": spec["key"],
                 "label": spec["label"],
                 "unit": spec.get("unit", ""),
+                "aliases": list(spec.get("aliases") or []),
                 "axis": dict(spec.get("axis") or {}),
             }
         )
@@ -2465,6 +2585,7 @@ def resolve_station_chart_specs(access_store: AccessStore, instrument_uuid: str)
                 "key": spec["key"],
                 "label": spec["label"],
                 "unit": spec.get("unit", ""),
+                "aliases": list(spec.get("aliases") or []),
                 "axis": merged_axis,
                 "saved": {
                     "y_min": override.get("y_min"),
@@ -2773,6 +2894,74 @@ def build_public_station_snapshot(
                     "stats": _build_series_stats(points, resolved_spec["label"]),
                 }
             )
+
+    wind_dir_spec = chart_specs.get("wind_direction", next((spec for spec in PUBLIC_SERIES_SPECS if spec["key"] == "wind_direction"), {}))
+    wind_speed_spec = chart_specs.get("wind_speed", next((spec for spec in PUBLIC_SERIES_SPECS if spec["key"] == "wind_speed"), {}))
+    wind_dir_points = []
+    wind_dir_values = []
+    wind_speed_points = []
+    wind_speed_values = []
+    for ts, row in rows_ts:
+        iso_ts = ts.isoformat().replace("+00:00", "Z")
+        wind_dir = _first_numeric_for_aliases(row, ["WindDir", "wind_dir"])
+        if wind_dir is not None:
+            rounded = round(wind_dir, 3)
+            wind_dir_values.append(rounded)
+            wind_dir_points.append({"x": iso_ts, "y": rounded})
+        wind_speed = _first_numeric_for_aliases(row, ["WindSpeed", "wind_speed"])
+        if wind_speed is not None:
+            rounded = round(wind_speed, 3)
+            wind_speed_values.append(rounded)
+            wind_speed_points.append({"x": iso_ts, "y": rounded})
+    if wind_dir_points or wind_speed_points:
+        dir_min, dir_max, dir_step = _calc_axis_settings(wind_dir_values, wind_dir_spec.get("axis"))
+        speed_min, speed_max, speed_step = _calc_axis_settings(wind_speed_values, wind_speed_spec.get("axis"))
+        wind_stats = []
+        dir_stats = _build_series_stats(wind_dir_points, "Wind Direction")
+        speed_stats = _build_series_stats(wind_speed_points, "Wind Speed")
+        if dir_stats:
+            wind_stats.append(dir_stats)
+        if speed_stats:
+            wind_stats.append(speed_stats)
+        series.append(
+            {
+                "key": "wind_combined",
+                "label": "Wind",
+                "unit": "",
+                "labels": [str(row.get("timestamp") or "") for row in rows],
+                "datasets": [
+                    {
+                        "label": "Wind Direction",
+                        "points": wind_dir_points,
+                        "type": "line",
+                        "yAxisID": "wind_direction",
+                    },
+                    {
+                        "label": "Wind Speed",
+                        "points": wind_speed_points,
+                        "type": "bar",
+                        "yAxisID": "wind_speed",
+                    },
+                ],
+                "axes": {
+                    "wind_direction": {
+                        "position": "left",
+                        "unit": wind_dir_spec.get("unit", "deg"),
+                        "y_min": dir_min,
+                        "y_max": dir_max,
+                        "y_step": dir_step,
+                    },
+                    "wind_speed": {
+                        "position": "right",
+                        "unit": wind_speed_spec.get("unit", "m/s"),
+                        "y_min": speed_min,
+                        "y_max": speed_max,
+                        "y_step": speed_step,
+                    },
+                },
+                "stats": wind_stats,
+            }
+        )
 
     # Particulate matter multi-series trend (only when available).
     pm_series_specs = [
@@ -3299,14 +3488,18 @@ def create_web_app(cfg: dict, access_store: AccessStore):
               </style>
             </head>
             <body class="container py-4">
-              {% if app_logo_url %}<img src="{{ app_logo_url }}" alt="App logo" style="max-height:56px; margin-bottom:8px;">{% endif %}
+              {% if app_logo_url %}
+                {% if web_app_link %}<a href="{{ web_app_link }}" target="_blank" rel="noopener noreferrer">{% endif %}
+                <img src="{{ app_logo_url }}" alt="App logo" style="max-height:56px; margin-bottom:8px;">
+                {% if web_app_link %}</a>{% endif %}
+              {% endif %}
               <h1>Sensor Network Collector - Data Portal</h1>
               {% if user %}
                 <p>Logged in as <b>{{ user.username }}</b> ({{ user.role }}) - <a href="{{ url_for('logout') }}">Logout</a></p>
                 <p><a href="{{ url_for('anomalies_log') }}">Anomalies log</a></p>
                 {% if user.role == 'admin' %}<p><a href="{{ url_for('admin') }}">Admin panel</a></p>{% endif %}
               {% else %}
-                <p><a href="{{ url_for('login') }}">Login</a> | <a href="{{ url_for('request_account') }}">Request account</a></p>
+                <p>{% if web_info_link %}<a href="{{ web_info_link }}" target="_blank" rel="noopener noreferrer">Info</a> | {% endif %}<a href="{{ url_for('login') }}">Login</a> | <a href="{{ url_for('request_account') }}">Request account</a></p>
               {% endif %}
 
               <div class="panel">
@@ -3404,6 +3597,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             clickable=clickable,
             center=center,
             app_logo_url=logo_url(app_logo_path),
+            web_app_link=cfg.get("web_app_link"),
+            web_info_link=cfg.get("web_info_link"),
         )
 
     @app.route("/station/<path:instrument_uuid>")
@@ -3515,7 +3710,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     chart_config_args = {"chart_config": cookie_chart_config}
         chart_config = parse_station_browser_chart_config(chart_config_args, numeric_cols)
         chart_config_json = serialize_station_browser_chart_config(chart_config)
-        chart_labels, chart_datasets, chart_y_axes = build_station_browser_chart_model(rows, chart_config, units_map)
+        resolved_chart_specs = resolve_station_chart_specs(access_store, instrument_uuid)
+        chart_labels, chart_datasets, chart_y_axes = build_station_browser_chart_model(rows, chart_config, units_map, resolved_chart_specs)
         selected_fields = [item["field"] for side in ("left", "right") for item in chart_config.get(side, [])]
         numeric_series_values = {}
         numeric_series_aligned = {}
@@ -4647,13 +4843,16 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   const styleDataset = (dataset, color) => {
                     const pointCount = Array.isArray(dataset.data) ? dataset.data.length : 0;
                     const sparse = pointCount <= 2;
+                    const datasetType = dataset.type === 'bar' ? 'bar' : 'line';
                     return {
                       ...dataset,
+                      type: datasetType,
                       borderColor: color,
+                      backgroundColor: datasetType === 'bar' ? `${color}88` : color,
                       borderWidth: 2,
                       tension: sparse ? 0 : 0.25,
                       spanGaps: true,
-                      showLine: pointCount > 1,
+                      showLine: datasetType === 'bar' ? false : pointCount > 1,
                       pointRadius: sparse ? 3 : 0,
                       pointHoverRadius: sparse ? 4 : 0
                     };
@@ -4667,12 +4866,52 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     const datasets = (s.datasets && Array.isArray(s.datasets))
                       ? s.datasets.map((d, j) => styleDataset({
                           label: d.label,
-                          data: normalizeChartPoints(d.points)
+                          data: normalizeChartPoints(d.points),
+                          type: d.type,
+                          yAxisID: d.yAxisID
                         }, colors[(idx + j) % colors.length]))
                       : [styleDataset({
                           label: s.label,
                           data: normalizeChartPoints(s.points)
                         }, colors[idx % colors.length])];
+                    const scales = {
+                      x: {
+                        type: 'linear',
+                        min: xMin,
+                        max: xMax,
+                        afterBuildTicks: (axis) => {
+                          axis.ticks = customTicks.map((tick) => ({ value: tick }));
+                        },
+                        ticks: {
+                          callback: (value, index, ticks) => {
+                            return formatWindowTickWithDayChange(value, snapshot.window || currentWindow, index, ticks);
+                          }
+                        }
+                      }
+                    };
+                    if (s.axes && typeof s.axes === 'object') {
+                      Object.entries(s.axes).forEach(([axisId, axis]) => {
+                        const axisStep = (axis.y_step !== null && axis.y_step !== undefined) ? axis.y_step : undefined;
+                        scales[axisId] = {
+                          type: 'linear',
+                          display: true,
+                          position: axis.position === 'right' ? 'right' : 'left',
+                          min: axis.y_min !== null && axis.y_min !== undefined ? axis.y_min : undefined,
+                          max: axis.y_max !== null && axis.y_max !== undefined ? axis.y_max : undefined,
+                          ticks: axisStep ? { stepSize: axisStep } : {},
+                          title: { display: Boolean(axis.unit), text: axis.unit || '' },
+                          grid: { drawOnChartArea: axis.position !== 'right' }
+                        };
+                      });
+                    } else {
+                      scales.y = {
+                        beginAtZero: false,
+                        min: yMin,
+                        max: yMax,
+                        ticks: yStep ? { stepSize: yStep } : {},
+                        title: { display: Boolean(s.unit), text: s.unit || '' }
+                      };
+                    }
                     let col = chartCards[s.key];
                     if (!col) {
                       col = document.createElement('div');
@@ -4734,7 +4973,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
                     if (!chartInstances[s.key]) {
                       chartInstances[s.key] = new Chart(canvas, {
-                        type: 'line',
+                        type: datasets.some((d) => d.type === 'bar') ? 'bar' : 'line',
                         data: {
                           labels: s.labels,
                           datasets
@@ -4746,45 +4985,16 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                             legend: { display: datasets.length > 1 },
                             tooltip: { enabled: false }
                           },
-                          scales: {
-                            x: {
-                              type: 'linear',
-                              min: xMin,
-                              max: xMax,
-                              afterBuildTicks: (axis) => {
-                                axis.ticks = customTicks.map((tick) => ({ value: tick }));
-                              },
-                              ticks: {
-                                callback: (value, index, ticks) => {
-                                  return formatWindowTickWithDayChange(value, snapshot.window || currentWindow, index, ticks);
-                                }
-                              }
-                            },
-                            y: {
-                              beginAtZero: false,
-                              min: yMin,
-                              max: yMax,
-                              ticks: yStep ? { stepSize: yStep } : {},
-                              title: { display: Boolean(s.unit), text: s.unit || '' }
-                            }
-                          }
+                          scales
                         }
                       });
                     } else {
                       const chart = chartInstances[s.key];
                       chart.data.labels = s.labels;
                       chart.data.datasets = datasets;
+                      chart.config.type = datasets.some((d) => d.type === 'bar') ? 'bar' : 'line';
                       chart.options.plugins.legend.display = datasets.length > 1;
-                      chart.options.scales.x.min = xMin;
-                      chart.options.scales.x.max = xMax;
-                      chart.options.scales.x.afterBuildTicks = (axis) => {
-                        axis.ticks = customTicks.map((tick) => ({ value: tick }));
-                      };
-                      chart.options.scales.x.ticks.callback = (value, index, ticks) => formatWindowTickWithDayChange(value, snapshot.window || currentWindow, index, ticks);
-                      chart.options.scales.y.min = yMin;
-                      chart.options.scales.y.max = yMax;
-                      chart.options.scales.y.ticks = yStep ? { stepSize: yStep } : {};
-                      chart.options.scales.y.title = { display: Boolean(s.unit), text: s.unit || '' };
+                      chart.options.scales = scales;
                       chart.update('none');
                     }
                   });
@@ -5120,19 +5330,29 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         msg = ""
         err = ""
         if request.method == "POST":
-            username = request.form.get("username", "").strip()
             email = request.form.get("email", "").strip()
-            password = request.form.get("password", "")
             reason = request.form.get("reason", "")
-            ok, text = access_store.create_account_request(username, password, email, reason)
+            ok, text = access_store.create_account_request(email, reason)
             if ok:
                 msg = text
-                if email:
+                send_email(
+                    cfg,
+                    [email],
+                    "Sensor Network Collector: registration request received",
+                    "Hello,\n\nYour registration request has been received and is pending admin approval.",
+                )
+                admin_emails = access_store.list_admin_emails()
+                if admin_emails:
                     send_email(
                         cfg,
-                        [email],
-                        "Sensor Network Collector: registration request received",
-                        f"Hello {username},\n\nYour registration request has been received and is pending admin approval.",
+                        admin_emails,
+                        "Sensor Network Collector: new account request",
+                        (
+                            "A new account request has been submitted.\n\n"
+                            f"Email: {email}\n"
+                            f"Reason: {reason.strip() or '-'}\n\n"
+                            f"Review it in the admin panel:\n{compose_external_url(cfg['base_url'], url_for('admin'))}\n"
+                        ),
                     )
             else:
                 err = text
@@ -5153,20 +5373,12 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   {% if err %}<div class="alert alert-danger">{{ err }}</div>{% endif %}
                   <form method="post">
                     <div class="mb-3">
-                      <label class="form-label">Username</label>
-                      <input class="form-control" name="username">
-                    </div>
-                    <div class="mb-3">
                       <label class="form-label">Email</label>
-                      <input class="form-control" name="email" type="email">
-                    </div>
-                    <div class="mb-3">
-                      <label class="form-label">Password</label>
-                      <input class="form-control" name="password" type="password">
+                      <input class="form-control" name="email" type="email" required>
                     </div>
                     <div class="mb-3">
                       <label class="form-label">Reason</label>
-                      <textarea class="form-control" name="reason" rows="4"></textarea>
+                      <textarea class="form-control" name="reason" rows="4" required></textarea>
                     </div>
                     <button class="btn btn-primary" type="submit">Submit request</button>
                   </form>
@@ -5176,6 +5388,116 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             </body>
             </html>
             """,
+            msg=msg,
+            err=err,
+        )
+
+    @app.route("/api/check-username")
+    def check_username():
+        username = request.args.get("username", "").strip()
+        if not username:
+            return jsonify({"available": False, "message": "Username is required"})
+        available = not access_store.username_exists(username)
+        return jsonify({"available": available, "message": "" if available else "Username already exists"})
+
+    @app.route("/request-account/complete", methods=["GET", "POST"])
+    def complete_account_request():
+        token = request.args.get("token", "").strip()
+        request_row = access_store.get_account_request_for_token(token)
+        if request_row is None:
+            return render_template_string(
+                """
+                <html><body class="container py-5">
+                  <h1 class="h4">Onboarding link invalid</h1>
+                  <p>This onboarding link is invalid, expired, or already used.</p>
+                  <p><a href="{{ url_for('index') }}">Home</a></p>
+                </body></html>
+                """
+            )
+        msg = ""
+        err = ""
+        if request.method == "POST":
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "")
+            confirm_password = request.form.get("confirm_password", "")
+            if password != confirm_password:
+                err = "Passwords do not match"
+            else:
+                ok, text = access_store.complete_account_request(token, username, password)
+                if ok:
+                    msg = text
+                    session["username"] = username
+                    return redirect(url_for("index"))
+                err = text
+        return render_template_string(
+            """
+            <html>
+            <head>
+              <title>Complete onboarding</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+              <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+            </head>
+            <body class="container py-5">
+              <div class="row justify-content-center">
+                <div class="col-12 col-md-8 col-lg-6">
+                  <h1 class="h3 mb-3">Complete onboarding</h1>
+                  <p class="text-muted">Request for {{ request_row.email }}</p>
+                  {% if msg %}<div class="alert alert-success">{{ msg }}</div>{% endif %}
+                  {% if err %}<div class="alert alert-danger">{{ err }}</div>{% endif %}
+                  <form method="post" id="onboardingForm" novalidate>
+                    <div class="mb-3">
+                      <label class="form-label">Username</label>
+                      <input class="form-control" name="username" id="onboardingUsername" required>
+                      <div id="usernameAvailability" class="form-text"></div>
+                    </div>
+                    <div class="mb-3">
+                      <label class="form-label">Password</label>
+                      <input class="form-control" name="password" id="onboardingPassword" type="password" required>
+                      <div class="form-text">Use at least 12 characters, including uppercase, lowercase, digit, and special character.</div>
+                    </div>
+                    <div class="mb-3">
+                      <label class="form-label">Confirm password</label>
+                      <input class="form-control" name="confirm_password" type="password" required>
+                    </div>
+                    <button class="btn btn-primary" type="submit">Create account</button>
+                  </form>
+                  <p class="mt-3"><a href="{{ url_for('index') }}">Home</a></p>
+                </div>
+              </div>
+              <script>
+                const usernameInput = document.getElementById('onboardingUsername');
+                const availability = document.getElementById('usernameAvailability');
+                let availabilityTimer = null;
+                let lastAvailability = null;
+                async function checkUsername(showAlert = false) {
+                  const username = (usernameInput.value || '').trim();
+                  if (!username) {
+                    availability.textContent = '';
+                    lastAvailability = null;
+                    return;
+                  }
+                  try {
+                    const resp = await fetch(`/api/check-username?username=${encodeURIComponent(username)}`, { cache: 'no-store' });
+                    if (!resp.ok) return;
+                    const payload = await resp.json();
+                    availability.textContent = payload.message || 'Username available';
+                    availability.className = payload.available ? 'form-text text-success' : 'form-text text-danger';
+                    if (!payload.available && showAlert && lastAvailability !== false) {
+                      window.alert(payload.message || 'Username already exists');
+                    }
+                    lastAvailability = payload.available;
+                  } catch (_) {}
+                }
+                usernameInput.addEventListener('input', () => {
+                  if (availabilityTimer) clearTimeout(availabilityTimer);
+                  availabilityTimer = setTimeout(() => checkUsername(false), 300);
+                });
+                usernameInput.addEventListener('blur', () => checkUsername(true));
+              </script>
+            </body>
+            </html>
+            """,
+            request_row=request_row,
             msg=msg,
             err=err,
         )
@@ -5268,8 +5590,9 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             {% if pending_requests %}
               {% for r in pending_requests %}
                 <div class="card mb-2"><div class="card-body">
-                  <b>#{{ r.id }} {{ r.username }}</b> ({{ r.email }})<br/>
-                  {{ r.message }}<br/>
+                  <b>#{{ r.id }}</b> {{ r.email }}<br/>
+                  <span class="text-muted">Reason:</span> {{ r.message or '-' }}<br/>
+                  <span class="text-muted">Created:</span> {{ r.created_at }}<br/>
                   <form method="post" action="{{ url_for('admin_approve_request', request_id=r.id) }}" style="display:inline;">
                     <button class="btn btn-success btn-sm" type="submit">Approve</button>
                   </form>
@@ -5868,15 +6191,21 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         ok, msg = access_store.approve_request(request_id, admin_user["username"])
         if not ok:
             abort(400, msg)
-        req = next((r for r in access_store.list_account_requests() if int(r["id"]) == int(request_id)), None)
+        req = access_store.get_account_request(request_id)
         if req and req.get("email"):
-            token = access_store.create_login_token(req["username"], ttl_minutes=60)
-            link = compose_external_url(cfg["base_url"], url_for("fast_login"), {"token": token})
+            token = access_store.create_account_request_token(request_id, ttl_hours=48)
+            link = compose_external_url(cfg["base_url"], url_for("complete_account_request"), {"token": token})
             send_email(
                 cfg,
                 [req["email"]],
                 "Sensor Network Collector: account approved",
-                f"Hello {req['username']},\n\nYour account request has been approved.\nFast login link (expires in 60 minutes):\n{link}\n",
+                (
+                    "Hello,\n\n"
+                    "Your account request has been approved.\n"
+                    "Use the link below to complete onboarding and choose your username and password.\n"
+                    "This link expires in 48 hours.\n\n"
+                    f"{link}\n"
+                ),
             )
         return redirect(url_for("admin"))
 

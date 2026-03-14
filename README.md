@@ -19,6 +19,7 @@ Threaded MQTT collector for weather/sensor networks, aligned with `vantage-publi
 - Per-station public trend-chart Y-axis configuration with controller/admin management
 - JSON export/import for station trend-chart setup
 - Public station trend charts update incrementally, support full-screen focus with branding, and show per-window min/max/current widgets
+- Public station dashboard includes a combined Wind trend chart with wind direction and wind speed on separate Y-axes
 - Watchdog anomaly detection with persisted anomaly log (SQLite)
 - SMTP notifications (welcome, registration, alarms with fast-login link)
   - if `smtpHost` is not configured, emails are skipped
@@ -26,6 +27,7 @@ Threaded MQTT collector for weather/sensor networks, aligned with `vantage-publi
 - Admin-enforced password change and user self-service password update
 - Self-service forgot-password and reset-by-email flow
 - Web app logo and per-station logo upload/display
+- Configurable home-page external links for logo and info
 
 ## Configuration Style (Homogeneous with `vantage-publisher`)
 
@@ -218,13 +220,15 @@ See:
 
 ## Web UI notes
 
-- `baseUrl` is used to compose externally visible links in email messages, including fast-login and password-reset URLs.
+- `baseUrl` is used to compose externally visible links in email messages, including fast-login, onboarding, and password-reset URLs.
+- Account requests are handled in two steps: request by email/reason, then admin approval, then onboarding with a unique username and strong password.
 - Public station dashboard trend-window choice is remembered in browser cookies.
 - Station dashboard trend interval choice is also remembered in browser cookies.
 - Station browser chart and table preferences are persisted per station and can be exported/imported as JSON.
 - The auth SQLite database also stores chart-control rights and per-station trend-chart axis settings used by the Public Station Dashboard.
 - Public station dashboard supports `focus=<chart_key>` in the query string to open a specific trend chart in focused full-screen mode.
 - Public station dashboard trend charts show the full date on the x-axis when the displayed day changes.
+- Home-page logo can link to `webAppLink`, and the unauthenticated nav can show `Info` from `webInfoLink`.
 - In focused mode, the chart title includes the selected trend window and the header shows the station name without UUID.
 
 ## Security notes
