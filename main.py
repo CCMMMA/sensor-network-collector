@@ -2309,6 +2309,24 @@ def build_station_browser_chart_model(rows, chart_config, units_map, resolved_sp
     return labels, datasets, y_axes
 
 
+def build_station_browser_axis_defaults(numeric_series_values, resolved_specs):
+    defaults = {}
+    available_fields = {str(field).strip().lower(): field for field in (numeric_series_values or {}).keys()}
+    for spec in resolved_specs or []:
+        axis_spec = spec.get("axis") or {}
+        for alias in spec.get("aliases", []):
+            alias_key = str(alias or "").strip().lower()
+            field_name = available_fields.get(alias_key, alias)
+            field_values = numeric_series_values.get(field_name, []) if field_name in numeric_series_values else []
+            y_min, y_max, y_step = _calc_axis_settings(field_values, axis_spec)
+            defaults[alias_key] = {
+                "min": y_min,
+                "max": y_max,
+                "step": y_step,
+            }
+    return defaults
+
+
 def parse_station_browser_table_prefs(request_args, request_cookies, instrument_uuid: str, all_columns):
     pref_cookie_name = f"station_browser_prefs_{safe_filename(instrument_uuid)}"
     raw = str(request_args.get("browser_prefs", "") or "").strip()
@@ -3719,6 +3737,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             aligned_values = [_to_float(row.get(field)) for row in rows]
             numeric_series_aligned[field] = aligned_values
             numeric_series_values[field] = [value for value in aligned_values if value is not None]
+        chart_axis_defaults = build_station_browser_axis_defaults(numeric_series_values, resolved_chart_specs)
 
         all_table_columns = list(rows[0].keys()) if rows else []
         table_prefs = parse_station_browser_table_prefs(request.args, request.cookies, instrument_uuid, all_table_columns)
@@ -3784,7 +3803,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 <p><img src="{{ station_logo_url }}" alt="Station logo" style="max-height:48px;"></p>
               {% endif %}
 
-              <div class="panel">
+              <div class="panel" id="intervalPanel">
                 <h2>Time interval</h2>
                 <form method="get" id="intervalForm">
                   <label>Window
@@ -3798,12 +3817,12 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   <input type="hidden" name="chart_config" value="{{ chart_config_json }}"/>
                   <input type="hidden" name="browser_prefs" value="{{ browser_prefs_json }}"/>
                 </form>
-                <p>
+                <p id="intervalPager">
                   <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=prev_anchor, browser_prefs=browser_prefs_json, from_date=request.args.get('from_date',''), to_date=request.args.get('to_date','')) }}">&#8592; previous {{ interval_label }}</a>
                   |
                   <a href="{{ url_for('browse_station', instrument_uuid=instrument_uuid, interval=interval, anchor=next_anchor, browser_prefs=browser_prefs_json, from_date=request.args.get('from_date',''), to_date=request.args.get('to_date','')) }}">next {{ interval_label }} &#8594;</a>
                 </p>
-                <p>Showing data in window: {{ win_start }} to {{ win_end }} UTC</p>
+                <p id="intervalSummary">Showing data in window: {{ win_start }} to {{ win_end }} UTC</p>
               </div>
 
               <div class="panel">
@@ -3884,6 +3903,8 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   <canvas id="chart" height="110"></canvas>
                 {% endif %}
               </div>
+
+              <script id="stationBrowseState" type="application/json">{{ station_browse_state_json|safe }}</script>
 
               <div class="panel">
                 <h2>Data table</h2>
@@ -3974,22 +3995,46 @@ def create_web_app(cfg: dict, access_store: AccessStore):
               </div>
 
               <script>
-                const labels = {{ chart_labels | tojson }};
-                const datasets = {{ chart_datasets | tojson }};
-                const yAxes = {{ chart_y_axes | tojson }};
+                let labels = {{ chart_labels | tojson }};
+                let datasets = {{ chart_datasets | tojson }};
+                let yAxes = {{ chart_y_axes | tojson }};
                 const chartConfigState = {{ chart_config | tojson }};
                 const tablePrefsState = {{ table_prefs | tojson }};
-                const unitsMap = {{ units_map | tojson }};
-                const allNumericCols = {{ numeric_cols | tojson }};
-                const allTableColumns = {{ all_table_columns | tojson }};
+                let unitsMap = {{ units_map | tojson }};
+                let allNumericCols = {{ numeric_cols | tojson }};
+                let allTableColumns = {{ all_table_columns | tojson }};
                 const chartConfigCookieName = {{ chart_cookie_name | tojson }};
                 const browserPrefsCookieName = {{ browser_prefs_cookie_name | tojson }};
                 const defaultChartColors = {{ default_chart_colors | tojson }};
-                const numericSeriesValues = {{ numeric_series_values | tojson }};
-                const numericSeriesAligned = {{ numeric_series_aligned | tojson }};
+                let numericSeriesValues = {{ numeric_series_values | tojson }};
+                let numericSeriesAligned = {{ numeric_series_aligned | tojson }};
+                let chartAxisDefaults = {{ chart_axis_defaults | tojson }};
                 const chartCanvas = document.getElementById('chart');
                 let stationChart = null;
                 const chartFillPalette = ['rgba(11,87,208,0.25)','rgba(31,157,85,0.25)','rgba(217,95,2,0.25)','rgba(123,31,162,0.25)','rgba(194,24,91,0.25)'];
+
+                function parseStationBrowseStateFromDocument(doc) {
+                  const node = doc.getElementById('stationBrowseState');
+                  if (!node) return null;
+                  try {
+                    return JSON.parse(node.textContent || '{}');
+                  } catch (_) {
+                    return null;
+                  }
+                }
+
+                function applyServerState(state) {
+                  if (!state || typeof state !== 'object') return;
+                  labels = Array.isArray(state.chart_labels) ? state.chart_labels : [];
+                  datasets = Array.isArray(state.chart_datasets) ? state.chart_datasets : [];
+                  yAxes = state.chart_y_axes && typeof state.chart_y_axes === 'object' ? state.chart_y_axes : {};
+                  unitsMap = state.units_map && typeof state.units_map === 'object' ? state.units_map : {};
+                  allNumericCols = Array.isArray(state.numeric_cols) ? state.numeric_cols : [];
+                  allTableColumns = Array.isArray(state.all_table_columns) ? state.all_table_columns : [];
+                  numericSeriesValues = state.numeric_series_values && typeof state.numeric_series_values === 'object' ? state.numeric_series_values : {};
+                  numericSeriesAligned = state.numeric_series_aligned && typeof state.numeric_series_aligned === 'object' ? state.numeric_series_aligned : {};
+                  chartAxisDefaults = state.chart_axis_defaults && typeof state.chart_axis_defaults === 'object' ? state.chart_axis_defaults : {};
+                }
 
                 function buildStationChartModel() {
                   const builtDatasets = [];
@@ -4166,7 +4211,15 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                         ...chartConfigState.right.map((item) => item.color)
                       ]);
                       const nextColor = defaultChartColors.find((color) => !usedColors.has(color)) || defaultChartColors[0];
-                      chartConfigState[side].push({ field: opt.value, type: 'line', min: null, max: null, step: null, color: nextColor });
+                      const fieldDefaults = chartAxisDefaults[String(opt.value || '').trim().toLowerCase()] || {};
+                      chartConfigState[side].push({
+                        field: opt.value,
+                        type: 'line',
+                        min: fieldDefaults.min ?? null,
+                        max: fieldDefaults.max ?? null,
+                        step: fieldDefaults.step ?? null,
+                        color: nextColor
+                      });
                     });
                     renderChartSelector();
                     scheduleChartRefresh();
@@ -4295,6 +4348,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 if (tablePrefsForm) {
                   const pageSizeSel = document.getElementById('tablePageSize');
                   const tableBrowserPrefsInput = document.getElementById('tableBrowserPrefsInput');
+                  let intervalPanel = document.getElementById('intervalPanel');
                   let tableWrap = document.getElementById('tableWrap');
                   let dataTableSection = document.getElementById('dataTableSection');
                   let statisticsSection = document.getElementById('statisticsSection');
@@ -4306,6 +4360,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   }
 
                   function refreshTableRefs() {
+                    intervalPanel = document.getElementById('intervalPanel');
                     tableWrap = document.getElementById('tableWrap');
                     dataTableSection = document.getElementById('dataTableSection');
                     statisticsSection = document.getElementById('statisticsSection');
@@ -4317,16 +4372,25 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                       if (!resp.ok) return;
                       const html = await resp.text();
                       const doc = new DOMParser().parseFromString(html, 'text/html');
+                      const nextState = parseStationBrowseStateFromDocument(doc);
                       const nextDataTableSection = doc.getElementById('dataTableSection');
                       const nextStatisticsSection = doc.getElementById('statisticsSection');
+                      const nextIntervalPanel = doc.getElementById('intervalPanel');
                       if (!nextDataTableSection || !nextStatisticsSection || !dataTableSection || !statisticsSection) {
                         window.location.href = href;
                         return;
+                      }
+                      applyServerState(nextState);
+                      if (intervalPanel && nextIntervalPanel) {
+                        intervalPanel.replaceWith(nextIntervalPanel);
                       }
                       dataTableSection.replaceWith(nextDataTableSection);
                       statisticsSection.replaceWith(nextStatisticsSection);
                       window.history.replaceState({}, '', href);
                       refreshTableRefs();
+                      bindIntervalForm();
+                      renderChartSelector();
+                      renderStationChart();
                     } catch (_) {
                       window.location.href = href;
                     }
@@ -4362,17 +4426,55 @@ def create_web_app(cfg: dict, access_store: AccessStore):
 
                   syncTablePrefsInput();
                 }
-                const intervalSel = document.getElementById('intervalSelect');
-                const intervalForm = document.getElementById('intervalForm');
-                if (intervalSel && intervalForm) {
-                  intervalSel.addEventListener('change', () => {
+                function bindIntervalForm() {
+                  const intervalSel = document.getElementById('intervalSelect');
+                  const intervalForm = document.getElementById('intervalForm');
+                  if (!intervalSel || !intervalForm || intervalSel.dataset.bound === '1') {
+                    return;
+                  }
+                  intervalSel.dataset.bound = '1';
+                  intervalSel.addEventListener('change', async () => {
                     document.cookie = `station_trend_window=${encodeURIComponent(intervalSel.value)}; path=/; max-age=31536000; samesite=lax`;
                     const prefsField = intervalForm.querySelector('input[name="browser_prefs"]');
                     const browserPrefsInput = document.getElementById('browserPrefsInput');
                     if (prefsField && browserPrefsInput) prefsField.value = browserPrefsInput.value;
-                    intervalForm.submit();
+                    const formData = new FormData(intervalForm);
+                    const url = new URL(window.location.href);
+                    Array.from(url.searchParams.keys()).forEach((key) => url.searchParams.delete(key));
+                    for (const [key, value] of formData.entries()) {
+                      if (value !== '') url.searchParams.set(key, String(value));
+                    }
+                    try {
+                      const resp = await fetch(url.toString(), { cache: 'no-store' });
+                      if (!resp.ok) {
+                        window.location.href = url.toString();
+                        return;
+                      }
+                      const html = await resp.text();
+                      const doc = new DOMParser().parseFromString(html, 'text/html');
+                      const nextState = parseStationBrowseStateFromDocument(doc);
+                      const nextIntervalPanel = doc.getElementById('intervalPanel');
+                      const nextDataTableSection = doc.getElementById('dataTableSection');
+                      const nextStatisticsSection = doc.getElementById('statisticsSection');
+                      if (!nextState || !nextIntervalPanel || !nextDataTableSection || !nextStatisticsSection) {
+                        window.location.href = url.toString();
+                        return;
+                      }
+                      applyServerState(nextState);
+                      document.getElementById('intervalPanel')?.replaceWith(nextIntervalPanel);
+                      document.getElementById('dataTableSection')?.replaceWith(nextDataTableSection);
+                      document.getElementById('statisticsSection')?.replaceWith(nextStatisticsSection);
+                      window.history.replaceState({}, '', url.toString());
+                      if (typeof refreshTableRefs === 'function') refreshTableRefs();
+                      bindIntervalForm();
+                      renderChartSelector();
+                      renderStationChart();
+                    } catch (_) {
+                      window.location.href = url.toString();
+                    }
                   });
                 }
+                bindIntervalForm();
               </script>
             </body>
             </html>
@@ -4403,6 +4505,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             chart_labels=chart_labels,
             chart_datasets=chart_datasets,
             chart_y_axes=chart_y_axes,
+            chart_axis_defaults=chart_axis_defaults,
             default_chart_colors=DEFAULT_CHART_COLORS,
             numeric_series_values=numeric_series_values,
             numeric_series_aligned=numeric_series_aligned,
@@ -4420,6 +4523,20 @@ def create_web_app(cfg: dict, access_store: AccessStore):
             start_idx=start_idx,
             end_idx=end_idx,
             request=request,
+            station_browse_state_json=json.dumps(
+                {
+                    "chart_labels": chart_labels,
+                    "chart_datasets": chart_datasets,
+                    "chart_y_axes": chart_y_axes,
+                    "numeric_cols": numeric_cols,
+                    "all_table_columns": all_table_columns,
+                    "units_map": units_map,
+                    "numeric_series_values": numeric_series_values,
+                    "numeric_series_aligned": numeric_series_aligned,
+                    "chart_axis_defaults": chart_axis_defaults,
+                },
+                separators=(",", ":"),
+            ),
         )
 
     @app.route("/station/<path:instrument_uuid>/logo", methods=["POST"])
