@@ -1,3 +1,4 @@
+gunicorn
 paho-mqtt
 influxdb-client
 websocket-client
