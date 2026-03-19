@@ -101,7 +101,7 @@ Table section:
 
 Persistence:
 
-- station browser preferences are persisted per station
+- station browser preferences are persisted per station in browser `localStorage`
 - the same preference object stores:
   - chart selection and left/right assignment
   - chart type
@@ -111,6 +111,7 @@ Persistence:
   - chart `y_step`
   - table page size
   - visible columns
+- large station-browser preference payloads are not stored in cookies, which avoids reverse-proxy `Request Header Or Cookie Too Large` failures on subsequent requests
 
 Import/export:
 

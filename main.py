@@ -2343,11 +2343,8 @@ def build_station_browser_axis_defaults(numeric_series_values, resolved_specs):
 
 
 def parse_station_browser_table_prefs(request_args, request_cookies, instrument_uuid: str, all_columns):
-    pref_cookie_name = f"station_browser_prefs_{safe_filename(instrument_uuid)}"
     raw = str(request_args.get("browser_prefs", "") or "").strip()
     payload = {}
-    if not raw:
-        raw = str(request_cookies.get(pref_cookie_name, "") or "").strip()
     if raw:
         try:
             parsed = json.loads(raw)
@@ -3725,8 +3722,6 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         chart_config_args = request.args
         browser_prefs = {}
         browser_prefs_raw = str(request.args.get("browser_prefs", "") or "").strip()
-        if not browser_prefs_raw:
-            browser_prefs_raw = str(request.cookies.get(browser_prefs_cookie_name, "") or "").strip()
         if browser_prefs_raw:
             try:
                 parsed_browser_prefs = json.loads(browser_prefs_raw)
@@ -3737,10 +3732,6 @@ def create_web_app(cfg: dict, access_store: AccessStore):
         if not str(request.args.get("chart_config", "") or "").strip():
             if isinstance(browser_prefs.get("chart_config"), dict):
                 chart_config_args = {"chart_config": json.dumps(browser_prefs.get("chart_config"))}
-            else:
-                cookie_chart_config = request.cookies.get(chart_cookie_name, "")
-                if cookie_chart_config:
-                    chart_config_args = {"chart_config": cookie_chart_config}
         chart_config = parse_station_browser_chart_config(chart_config_args, numeric_cols)
         chart_config_json = serialize_station_browser_chart_config(chart_config)
         resolved_chart_specs = resolve_station_chart_specs(access_store, instrument_uuid)
@@ -4024,9 +4015,49 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 let numericSeriesValues = {{ numeric_series_values | tojson }};
                 let numericSeriesAligned = {{ numeric_series_aligned | tojson }};
                 let chartAxisDefaults = {{ chart_axis_defaults | tojson }};
+                const browserPrefsStorageKey = `station_browser_prefs:${{ instrument_uuid | tojson }}`;
+                const chartConfigStorageKey = `station_chart_config:${{ instrument_uuid | tojson }}`;
+                const hasBrowserPrefsQuery = {{ (True if request.args.get('browser_prefs') or request.args.get('chart_config') else False) | tojson }};
                 const chartCanvas = document.getElementById('chart');
                 let stationChart = null;
                 const chartFillPalette = ['rgba(11,87,208,0.25)','rgba(31,157,85,0.25)','rgba(217,95,2,0.25)','rgba(123,31,162,0.25)','rgba(194,24,91,0.25)'];
+
+                function expireLegacyCookie(name) {
+                  document.cookie = `${name}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; samesite=lax`;
+                }
+
+                function loadStoredBrowserPrefs() {
+                  try {
+                    const raw = window.localStorage.getItem(browserPrefsStorageKey);
+                    if (!raw) return null;
+                    const parsed = JSON.parse(raw);
+                    return parsed && typeof parsed === 'object' ? parsed : null;
+                  } catch (_) {
+                    return null;
+                  }
+                }
+
+                function persistStationPrefs(payload) {
+                  try {
+                    window.localStorage.setItem(browserPrefsStorageKey, JSON.stringify(payload));
+                    window.localStorage.setItem(chartConfigStorageKey, JSON.stringify(chartConfigState));
+                  } catch (_) {
+                    // keep the page functional even if localStorage is unavailable
+                  }
+                }
+
+                expireLegacyCookie(browserPrefsCookieName);
+                expireLegacyCookie(chartConfigCookieName);
+
+                const storedBrowserPrefs = loadStoredBrowserPrefs();
+                if (!hasBrowserPrefsQuery && storedBrowserPrefs && typeof storedBrowserPrefs === 'object') {
+                  const url = new URL(window.location.href);
+                  url.searchParams.set('browser_prefs', JSON.stringify(storedBrowserPrefs));
+                  if (storedBrowserPrefs.chart_config && typeof storedBrowserPrefs.chart_config === 'object') {
+                    url.searchParams.set('chart_config', JSON.stringify(storedBrowserPrefs.chart_config));
+                  }
+                  window.location.replace(url.toString());
+                }
 
                 function parseStationBrowseStateFromDocument(doc) {
                   const node = doc.getElementById('stationBrowseState');
@@ -4198,8 +4229,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     chartConfigInput.value = JSON.stringify(chartConfigState);
                     const payload = { chart_config: chartConfigState, table: tablePrefsState };
                     browserPrefsInput.value = JSON.stringify(payload);
-                    document.cookie = `${browserPrefsCookieName}=${encodeURIComponent(browserPrefsInput.value)}; path=/; max-age=31536000; samesite=lax`;
-                    document.cookie = `${chartConfigCookieName}=${encodeURIComponent(chartConfigInput.value)}; path=/; max-age=31536000; samesite=lax`;
+                    persistStationPrefs(payload);
                     syncChartUrl();
                   }
 
@@ -4371,7 +4401,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                   function syncTablePrefsInput() {
                     const payload = { chart_config: chartConfigState, table: tablePrefsState };
                     if (tableBrowserPrefsInput) tableBrowserPrefsInput.value = JSON.stringify(payload);
-                    document.cookie = `${browserPrefsCookieName}=${encodeURIComponent(JSON.stringify(payload))}; path=/; max-age=31536000; samesite=lax`;
+                    persistStationPrefs(payload);
                   }
 
                   function refreshTableRefs() {
