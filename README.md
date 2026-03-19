@@ -92,6 +92,7 @@ Detailed documentation has been split into dedicated pages:
 - CSV storage: [link](docs/storage.md)
 - Web GUI and policies: [link](docs/webgui.md)
 - InfluxDB sink: [link](docs/influxdb.md)
+- How to join with a Vantage Pro2 edge node: [link](docs/how_to_join.md)
 
 ## Architecture
 
