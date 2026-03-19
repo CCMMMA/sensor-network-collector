@@ -68,7 +68,7 @@ services:
     restart: unless-stopped
     depends_on:
       - collector
-    command: ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:8080", "webapp_wsgi:app"]
+    command: ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:8080", "--worker-tmp-dir", "/tmp", "webapp_wsgi:app"]
     environment:
       COLLECTOR_CONFIG: /app/config.json
     ports:
@@ -101,6 +101,7 @@ Important:
 - The `collector` service continues handling MQTT ingest and sinks; the `web` service serves the Flask UI through [`webapp_wsgi.py`](/Users/raffaelemontella/Documents/New project/sensor-network-collector/webapp_wsgi.py).
 - If email delivery is not needed, omit `smtpHost` and the application will skip email sending.
 - For plain unauthenticated relay inside trusted networks, you can omit `smtpPort`, `smtpUser`, and `smtpPass`; SMTP falls back to port `25`.
+- The sample Gunicorn command uses `--worker-tmp-dir /tmp` to avoid permission errors in hardened container deployments.
 
 ## Build and start
 

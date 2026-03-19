@@ -18,7 +18,7 @@ services:
     restart: unless-stopped
     depends_on:
       - collector
-    command: ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:8080", "webapp_wsgi:app"]
+    command: ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:8080", "--worker-tmp-dir", "/tmp", "webapp_wsgi:app"]
     environment:
       COLLECTOR_CONFIG: /app/config.json
     volumes:

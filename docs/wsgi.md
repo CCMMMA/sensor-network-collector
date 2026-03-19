@@ -50,7 +50,7 @@ Optional but commonly relevant:
 ```bash
 source .venv/bin/activate
 COLLECTOR_CONFIG=/absolute/path/config.prod.json \
-  gunicorn --workers 2 --bind 127.0.0.1:8080 webapp_wsgi:app
+  gunicorn --workers 2 --bind 127.0.0.1:8080 --worker-tmp-dir /tmp webapp_wsgi:app
 ```
 
 Tuning guidance:
@@ -72,7 +72,7 @@ User=www-data
 Group=www-data
 WorkingDirectory=/opt/sensor-network-collector
 Environment=COLLECTOR_CONFIG=/opt/sensor-network-collector/config.prod.json
-ExecStart=/opt/sensor-network-collector/.venv/bin/gunicorn --workers 2 --bind 127.0.0.1:8080 webapp_wsgi:app
+ExecStart=/opt/sensor-network-collector/.venv/bin/gunicorn --workers 2 --bind 127.0.0.1:8080 --worker-tmp-dir /tmp webapp_wsgi:app
 Restart=always
 RestartSec=5
 
@@ -212,7 +212,7 @@ services:
     restart: unless-stopped
     depends_on:
       - collector
-    command: ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:8080", "webapp_wsgi:app"]
+    command: ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:8080", "--worker-tmp-dir", "/tmp", "webapp_wsgi:app"]
     environment:
       COLLECTOR_CONFIG: /app/config.json
     expose:
@@ -231,6 +231,10 @@ services:
       - "8087:8087"
     volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
 ```
 
 Notes:
@@ -238,6 +242,9 @@ Notes:
 - `collector` is only exposed to the internal Compose network
 - only Nginx publishes a host port
 - if you also need MQTT ingest, InfluxDB, or SMTP by hostname, ensure the container can resolve and reach those services from the Docker network
+- The sample Gunicorn command uses `--worker-tmp-dir /tmp` to avoid permission errors for Gunicorn internals in hardened containers.
+- The sample Nginx config writes temp files under `/tmp`; the Compose sample mounts writable `tmpfs` paths for Nginx runtime/cache directories.
+- If you force `user: "<uid>:<gid>"` on the standard `nginx:alpine` image, startup can fail with permission errors on `/var/cache/nginx`. In that case either remove the `user` override for Nginx or use an unprivileged Nginx image and keep temp paths under `/tmp`.
 
 ### 4. Create `nginx/default.conf`
 
@@ -249,6 +256,11 @@ server {
     server_name _;
 
     client_max_body_size 25m;
+    client_body_temp_path /tmp/client_temp;
+    proxy_temp_path /tmp/proxy_temp;
+    fastcgi_temp_path /tmp/fastcgi_temp;
+    uwsgi_temp_path /tmp/uwsgi_temp;
+    scgi_temp_path /tmp/scgi_temp;
 
     location / {
         proxy_pass http://web:8080;
