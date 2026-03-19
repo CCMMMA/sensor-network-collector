@@ -1679,6 +1679,42 @@ def collect_instruments(storage_root: str):
     return sorted(instruments)
 
 
+def find_latest_csv_file(storage_root: str, instrument_uuid: str):
+    root = Path(storage_root) / instrument_uuid
+    if not root.exists() or not root.is_dir():
+        return None
+
+    def _descending_dirs(parent: Path):
+        dirs = [p for p in parent.iterdir() if p.is_dir() and not p.name.startswith(".")]
+        return sorted(dirs, key=lambda p: p.name, reverse=True)
+
+    for year_dir in _descending_dirs(root):
+        for month_dir in _descending_dirs(year_dir):
+            for day_dir in _descending_dirs(month_dir):
+                csv_files = sorted(
+                    [p for p in day_dir.iterdir() if p.is_file() and p.suffix.lower() == ".csv"],
+                    key=lambda p: p.name,
+                    reverse=True,
+                )
+                if csv_files:
+                    return csv_files[0]
+
+    for path in root.rglob("*.csv"):
+        return path
+    return None
+
+
+def read_latest_station_row(csv_path: Path):
+    try:
+        with csv_path.open("r", newline="", encoding="utf-8") as f:
+            last_row = None
+            for row in csv.DictReader(f):
+                last_row = row
+            return last_row
+    except Exception:
+        return None
+
+
 def parse_date_ymd(value: str):
     if not value:
         return None
@@ -2035,46 +2071,25 @@ def shift_anchor(anchor: datetime, interval: str, steps: int):
 
 
 def get_station_preview(storage_root: str, instrument_uuid: str):
-    files = list_csv_files_for_instrument(storage_root, instrument_uuid)
-    if not files:
+    latest_csv = find_latest_csv_file(storage_root, instrument_uuid)
+    if latest_csv is None:
         return {"latitude": None, "longitude": None, "last_timestamp": None, "rows": 0, "name": instrument_uuid}
 
-    total_rows = 0
-    last_timestamp = None
-    latitude = None
-    longitude = None
+    latest_row = read_latest_station_row(latest_csv)
+    if not latest_row:
+        return {"latitude": None, "longitude": None, "last_timestamp": None, "rows": 0, "name": instrument_uuid}
+
+    lat, lon = _extract_lat_lon_from_row(latest_row)
     station_name = instrument_uuid
-
-    # Scan newest files first so map can show latest known position quickly.
-    for csv_path in reversed(files):
-        try:
-            with csv_path.open("r", newline="", encoding="utf-8") as f:
-                rows = list(csv.DictReader(f))
-        except Exception:
-            continue
-
-        if not rows:
-            continue
-
-        total_rows += len(rows)
-
-        if last_timestamp is None:
-            last_timestamp = rows[-1].get("timestamp")
-        if station_name == instrument_uuid:
-            maybe_name = rows[-1].get("name")
-            if isinstance(maybe_name, str) and maybe_name.strip():
-                station_name = maybe_name.strip()
-
-        if latitude is None or longitude is None:
-            lat, lon = _extract_lat_lon_from_row(rows[-1])
-            if lat is not None and lon is not None:
-                latitude, longitude = lat, lon
+    maybe_name = latest_row.get("name")
+    if isinstance(maybe_name, str) and maybe_name.strip():
+        station_name = maybe_name.strip()
 
     return {
-        "latitude": latitude,
-        "longitude": longitude,
-        "last_timestamp": last_timestamp,
-        "rows": total_rows,
+        "latitude": lat,
+        "longitude": lon,
+        "last_timestamp": latest_row.get("timestamp"),
+        "rows": 0,
         "name": station_name,
     }
 
@@ -3541,7 +3556,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                     {% for st in clickable %}
                       <label>
                         <input type="checkbox" name="instrument" value="{{ st.uuid }}"> {{ st.name }} ({{ st.uuid }})
-                        (policy={{ st.policy }}, rows={{ st.rows }})
+                        (policy={{ st.policy }})
                         <a href="{{ url_for('browse_station', instrument_uuid=st.uuid) }}">browse</a>
                         | <a href="{{ url_for('public_station', instrument_uuid=st.uuid) }}">public view</a>
                       </label><br/>
@@ -3589,7 +3604,7 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                       fillOpacity: 0.85
                     }).addTo(map);
 
-                    let html = `<b>${s.name || s.uuid}</b><br/>uuid=${s.uuid}<br/>policy=${s.policy}<br/>rows=${s.rows}`;
+                    let html = `<b>${s.name || s.uuid}</b><br/>uuid=${s.uuid}<br/>policy=${s.policy}`;
                     if (s.last_timestamp) {
                       html += `<br/>last=${s.last_timestamp}`;
                     }

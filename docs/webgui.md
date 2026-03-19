@@ -33,6 +33,10 @@ Set:
 - `/admin/dashboard` admin-only network dashboard
 - `/anomalies` anomaly log and silence actions
 
+## Home page previews
+
+The home page station map and browse/download list use a lightweight latest-sample preview per station. They show the latest known station name, position, and timestamp without scanning the full historical archive, so the home page stays responsive even with large CSV storage trees.
+
 ## Access policies
 
 Per station policy:
