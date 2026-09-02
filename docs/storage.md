@@ -17,11 +17,18 @@ Where:
 - `UUID`: instrument identifier from payload (`uuid`/`UUID`/`station_uuid`) or topic fallback
 - one file per hour (UTC timestamp bucket)
 
+Identifiers must be non-empty single directory names: `.`, `..`, path separators
+(`/` or `\`), and NUL characters are rejected. Paths that resolve outside
+`pathStorage`, including through symlinks, are rejected. A rejected CSV write is
+logged and does not prevent the other configured sinks from processing the message;
+the same validation applies in dry mode.
+
 ## Rotation and append behavior
 
 - file rotates every hour
 - if collector restarts during same hour, it appends to current hourly file
 - schema evolves forward: when new fields appear, header is extended and prior rows are rewritten with blank new columns
+- schema expansion is written to a temporary file in the same directory and atomically replaces the original, preserving its permissions; a failed rewrite leaves the original intact
 
 ## CLI and config
 
@@ -46,7 +53,7 @@ python3 main.py --config config.json --storage false
 
 - scalar values (`bool`, `int`, `float`, `str`) stored directly
 - nested objects/arrays serialized as JSON strings
-- `timestamp`, `topic`, `uuid` and flattened fields are included
+- `timestamp`, `topic`, `uuid` and flattened fields are included. These three columns are reserved for the collector's resolved event time, MQTT topic, and instrument identifier; same-named payload fields cannot override them.
 - `name` is stored in CSV when present and is also reused by the web GUI and Signal K forwarding
 - units are preserved exactly as published on MQTT; CSV storage does not normalize to Signal K units
 

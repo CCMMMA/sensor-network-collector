@@ -1,5 +1,8 @@
 # Web GUI and Policies
 
+After login, the `next` return URL must be a local path beginning with a single
+`/`. External URLs, backslashes, and control characters fall back to the home page.
+
 ## Enable
 
 Set:

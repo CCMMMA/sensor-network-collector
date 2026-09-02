@@ -635,9 +635,19 @@ class CSVHourlyStorage:
         self.root = Path(root_path)
 
     def _file_path(self, instrument_uuid: str, dt: datetime) -> Path:
+        if (
+            not isinstance(instrument_uuid, str)
+            or not instrument_uuid.strip()
+            or instrument_uuid in (".", "..")
+            or any(ch in instrument_uuid for ch in ("/", "\\", "\x00"))
+        ):
+            raise ValueError("Instrument identifier must be a single non-empty directory name")
         day_dir = self.root / instrument_uuid / dt.strftime("%Y") / dt.strftime("%m") / dt.strftime("%d")
         name = f"{instrument_uuid}_{dt.strftime('%Y%m%d')}Z{dt.strftime('%H')}00.csv"
-        return day_dir / name
+        csv_path = day_dir / name
+        if not csv_path.resolve().is_relative_to(self.root.resolve()):
+            raise ValueError("CSV path escapes the configured storage root")
+        return csv_path
 
     def _read_header(self, csv_path: Path):
         if not csv_path.exists() or csv_path.stat().st_size == 0:
@@ -659,11 +669,25 @@ class CSVHourlyStorage:
         with csv_path.open("r", newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
 
-        with csv_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=merged)
-            writer.writeheader()
-            for old in rows:
-                writer.writerow({k: old.get(k, "") for k in merged})
+        # Keep the current file intact until the expanded schema is fully written.
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", newline="", encoding="utf-8", dir=csv_path.parent,
+                prefix=f".{csv_path.name}.", suffix=".tmp", delete=False,
+            ) as f:
+                tmp_path = Path(f.name)
+                writer = csv.DictWriter(f, fieldnames=merged)
+                writer.writeheader()
+                for old in rows:
+                    writer.writerow({k: old.get(k, "") for k in merged})
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.chmod(csv_path.stat().st_mode & 0o777)
+            os.replace(tmp_path, csv_path)
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
 
         return merged
 
@@ -5270,6 +5294,13 @@ def create_web_app(cfg: dict, access_store: AccessStore):
                 if int(user.get("force_password_change", 0)) == 1:
                     return redirect(url_for("change_password"))
                 nxt = request.args.get("next") or url_for("index")
+                if (
+                    not nxt.startswith("/")
+                    or nxt.startswith("//")
+                    or "\\" in nxt
+                    or any(ord(ch) < 32 or ord(ch) == 127 for ch in nxt)
+                ):
+                    nxt = url_for("index")
                 return redirect(nxt)
             err = "Invalid credentials or inactive user"
 
@@ -6591,21 +6622,21 @@ def on_message(client, userdata, message):
     # CSV storage sink
     if cfg["enable_storage"]:
         storage_row = {
+            **flat_fields,
             "timestamp": dt.isoformat().replace("+00:00", "Z"),
             "topic": topic,
             "uuid": instrument_uuid,
-            **flat_fields,
         }
 
-        if cfg["dry"]:
-            csv_path = runtime["csv_storage"]._file_path(instrument_uuid, dt)
-            logger.info("DRY STORAGE file=%s row=%s", csv_path, storage_row)
-        else:
-            try:
+        try:
+            if cfg["dry"]:
+                csv_path = runtime["csv_storage"]._file_path(instrument_uuid, dt)
+                logger.info("DRY STORAGE file=%s row=%s", csv_path, storage_row)
+            else:
                 csv_path = runtime["csv_storage"].write(instrument_uuid, dt, storage_row)
                 logger.info("Storage write topic=%s file=%s", topic, csv_path)
-            except Exception as e:
-                logger.exception("Storage write failed topic=%s: %s", topic, e)
+        except Exception as e:
+            logger.exception("Storage write failed topic=%s: %s", topic, e)
 
     # Signal K sink
     if cfg["enable_signalk"]:

@@ -8,9 +8,10 @@ Threaded MQTT collector for weather/sensor networks, aligned with `vantage-publi
 - Multiple output sinks:
   - InfluxDB
   - Signal K websocket deltas with retry backoff on transient gateway failures
-  - hourly CSV storage
+  - hourly CSV storage with path validation, protected collector metadata, and atomic schema expansion
 - Dry mode for safe runtime validation (`--dry`)
 - Web GUI for data download with authentication and access policies
+- Login return URLs are restricted to local paths
 - Map-based station discovery on the home page
 - Data browsing per station with configurable charts and tables
 - Station browser table supports per-column header toggles and window statistics
@@ -52,6 +53,12 @@ pip install -r requirements.txt
 ```
 
 ## CLI
+
+Run the regression checks after installing dependencies (startup uses mocked MQTT):
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ```bash
 python3 main.py --config config.json
