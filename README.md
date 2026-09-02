@@ -38,7 +38,7 @@ Backward-compatible snake_case keys are still accepted.
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+ (CI checks 3.10–3.14; Docker uses 3.11)
 - MQTT broker
 - Optional:
   - InfluxDB v2
@@ -93,6 +93,7 @@ python3 main.py --config config.json --dry
 Detailed documentation has been split into dedicated pages:
 
 - Docker deployment: [link](docs/docker.md)
+- Continuous integration and image delivery: [link](docs/ci-cd.md)
 - Production WSGI setup: [link](docs/wsgi.md)
 - Configuration reference: [link](docs/configuration.md)
 - Signal K forwarding: [link](docs/signalk.md)

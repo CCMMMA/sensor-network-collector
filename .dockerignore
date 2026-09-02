@@ -1,0 +1,8 @@
+# Only runtime sources and dependency metadata belong in the build context.
+**
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!main.py
+!signalk_access.py
+!webapp_wsgi.py

@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY . /app
+COPY main.py signalk_access.py webapp_wsgi.py /app/
 
 EXPOSE 8080
 

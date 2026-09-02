@@ -7,6 +7,12 @@ This document describes production-grade Docker deployment for `sensor-network-c
 - `Dockerfile`
 - `docker-compose.yml.sample`
 - `config.json.sample`
+- `.dockerignore` restricts the build context to runtime sources and dependency metadata
+
+GitHub Actions tests builds and publishes successful `main` images to GHCR. See
+[CI/CD and registry-based rollouts](ci-cd.md) for image tags, permissions, and rollout
+commands. Local builds remain supported. Images do not contain runtime configuration
+or data; provide these through volume mounts.
 
 ## Runtime model
 

@@ -9,7 +9,7 @@ This document covers production deployment of the web app via WSGI (Gunicorn).
 
 ## Prerequisites
 
-- Python 3.9+
+- Python 3.10+
 - virtualenv
 - gunicorn
 

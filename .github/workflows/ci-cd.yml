@@ -1,0 +1,82 @@
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Check dependency compatibility
+        run: python -m pip check
+      - name: Compile application
+        run: python -m compileall -q main.py signalk_access.py webapp_wsgi.py tests
+      - name: Run regression and startup tests
+        run: python -m unittest discover -s tests -v
+
+  container:
+    name: Build, test, and deliver container
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Build image
+        run: >-
+          docker build
+          --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+          --label "org.opencontainers.image.revision=${GITHUB_SHA}"
+          --tag collector:ci .
+      - name: Check container entry point
+        run: docker run --rm collector:ci python main.py --help
+      - name: Run tests in the built image
+        run: >-
+          docker run --rm
+          --volume "${GITHUB_WORKSPACE}/tests:/tests:ro"
+          collector:ci python -m unittest discover -s /tests -v
+      - name: Publish tested image to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          trap 'docker logout ghcr.io' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker tag collector:ci "${image}:sha-${GITHUB_SHA}"
+          docker tag collector:ci "${image}:latest"
+          docker push "${image}:sha-${GITHUB_SHA}"
+          docker push "${image}:latest"
+          printf 'Published `%s:sha-%s` and `%s:latest`.\n' "$image" "$GITHUB_SHA" "$image" >> "$GITHUB_STEP_SUMMARY"
