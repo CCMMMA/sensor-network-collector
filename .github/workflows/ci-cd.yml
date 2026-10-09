@@ -36,7 +36,7 @@ jobs:
       - name: Check dependency compatibility
         run: python -m pip check
       - name: Compile application
-        run: python -m compileall -q main.py signalk_access.py webapp_wsgi.py tests
+        run: python -m compileall -q main.py signalk_access.py tests
       - name: Run regression and startup tests
         run: python -m unittest discover -s tests -v
 

@@ -16,12 +16,10 @@ or data; provide these through volume mounts.
 
 ## Runtime model
 
-Container responsibilities:
-
-- run `python3 main.py --config /app/config.json` for MQTT ingest and sinks
-- run `gunicorn --bind 0.0.0.0:8080 webapp_wsgi:app` for the web GUI when deployed as a separate web service
-- write CSV storage and auth DB under mounted persistent volume
-- expose web GUI when `httpEnabled=true`
+The container runs `python main.py --config /app/config.json` for MQTT ingest and
+sinks, and writes CSV storage under the mounted persistent volume. It listens on no
+port. The web application is deployed from [`sensor-network-pwa`](https://github.com/CCMMMA/sensor-network-pwa) with its own image, mounting the
+same data directory.
 
 ## Prerequisites
 
@@ -41,11 +39,9 @@ docker compose version
 /opt/sensor-network-collector/
   Dockerfile
   docker-compose.yml
-  config.local.json
+  config.json
   data/
     storage/
-    collector_auth.sqlite
-    logos/
 ```
 
 ## Compose setup
@@ -54,11 +50,11 @@ Start from sample:
 
 ```bash
 cp docker-compose.yml.sample docker-compose.yml
-cp config.json.sample config.local.json
+cp config.json.sample config.json
 mkdir -p data
 ```
 
-Bind your config read-only and mount persistent data:
+Mount persistent data and allow the collector to save approved Signal K tokens in its config:
 
 ```yaml
 services:
@@ -66,21 +62,7 @@ services:
     build: .
     restart: unless-stopped
     volumes:
-      - ./config.local.json:/app/config.json:ro
-      - ./data:/data
-
-  web:
-    build: .
-    restart: unless-stopped
-    depends_on:
-      - collector
-    command: ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:8080", "--worker-tmp-dir", "/tmp", "webapp_wsgi:app"]
-    environment:
-      COLLECTOR_CONFIG: /app/config.json
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./config.local.json:/app/config.json:ro
+      - ./config.json:/app/config.json
       - ./data:/data
 ```
 
@@ -90,24 +72,14 @@ Use paths inside container:
 
 ```json
 {
-  "pathStorage": "/data/storage",
-  "authDbPath": "/data/collector_auth.sqlite",
-  "httpHost": "0.0.0.0",
-  "httpPort": 8080
+  "pathStorage": "/data/storage"
 }
 ```
 
 Important:
 
-- Use network-reachable hostnames for MQTT/InfluxDB/SMTP (not `localhost` unless service runs in same container).
-- Use a strong `webSessionSecret`.
-- Set strong `adminPassword`.
-- Set `baseUrl` to the public HTTPS URL used by browsers, so fast-login and password-reset email links are correct.
-- Keep `httpEnabled` set to `true` for the Gunicorn `web` service.
-- The `collector` service continues handling MQTT ingest and sinks; the `web` service serves the Flask UI through [`webapp_wsgi.py`](/Users/raffaelemontella/Documents/New project/sensor-network-collector/webapp_wsgi.py).
-- If email delivery is not needed, omit `smtpHost` and the application will skip email sending.
-- For plain unauthenticated relay inside trusted networks, you can omit `smtpPort`, `smtpUser`, and `smtpPass`; SMTP falls back to port `25`.
-- The sample Gunicorn command uses `--worker-tmp-dir /tmp` to avoid permission errors in hardened container deployments.
+- Use network-reachable hostnames for MQTT/InfluxDB/Signal K (not `localhost` unless the service runs in the same container).
+- Mount the host `./data` directory into the web application containers too, so they read the CSV files written here.
 
 ## Build and start
 
@@ -115,17 +87,13 @@ Important:
 docker compose up -d --build
 ```
 
-This starts:
-
-- `collector` for MQTT ingest, storage, InfluxDB, Signal K, and background tasks
-- `web` for the browser-facing GUI served by Gunicorn
+This starts `collector` for MQTT ingest, storage, InfluxDB, and Signal K.
 
 ## Verify health
 
 ```bash
 docker compose ps
 docker compose logs -f collector
-docker compose logs -f web
 ```
 
 ## Operational commands
@@ -139,7 +107,7 @@ docker compose down
 Restart:
 
 ```bash
-docker compose restart collector web
+docker compose restart collector
 ```
 
 Rollout after config/code updates:
@@ -148,18 +116,26 @@ Rollout after config/code updates:
 docker compose up -d --build
 ```
 
+Or run `./updater.sh`, which pulls the repository (fast-forward only), builds the
+image, and restarts the services. If `docker-compose.yml` still defines a Gunicorn
+`webapp_wsgi` service from before the web application moved out, the script leaves
+that service running on its old image and updates only the others; see
+[upgrading](upgrading.md).
+
 ## Data persistence and backup
 
-Everything under `/data` should be persistent:
+Everything under `/data` should be persistent. The collector writes the station CSV
+files there; the web application keeps its SQLite database and logo uploads in the
+same directory when deployed as documented in its own project.
 
-- station CSV files
-- SQLite auth/anomaly DB
-- station logo uploads
-
-Backup:
+Stop every writer (this collector and the web application services) before copying
+active files. Back up configuration separately and securely; see
+[operations](operations.md#backup-and-restore).
 
 ```bash
+docker compose stop collector
 tar -czf sensor-network-collector-backup.tgz data/
+docker compose start collector
 ```
 
 Restore:
@@ -168,16 +144,7 @@ Restore:
 tar -xzf sensor-network-collector-backup.tgz
 ```
 
-## Networking and reverse proxy
-
-If exposed publicly, run behind Nginx/Caddy/Traefik with TLS.
-
-Forward only the `web` HTTP port from reverse proxy to container.
-
 ## Security hardening checklist
 
-- Set non-default `adminPassword`
-- Set strong `webSessionSecret`
-- Restrict host firewall to required ports
-- Configure SMTP credentials via secrets manager or protected file
-- Keep `config.local.json` out of public repositories
+- The collector needs outbound access only (MQTT, InfluxDB, Signal K); publish no ports
+- Keep `config.json` out of public repositories: it holds MQTT, InfluxDB, and Signal K credentials

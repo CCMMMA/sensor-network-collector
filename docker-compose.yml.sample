@@ -8,21 +8,5 @@ services:
     command: ["python", "main.py", "--config", "/app/config.json"]
     volumes:
       - ./config.json:/app/config.json
+      # The web application (sensor-network-pwa) mounts this same directory to read the CSV storage.
       - ./data:/data
-
-  web:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: sensor-network-web
-    restart: unless-stopped
-    depends_on:
-      - collector
-    command: ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:8080", "--worker-tmp-dir", "/tmp", "webapp_wsgi:app"]
-    environment:
-      COLLECTOR_CONFIG: /app/config.json
-    volumes:
-      - ./config.json:/app/config.json
-      - ./data:/data
-    ports:
-      - "8080:8080"

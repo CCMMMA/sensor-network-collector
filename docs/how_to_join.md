@@ -76,7 +76,7 @@ Recommended baseline:
 
 - keep the edge machine focused on acquisition and publishing
 - avoid heavy local analytics or browser-facing workloads on the PN41
-- use the central `sensor-network-collector` for aggregation, web UI, CSV archival, InfluxDB, and Signal K forwarding
+- use the central `sensor-network-collector` for aggregation, CSV archival, InfluxDB, and Signal K forwarding; the web UI is served by `sensor-network-pwa` from the collected data
 
 ## 3. Ubuntu preparation
 
@@ -151,7 +151,7 @@ tcp:127.0.0.1:22222
 
 The `vantage-publisher` repository already includes a matching example in:
 
-- [`util/ser2net.yaml`](/Users/raffaelemontella/Documents/New project 2/vantage-publisher/util/ser2net.yaml)
+- `util/ser2net.yaml` in your `vantage-publisher` checkout
 
 The relevant block is:
 
@@ -428,7 +428,7 @@ The `vantage-publisher` repository also includes a simple Docker Compose example
 
 From the local repo:
 
-- [`docker-compose.yml`](/Users/raffaelemontella/Documents/New project 2/vantage-publisher/docker-compose.yml)
+- `docker-compose.yml` in your `vantage-publisher` checkout
 
 That sample uses:
 
@@ -460,7 +460,7 @@ Example central collector behavior:
 - stores CSV under its own `pathStorage`
 - optionally stores in InfluxDB
 - optionally forwards to Signal K
-- exposes the station in the web GUI map and station browser
+- makes the station available to the `sensor-network-pwa` map and station browser through the stored CSV files
 
 ## 14. Validation checklist
 
@@ -490,7 +490,7 @@ AirLink optional path:
 
 Central collector:
 
-- the new station appears in the home page map
+- the new station appears in the `sensor-network-pwa` home page map
 - data is visible in station browser and public dashboard
 - optional InfluxDB and Signal K sinks receive data
 
@@ -543,5 +543,5 @@ On the edge machine:
 On the central collector:
 
 - `sensor-network-collector/config.json`
-- optional web policies and station access assignments
+- optional web policies and station access assignments (stored by `sensor-network-pwa`)
 

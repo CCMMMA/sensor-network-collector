@@ -4,6 +4,11 @@
 
 Persist inbound MQTT payloads as hourly CSV partitions for replay, download, and web browsing.
 
+The files are read by the separate web application,
+[`sensor-network-pwa`](https://github.com/CCMMMA/sensor-network-pwa), so the layout below is
+an interface between the two projects. That application also stores station logos in
+`<pathStorage>/_logos`; directories whose names begin with `_` or `.` are not stations.
+
 ## File layout
 
 Pattern:
@@ -54,7 +59,7 @@ python3 main.py --config config.json --storage false
 - scalar values (`bool`, `int`, `float`, `str`) stored directly
 - nested objects/arrays serialized as JSON strings
 - `timestamp`, `topic`, `uuid` and flattened fields are included. These three columns are reserved for the collector's resolved event time, MQTT topic, and instrument identifier; same-named payload fields cannot override them.
-- `name` is stored in CSV when present and is also reused by the web GUI and Signal K forwarding
+- `name` is stored in CSV when present and is also reused by the web application (`sensor-network-pwa`) and Signal K forwarding
 - units are preserved exactly as published on MQTT; CSV storage does not normalize to Signal K units
 
 Examples:

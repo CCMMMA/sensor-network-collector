@@ -171,13 +171,24 @@ class SignalKAccessManager:
         return state or "PENDING", token
 
     def _approve_token(self, token: str):
-        persist_token(self.config_path, self.config_token_key, token)
+        try:
+            persist_token(self.config_path, self.config_token_key, token)
+            self.logger.info(
+                "Signal K access approved; token saved to %s key=%s", self.config_path, self.config_token_key
+            )
+        except Exception as e:
+            # Keep publishing with the approved token; only persistence across restarts is lost.
+            self.logger.error(
+                "Signal K access approved but the token could not be saved to %s (%s); "
+                "it will be used until restart",
+                self.config_path,
+                e,
+            )
         self.on_token_approved(token)
         with self._lock:
             self._candidate_token = token
             self._request_href = ""
             self._state = "APPROVED"
-        self.logger.info("Signal K access approved; token saved to %s key=%s", self.config_path, self.config_token_key)
 
         if not self._validate_token(token):
             self.notify_token_invalid()
@@ -241,6 +252,10 @@ class SignalKAccessManager:
                     self.logger.error("Signal K access requests unsupported (501).")
                 else:
                     self.logger.warning("Signal K access HTTP error: %s", e)
+                if e.code in (404, 410):
+                    # The pending request no longer exists server-side; submit a new one.
+                    with self._lock:
+                        self._request_href = ""
                 self._kick_event.wait(timeout=self.poll_interval_sec)
                 self._kick_event.clear()
             except Exception as e:

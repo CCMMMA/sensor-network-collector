@@ -2,22 +2,21 @@
 
 This page documents `config.json` keys with contextualized examples.
 
-## Minimal profile: storage + web GUI
+The web application is configured separately; see the configuration reference of
+[`sensor-network-pwa`](https://github.com/CCMMMA/sensor-network-pwa). Web, SMTP, and watchdog keys (`httpHost`, `authDbPath`, `smtpHost`,
+`watchdogIntervalSec`, ...) found in an older shared file are ignored by the
+collector. `httpEnabled: true` and the `--http` option are ignored with a warning.
+
+## Minimal profile: storage only
 
 ```json
 {
   "mqttBroker": "mqtt.local",
   "mqttPort": 1883,
   "mqttTopic": "it.uniparthenope.meteo/#",
+  "influxdb": false,
   "storage": true,
-  "pathStorage": "/data/storage",
-  "httpEnabled": true,
-  "httpHost": "0.0.0.0",
-  "httpPort": 8080,
-  "authDbPath": "/data/collector_auth.sqlite",
-  "webSessionSecret": "replace-with-strong-secret",
-  "adminUser": "admin",
-  "adminPassword": "change-me"
+  "pathStorage": "/data/storage"
 }
 ```
 
@@ -49,7 +48,7 @@ Example:
 ### Storage
 
 - `storage`: enable CSV sink
-- `pathStorage`: root directory for hourly station files
+- `pathStorage`: root directory for hourly station files; the web application needs read access to the same directory, plus write access to its `_logos` subdirectory for station logo uploads
 
 Storage units:
 
@@ -136,105 +135,6 @@ Signal K value normalization:
 - rain totals / evapotranspiration totals -> meters
 - rain rate -> meters per second
 
-### Web GUI and security
-
-- `httpEnabled`, `httpHost`, `httpPort`
-- `baseUrl`: public URL used in email links
-- `authDbPath`: SQLite file for users/policies/anomalies/chart settings/control rights
-- `webSessionSecret`: required strong random secret
-- `adminUser`, `adminPassword`
-- `webAppLogo`: optional absolute path to app logo image
-- `webAppLink`: optional external URL opened when the home-page logo is clicked
-- `webInfoLink`: optional external URL shown as `Info` before `Login` on the home page
-
-Example:
-
-```json
-{
-  "httpEnabled": true,
-  "httpHost": "0.0.0.0",
-  "httpPort": 8080,
-  "baseUrl": "https://collector.example.org",
-  "authDbPath": "/data/collector_auth.sqlite",
-  "webSessionSecret": "replace-with-strong-secret",
-  "adminUser": "admin",
-  "adminPassword": "replace-with-strong-password",
-  "webAppLogo": "/data/branding/app-logo.png",
-  "webAppLink": "https://meteo.uniparthenope.it",
-  "webInfoLink": "https://meteo.uniparthenope.it/info"
-}
-```
-
-`baseUrl` is used for:
-
-- fast-login links in welcome and anomaly emails
-- onboarding links sent after an admin approves an account request
-- password-reset links from the forgot-password flow
-
-`authDbPath` stores:
-
-- user accounts and account requests
-- station access policies
-- restricted per-user station assignments
-- per-user station chart-control rights
-- anomaly log and silence windows
-- station logos
-- per-station Public Station Dashboard trend-chart axis settings
-
-### SMTP and notifications
-
-- `smtpEnabled`
-- `smtpHost`, `smtpPort`
-- `smtpUser`, `smtpPass`
-- `smtpFrom`
-- `smtpUseTls`
-
-Behavior:
-
-- if `smtpHost` is not set, the application does not try to send emails
-- if `smtpPort`, `smtpUser`, and `smtpPass` are omitted, SMTP defaults to unauthenticated port `25`
-- if `smtpUser` is set, SMTP login is attempted
-- `smtpUseTls` can still explicitly force TLS behavior; default logic follows the port/auth fallback
-- forgot-password and reset emails require both SMTP configuration and a correct `baseUrl`
-- account approval onboarding emails also require both SMTP configuration and a correct `baseUrl`
-
-Example:
-
-```json
-{
-  "smtpEnabled": true,
-  "smtpHost": "smtp.mailprovider.net",
-  "smtpFrom": "noreply@example.org",
-  "smtpPort": 25
-}
-```
-
-Authenticated SMTP example:
-
-```json
-{
-  "smtpEnabled": true,
-  "smtpHost": "smtp.mailprovider.net",
-  "smtpPort": 587,
-  "smtpUser": "noreply@example.org",
-  "smtpPass": "smtp-password",
-  "smtpFrom": "noreply@example.org",
-  "smtpUseTls": true
-}
-```
-
-### Watchdog
-
-- `watchdogIntervalSec`: scan period for anomaly detection
-
-Example:
-
-```json
-{
-  "watchdogIntervalSec": 60
-}
-```
-
 ## Full integrated example
 
 ```json
@@ -263,26 +163,6 @@ Example:
   "signalkAccessPollSec": 10,
   "signalkAccessTimeoutSec": 10,
   "signalkContextPrefix": "meteo",
-  "signalkSourceLabel": "sensor-network-collector",
-
-  "httpEnabled": true,
-  "httpHost": "0.0.0.0",
-  "httpPort": 8080,
-  "baseUrl": "https://collector.example.org",
-  "webAppLogo": "/data/branding/app-logo.png",
-  "authDbPath": "/data/collector_auth.sqlite",
-  "webSessionSecret": "replace-with-strong-secret",
-  "adminUser": "admin",
-  "adminPassword": "replace-with-strong-password",
-
-  "smtpEnabled": true,
-  "smtpHost": "smtp.mailprovider.net",
-  "smtpPort": 587,
-  "smtpUser": "noreply@example.org",
-  "smtpPass": "smtp-password",
-  "smtpFrom": "noreply@example.org",
-  "smtpUseTls": true,
-
-  "watchdogIntervalSec": 60
+  "signalkSourceLabel": "sensor-network-collector"
 }
 ```

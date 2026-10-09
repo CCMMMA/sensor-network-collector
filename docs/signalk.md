@@ -4,6 +4,8 @@
 
 - collector publishes deltas over websocket to Signal K stream endpoint
 - default endpoint format: `ws://host:3000/signalk/v1/stream`
+- the collector is write-only: it appends `subscribe=none` unless the URL already has a `subscribe` parameter, so the server does not stream deltas back
+- the token is URL-encoded when appended to the stream URL
 - temporary websocket gateway/upstream failures such as `502 Bad Gateway` trigger bounded reconnect backoff instead of reconnecting on every MQTT message
 - during backoff, local CSV and InfluxDB sinks continue normally and Signal K publish failures are logged as concise warnings without full traceback spam
 
@@ -87,6 +89,14 @@ If `signalkToken` is empty or invalid:
 3. continues other sinks while waiting
 4. stores approved token back into config JSON
 5. resumes Signal K forwarding automatically
+
+The collector needs write permission on the config JSON to save an approved token.
+For Docker, mount this file read-write in the collector service. Back up the configuration securely because the
+persisted token is a credential. Dry mode does not request or persist tokens.
+
+If the token cannot be saved, the collector logs an error and keeps publishing with
+the approved token until it restarts; a new approval is then required. If the server
+no longer knows a pending request (`404`/`410` while polling), a new request is submitted.
 
 ## Configuration keys
 

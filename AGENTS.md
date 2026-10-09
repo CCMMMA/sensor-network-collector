@@ -3,6 +3,7 @@
 ## Project Overview
 - Repository: `sensor-network-collector`
 - Purpose: MQTT collector for the `meteo@uniparthenope` sensor network.
+- The web application lives in the separate `sensor-network-pwa` project; it reads the CSV storage (and optionally InfluxDB) written by this collector. Keep the CSV layout documented in `docs/storage.md` stable, or update both projects together.
 - Entry point: `main.py`
 - Language: Python 3
 
@@ -23,7 +24,8 @@
 - Always review whether `README.md`, `docs/*.md`, sample configuration files, and other user-facing documentation are affected by the code change, and update them in the same work item.
 - Do not leave documentation updates as an optional follow-up when the code modification changes anything user-visible or operator-visible.
 - Update `README.md` when behavior or configuration changes.
-- Keep `docs/*.md` aligned with current behavior for Web GUI, Signal K, storage, and deployment flows.
+- Keep `docs/*.md` aligned with current behavior for Signal K, storage, InfluxDB, and deployment flows.
+- Existing deployments must keep collecting after `git pull` + `./updater.sh`: keep accepting (and ignoring) legacy web keys and `--http`, and keep `docs/upgrading.md` current when deployment behavior changes.
 
 ## Validation
 - For each change, at minimum:
