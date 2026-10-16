@@ -20,6 +20,18 @@ class CollectorRobustnessTests(unittest.TestCase):
         publisher = main.SignalKWebsocketPublisher("ws://host/signalk/v1/stream?subscribe=self")
         self.assertEqual(publisher._build_url(), "ws://host/signalk/v1/stream?subscribe=self")
 
+    def test_signalk_https_base_url_becomes_secure_stream_url(self):
+        self.assertEqual(
+            signalk_access.normalize_stream_url("https://signalk.meteo.uniparthenope.it/"),
+            "wss://signalk.meteo.uniparthenope.it/signalk/v1/stream",
+        )
+
+    def test_signalk_explicit_stream_url_and_query_are_preserved(self):
+        self.assertEqual(
+            signalk_access.normalize_stream_url("wss://host/custom/stream?subscribe=self"),
+            "wss://host/custom/stream?subscribe=self",
+        )
+
     def test_signalk_token_is_used_when_it_cannot_be_persisted(self):
         ready = Mock()
         manager = signalk_access.SignalKAccessManager(

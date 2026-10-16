@@ -91,7 +91,7 @@ Example:
 ### Signal K
 
 - `signalk`: enable Signal K sink
-- `signalkServerUrl`, `signalkToken`
+- `signalkServerUrl` (HTTP(S) server base URL or complete WS(S) stream URL), `signalkToken`
 - `signalkClientId`, `signalkAccessDescription`
 - `signalkAccessPollSec`, `signalkAccessTimeoutSec`
 - `signalkContextPrefix`, `signalkSourceLabel`
@@ -103,7 +103,7 @@ Example:
 ```json
 {
   "signalk": true,
-  "signalkServerUrl": "ws://signalk.local:3000/signalk/v1/stream",
+  "signalkServerUrl": "https://signalk.meteo.uniparthenope.it",
   "signalkToken": "",
   "signalkClientId": "9d95a6f4-7c8e-4a2f-9fd8-8a190f8f24be",
   "signalkAccessDescription": "sensor-network-collector",
@@ -156,7 +156,7 @@ Signal K value normalization:
   "influxMeasurement": "mqtt_data",
 
   "signalk": true,
-  "signalkServerUrl": "ws://signalk.local:3000/signalk/v1/stream",
+  "signalkServerUrl": "https://signalk.meteo.uniparthenope.it",
   "signalkToken": "",
   "signalkClientId": "9d95a6f4-7c8e-4a2f-9fd8-8a190f8f24be",
   "signalkAccessDescription": "sensor-network-collector",

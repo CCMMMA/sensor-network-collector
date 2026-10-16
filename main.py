@@ -19,7 +19,7 @@ import paho.mqtt.client as mqtt
 from influxdb_client import InfluxDBClient
 from influxdb_client.client.write_api import SYNCHRONOUS
 
-from signalk_access import SignalKAccessManager
+from signalk_access import SignalKAccessManager, normalize_stream_url
 
 
 # ----------------------------
@@ -280,6 +280,11 @@ def load_config(path: str, args) -> dict:
 
     if cfg["enable_signalk"] and not cfg["signalk_server_url"]:
         raise RuntimeError("Signal K enabled but signalkServerUrl/signalk_server_url is empty")
+    if cfg["enable_signalk"]:
+        try:
+            cfg["signalk_server_url"] = normalize_stream_url(cfg["signalk_server_url"])
+        except ValueError as e:
+            raise RuntimeError(f"Invalid Signal K server URL: {e}") from e
 
     if cfg["enable_influx"]:
         cfg["influxdb_url"] = str(cfg_required(raw, ["influxdbUrl", "influxdb_url"], "INFLUXDB_URL"))

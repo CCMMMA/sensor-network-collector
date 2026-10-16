@@ -3,7 +3,9 @@
 ## Transport
 
 - collector publishes deltas over websocket to Signal K stream endpoint
-- default endpoint format: `ws://host:3000/signalk/v1/stream`
+- `signalkServerUrl` accepts either a server base URL or a complete stream URL
+- an HTTP(S) base URL is converted to the matching WebSocket scheme and the standard stream path; for example, `https://signalk.meteo.uniparthenope.it` becomes `wss://signalk.meteo.uniparthenope.it/signalk/v1/stream`
+- complete `ws://` and `wss://` stream URLs remain supported
 - the collector is write-only: it appends `subscribe=none` unless the URL already has a `subscribe` parameter, so the server does not stream deltas back
 - the token is URL-encoded when appended to the stream URL
 - temporary websocket gateway/upstream failures such as `502 Bad Gateway` trigger bounded reconnect backoff instead of reconnecting on every MQTT message
@@ -110,6 +112,17 @@ no longer knows a pending request (`404`/`410` while polling), a new request is 
 - `signalkContextPrefix`
 - `signalkSourceLabel`
 - `signalkPathMap`
+
+For the meteo@uniparthenope service, configure:
+
+```json
+{
+  "signalk": true,
+  "signalkServerUrl": "https://signalk.meteo.uniparthenope.it"
+}
+```
+
+On first use, approve the collector's access request in the Signal K server. The collector then saves the issued token and publishes incoming station deltas in real time.
 
 ## Operational note: path changes
 

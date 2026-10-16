@@ -16,6 +16,24 @@ def ws_to_http_base(ws_url: str) -> str:
     return f"{scheme}://{netloc}"
 
 
+def normalize_stream_url(server_url: str) -> str:
+    """Accept a Signal K server base URL or stream URL and return a websocket URL."""
+    value = str(server_url or "").strip()
+    parsed = urllib.parse.urlsplit(value)
+    scheme_map = {"http": "ws", "https": "wss", "ws": "ws", "wss": "wss"}
+    if parsed.scheme not in scheme_map:
+        raise ValueError(f"Unsupported Signal K URL scheme: {parsed.scheme}")
+    if not parsed.netloc:
+        raise ValueError(f"Invalid Signal K URL: {server_url}")
+
+    path = parsed.path.rstrip("/")
+    if not path:
+        path = "/signalk/v1/stream"
+    return urllib.parse.urlunsplit(
+        (scheme_map[parsed.scheme], parsed.netloc, path, parsed.query, parsed.fragment)
+    )
+
+
 def normalize_href(base_http: str, href: str) -> str:
     if href.startswith("http://") or href.startswith("https://"):
         return href

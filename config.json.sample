@@ -15,7 +15,7 @@
   "influxdbBucket": "replace-with-influx-bucket",
   "influxMeasurement": "mqtt_data",
   "signalk": false,
-  "signalkServerUrl": "ws://localhost:3000/signalk/v1/stream",
+  "signalkServerUrl": "https://signalk.meteo.uniparthenope.it",
   "signalkToken": "",
   "signalkContextPrefix": "meteo",
   "signalkSourceLabel": "sensor-network-collector",

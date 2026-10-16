@@ -141,7 +141,7 @@ Example config:
   "influxdb": false,
 
   "signalk": true,
-  "signalkServerUrl": "ws://signalk.local:3000/signalk/v1/stream",
+  "signalkServerUrl": "https://signalk.meteo.uniparthenope.it",
   "signalkContextPrefix": "meteo",
   "signalkPathMap": {
     "TempOut": "environment.outside.temperature",
